@@ -1,0 +1,37 @@
+- main [ref=e3]:
+  - button "工具" [ref=e6] [cursor=pointer]: 工具⌄
+  - generic [ref=e7]:
+    - generic [ref=e8]:
+      - generic [ref=e9]:
+        - heading "魔方图像" [level=1] [ref=e10]
+        - generic [ref=e11]:
+          - generic [ref=e12]: 后台拼接图像
+          - generic [ref=e13]: "-"
+          - generic [ref=e14]: ROI 0/54
+      - generic [ref=e16]:
+        - strong [ref=e17]: 等待拼接图像
+        - generic [ref=e18]: 通过工具菜单读取图片，或打开相机后由后台推送图像。
+      - generic [ref=e19]:
+        - button "打开相机" [ref=e20] [cursor=pointer]
+        - button "开始解算" [ref=e21] [cursor=pointer]
+        - button "开始运行" [ref=e22] [cursor=pointer]
+    - complementary [ref=e23]:
+      - generic [ref=e24]:
+        - heading "运动计时" [level=2] [ref=e25]
+        - generic [ref=e26]: "00.00"
+        - generic [ref=e27]: 状态：空闲
+      - generic [ref=e28]:
+        - heading "串口" [level=2] [ref=e29]
+        - generic [ref=e30]:
+          - generic [ref=e31]: 串口信息
+          - combobox "串口信息" [ref=e32]:
+            - option "COM4" [selected]
+            - option "COM5"
+            - option "/dev/tty.usbserial"
+        - generic [ref=e33]:
+          - button "关闭" [ref=e34] [cursor=pointer]
+          - button "刷新" [ref=e35] [cursor=pointer]
+        - paragraph [ref=e36]: 串口状态：已连接
+      - generic [ref=e37]:
+        - heading "信息输出" [level=2] [ref=e38]
+        - paragraph [ref=e40]: 20:49:30RobotApp initialized.

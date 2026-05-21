@@ -1,0 +1,44 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - heading "RobotApp" [level=1] [ref=e6]
+      - paragraph [ref=e7]: 魔方机器人控制台
+    - generic "System status" [ref=e8]:
+      - generic [ref=e9]: 相机：未打开
+      - generic [ref=e10]: 串口：已连接
+      - generic [ref=e11]: 状态：空闲
+  - generic [ref=e12]:
+    - generic [ref=e13]:
+      - generic [ref=e14]:
+        - heading "魔方图像" [level=2] [ref=e15]
+        - generic [ref=e16]: 等待后台图像
+      - generic [ref=e18]:
+        - strong [ref=e19]: 相机未打开
+        - generic [ref=e20]: 点击打开相机后，前端只负责展示后台推送的拼接图像。
+      - generic [ref=e21]:
+        - button "打开相机" [ref=e22] [cursor=pointer]
+        - button "开始解算" [ref=e23] [cursor=pointer]
+        - button "开始运行" [ref=e24] [cursor=pointer]
+    - complementary [ref=e25]:
+      - generic [ref=e26]:
+        - heading "运动计时" [level=2] [ref=e27]
+        - generic [ref=e28]: "00.00"
+        - generic [ref=e29]: 状态：空闲
+      - generic [ref=e30]:
+        - heading "串口" [level=2] [ref=e31]
+        - generic [ref=e32]:
+          - generic [ref=e33]: 串口信息
+          - combobox "串口信息" [ref=e34]:
+            - option "COM4" [selected]
+            - option "COM5"
+            - option "/dev/tty.usbserial"
+        - generic [ref=e35]:
+          - button "关闭" [ref=e36] [cursor=pointer]
+          - button "刷新" [ref=e37] [cursor=pointer]
+        - paragraph [ref=e38]: 串口状态：已连接
+      - generic [ref=e39]:
+        - heading "电机步骤" [level=2] [ref=e40]
+        - paragraph [ref=e42]: 点击开始解算后显示动作序列。
+      - generic [ref=e43]:
+        - heading "信息输出" [level=2] [ref=e44]
+        - paragraph [ref=e46]: 20:54:53RobotApp initialized.
