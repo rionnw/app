@@ -30,10 +30,8 @@ fn main() {
     build.flag_if_supported("/std:c++17");
     build.flag_if_supported("-std=c++17");
     build.include(include_dir);
-    build.define(
-        "MIN2PHASE_SOURCE_DIR",
-        format!("\"{}\"", repo_root.display()).as_str(),
-    );
+    let source_dir = repo_root.to_string_lossy().replace('\\', "/");
+    build.define("MIN2PHASE_SOURCE_DIR", format!("\"{source_dir}\"").as_str());
     build.file("src/bridge.cpp");
     for source in sources {
         build.file(repo_root.join(source));

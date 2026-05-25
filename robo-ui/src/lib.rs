@@ -1,29 +1,37 @@
 use std::{
+    collections::HashMap,
     io::Cursor,
-    sync::{mpsc, Arc, Mutex},
-    thread,
+    io::Read,
+    sync::{mpsc, Arc, Condvar, Mutex},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use image::{codecs::jpeg::JpegEncoder, RgbImage};
+use image::{codecs::jpeg::JpegEncoder, imageops, RgbImage};
 use robo_camera::{
-    frame_format_from_str, CameraConfig, CameraControlKind, CameraStatusEventKind,
+    frame_format_from_str, CameraConfig, CameraControlKind, CameraSlotStatus,
+    CameraSlotWorker, CameraSlotWorkerEvent, CameraStatusEventKind, FramePacket,
     MultiCameraCapture, MultiCameraSource,
 };
-use robo_core::{CubeFace, Recognizer, Roi, Solver, Steps, Translator, Transport};
+use robo_core::{CubeFace, Frame, Recognizer, Roi, Solver, Steps, Translator, Transport};
 use robo_solver::Min2PhaseSolver;
 use robo_translator::BasicTranslator;
 use robo_transport::SerialTransport;
 use robo_vision::ColorClusterRecognizer;
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use tiny_http::{Header, Response, Server};
 
 struct AppState {
     camera: Mutex<CameraWorker>,
+    camera_stream: Mutex<Option<CameraStreamRuntime>>,
     serial: Mutex<Option<SerialTransport>>,
     latest_frame: Arc<Mutex<Option<LatestFrame>>>,
     latest_frame_seq: Mutex<u64>,
+    stream_hub: Arc<FrameHub>,
+    discovery_cache: Mutex<DiscoveryCache>,
     frame_server_port: u16,
 }
 
@@ -32,15 +40,74 @@ struct LatestFrame {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct StreamFrame {
+    seq: u64,
+    width: u32,
+    height: u32,
+    jpeg: Arc<Vec<u8>>,
+    rgb: Arc<Frame>,
+    capture_ms: u128,
+    encode_ms: u128,
+}
+
+#[derive(Clone)]
+struct SlotStreamState {
+    status: CameraSlotStatus,
+    frame: Option<StreamFrame>,
+}
+
+#[derive(Default)]
+struct FrameHub {
+    inner: Mutex<FrameHubInner>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct FrameHubInner {
+    session_id: u64,
+    slots: Vec<SlotStreamState>,
+    grid: Option<StreamFrame>,
+    tile_width: u32,
+    tile_height: u32,
+    columns: u32,
+    grid_seq: u64,
+    active: bool,
+    last_grid_encode_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct DiscoveryCache {
+    cameras: Option<CachedValue<Vec<CameraDeviceDto>>>,
+    formats: HashMap<u32, CachedValue<Vec<CameraFormatDto>>>,
+}
+
+struct CachedValue<T> {
+    value: T,
+    expires_at: Instant,
+}
+
+struct CameraStreamRuntime {
+    workers: Vec<CameraSlotWorker>,
+    aggregator: Option<JoinHandle<()>>,
+}
+
+const GRID_ENCODE_INTERVAL: Duration = Duration::from_millis(33);
+
 impl Default for AppState {
     fn default() -> Self {
         let latest_frame = Arc::new(Mutex::new(None));
-        let frame_server_port = start_frame_server(Arc::clone(&latest_frame)).unwrap_or(0);
+        let stream_hub = Arc::new(FrameHub::default());
+        let frame_server_port =
+            start_frame_server(Arc::clone(&latest_frame), Arc::clone(&stream_hub)).unwrap_or(0);
         Self {
             camera: Mutex::default(),
+            camera_stream: Mutex::default(),
             serial: Mutex::default(),
             latest_frame,
             latest_frame_seq: Mutex::default(),
+            stream_hub,
+            discovery_cache: Mutex::default(),
             frame_server_port,
         }
     }
@@ -177,6 +244,360 @@ impl CameraWorker {
     }
 }
 
+impl CameraStreamRuntime {
+    fn open(configs: Vec<CameraConfig>, hub: Arc<FrameHub>, app: tauri::AppHandle) -> Result<Self> {
+        let session_id = hub.configure(&configs)?;
+        let (tx, rx) = mpsc::channel();
+        let workers = configs
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(slot, config)| CameraSlotWorker::spawn(slot, config, tx.clone()))
+            .collect::<Vec<_>>();
+        drop(tx);
+
+        let aggregator_hub = Arc::clone(&hub);
+        let aggregator = thread::spawn(move || {
+            while let Ok(event) = rx.recv() {
+                match event {
+                    CameraSlotWorkerEvent::Frame(packet) => {
+                        if let Err(err) = publish_stream_packet(&aggregator_hub, session_id, &app, packet) {
+                            let _ = app.emit(
+                                "camera-stream-event",
+                                CameraStreamEventDto {
+                                    kind: "error".to_string(),
+                                    slot: None,
+                                    index: None,
+                                    seq: None,
+                                    width: None,
+                                    height: None,
+                                    fps: None,
+                                    capture_ms: None,
+                                    encode_ms: None,
+                                    message: Some(err.to_string()),
+                                    statuses: aggregator_hub.statuses().unwrap_or_default(),
+                                },
+                            );
+                        }
+                    }
+                    CameraSlotWorkerEvent::Status(status) => {
+                        let statuses = aggregator_hub
+                            .update_status(session_id, status)
+                            .unwrap_or_default();
+                        let _ = app.emit(
+                            "camera-stream-event",
+                            CameraStreamEventDto {
+                                kind: "status".to_string(),
+                                slot: None,
+                                index: None,
+                                seq: None,
+                                width: None,
+                                height: None,
+                                fps: None,
+                                capture_ms: None,
+                                encode_ms: None,
+                                message: None,
+                                statuses,
+                            },
+                        );
+                    }
+                    CameraSlotWorkerEvent::Event(event) => {
+                        if !aggregator_hub.is_active_session(session_id) {
+                            continue;
+                        }
+                        let _ = app.emit(
+                            "camera-stream-event",
+                            CameraStreamEventDto {
+                                kind: match event.kind {
+                                    CameraStatusEventKind::Connected => "connected".to_string(),
+                                    CameraStatusEventKind::Disconnected => "disconnected".to_string(),
+                                },
+                                slot: Some(event.slot),
+                                index: Some(event.index),
+                                seq: None,
+                                width: None,
+                                height: None,
+                                fps: None,
+                                capture_ms: None,
+                                encode_ms: None,
+                                message: Some(event.message),
+                                statuses: aggregator_hub.statuses().unwrap_or_default(),
+                            },
+                        );
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            workers,
+            aggregator: Some(aggregator),
+        })
+    }
+
+    fn close(&mut self) {
+        for worker in &mut self.workers {
+            worker.close();
+        }
+        self.workers.clear();
+        // Dropping the JoinHandle detaches the aggregator. It exits once all
+        // worker senders close, but close_camera_stream must not wait on a
+        // device thread that may be stuck in a driver call.
+        let _ = self.aggregator.take();
+    }
+}
+
+impl Drop for CameraStreamRuntime {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl FrameHub {
+    fn configure(&self, configs: &[CameraConfig]) -> Result<u64> {
+        anyhow::ensure!(!configs.is_empty(), "at least one camera is required");
+        let tile_width = configs.iter().map(|config| config.width).max().unwrap_or(640);
+        let tile_height = configs.iter().map(|config| config.height).max().unwrap_or(480);
+        let slots = configs
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(slot, config)| SlotStreamState {
+                status: CameraSlotStatus {
+                    slot,
+                    index: config.index,
+                    connected: false,
+                    message: "waiting for camera".to_string(),
+                },
+                frame: None,
+            })
+            .collect();
+
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
+        let session_id = inner.session_id.wrapping_add(1);
+        *inner = FrameHubInner {
+            session_id,
+            slots,
+            grid: None,
+            tile_width,
+            tile_height,
+            columns: 2,
+            grid_seq: 0,
+            active: true,
+            last_grid_encode_at: None,
+        };
+        self.changed.notify_all();
+        Ok(session_id)
+    }
+
+    fn clear(&self) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
+        let session_id = inner.session_id.wrapping_add(1);
+        *inner = FrameHubInner {
+            session_id,
+            ..FrameHubInner::default()
+        };
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn stream_info(&self, port: u16) -> Result<CameraStreamInfoDto> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
+        let columns = inner.columns.max(1);
+        let rows = if inner.slots.is_empty() {
+            0
+        } else {
+            (inner.slots.len() as u32 + columns - 1) / columns
+        };
+        Ok(CameraStreamInfoDto {
+            grid_url: format!("http://127.0.0.1:{port}/grid.mjpeg"),
+            slot_urls: (0..inner.slots.len())
+                .map(|slot| format!("http://127.0.0.1:{port}/slot/{slot}.mjpeg"))
+                .collect(),
+            width: inner.tile_width * columns,
+            height: inner.tile_height * rows.max(1),
+            statuses: inner.slots.iter().map(|slot| status_dto(&slot.status)).collect(),
+        })
+    }
+
+    fn update_status(
+        &self,
+        session_id: u64,
+        status: CameraSlotStatus,
+    ) -> Result<Vec<CameraStatusDto>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
+        if inner.session_id != session_id {
+            return Ok(inner.slots.iter().map(|slot| status_dto(&slot.status)).collect());
+        }
+        if let Some(slot) = inner.slots.get_mut(status.slot) {
+            slot.status = status;
+        }
+        let statuses = inner.slots.iter().map(|slot| status_dto(&slot.status)).collect();
+        self.changed.notify_all();
+        Ok(statuses)
+    }
+
+    fn publish_slot_frame(
+        &self,
+        session_id: u64,
+        packet: FramePacket,
+        jpeg: Vec<u8>,
+        encode_ms: u128,
+    ) -> Result<Option<StreamFrame>> {
+        let stream_frame = StreamFrame {
+            seq: packet.seq,
+            width: packet.frame.width,
+            height: packet.frame.height,
+            jpeg: Arc::new(jpeg),
+            rgb: Arc::new(packet.frame),
+            capture_ms: packet.capture_ms,
+            encode_ms,
+        };
+
+        let (frames, tile_width, tile_height, columns, should_encode_grid) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
+            if inner.session_id != session_id {
+                return Ok(None);
+            }
+            let slot = inner
+                .slots
+                .get_mut(packet.slot)
+                .with_context(|| format!("stream slot {} does not exist", packet.slot))?;
+            slot.status = CameraSlotStatus {
+                slot: packet.slot,
+                index: packet.index,
+                connected: true,
+                message: "connected".to_string(),
+            };
+            slot.frame = Some(stream_frame.clone());
+            let frames = inner
+                .slots
+                .iter()
+                .map(|slot| slot.frame.as_ref().map(|frame| Arc::clone(&frame.rgb)))
+                .collect::<Vec<_>>();
+            let now = Instant::now();
+            let should_encode_grid = match inner.last_grid_encode_at {
+                Some(last) => now.duration_since(last) >= GRID_ENCODE_INTERVAL,
+                None => true,
+            } || inner.grid.is_none();
+            if should_encode_grid {
+                inner.last_grid_encode_at = Some(now);
+            }
+            self.changed.notify_all();
+            (
+                frames,
+                inner.tile_width,
+                inner.tile_height,
+                inner.columns,
+                should_encode_grid,
+            )
+        };
+
+        if should_encode_grid {
+            if let Some(grid_frame) = compose_grid_frame(frames, tile_width, tile_height, columns)? {
+                let started = Instant::now();
+                let grid_jpeg = encode_frame_jpeg(&grid_frame)?;
+                let grid_encode_ms = started.elapsed().as_millis();
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
+                if inner.session_id != session_id || !inner.active {
+                    return Ok(None);
+                }
+                inner.grid_seq += 1;
+                let grid_seq = inner.grid_seq;
+                inner.grid = Some(StreamFrame {
+                    seq: grid_seq,
+                    width: grid_frame.width,
+                    height: grid_frame.height,
+                    jpeg: Arc::new(grid_jpeg),
+                    rgb: Arc::new(grid_frame),
+                    capture_ms: stream_frame.capture_ms,
+                    encode_ms: grid_encode_ms,
+                });
+                self.changed.notify_all();
+            }
+        }
+
+        Ok(Some(stream_frame))
+    }
+
+    fn wait_slot_frame(&self, slot: usize, last_seq: u64) -> Option<StreamFrame> {
+        let mut inner = self.inner.lock().ok()?;
+        loop {
+            if !inner.active {
+                return None;
+            }
+            if let Some(frame) = inner
+                .slots
+                .get(slot)
+                .and_then(|slot| slot.frame.as_ref())
+                .filter(|frame| frame.seq != last_seq)
+            {
+                return Some(frame.clone());
+            }
+            inner = self.changed.wait(inner).ok()?;
+        }
+    }
+
+    fn wait_grid_frame(&self, last_seq: u64) -> Option<StreamFrame> {
+        let mut inner = self.inner.lock().ok()?;
+        loop {
+            if !inner.active {
+                return None;
+            }
+            if let Some(frame) = inner.grid.as_ref().filter(|frame| frame.seq != last_seq) {
+                return Some(frame.clone());
+            }
+            inner = self.changed.wait(inner).ok()?;
+        }
+    }
+
+    fn latest_grid_rgb(&self) -> Result<Frame> {
+        self.inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?
+            .grid
+            .as_ref()
+            .map(|frame| (*frame.rgb).clone())
+            .context("no stream frame available")
+    }
+
+    fn statuses(&self) -> Result<Vec<CameraStatusDto>> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?
+            .slots
+            .iter()
+            .map(|slot| status_dto(&slot.status))
+            .collect())
+    }
+
+    fn is_active_session(&self, session_id: u64) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.active && inner.session_id == session_id)
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CameraConfigDto {
     index: u32,
@@ -204,14 +625,14 @@ impl From<CameraConfigDto> for CameraConfig {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct CameraDeviceDto {
     index: String,
     name: String,
     description: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct CameraFormatDto {
     width: u32,
     height: u32,
@@ -232,6 +653,34 @@ struct FrameResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct CameraStreamInfoDto {
+    #[serde(rename = "gridUrl")]
+    grid_url: String,
+    #[serde(rename = "slotUrls")]
+    slot_urls: Vec<String>,
+    width: u32,
+    height: u32,
+    statuses: Vec<CameraStatusDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CameraStreamEventDto {
+    kind: String,
+    slot: Option<usize>,
+    index: Option<u32>,
+    seq: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<f64>,
+    #[serde(rename = "captureMs")]
+    capture_ms: Option<u128>,
+    #[serde(rename = "encodeMs")]
+    encode_ms: Option<u128>,
+    message: Option<String>,
+    statuses: Vec<CameraStatusDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct CameraStatusDto {
     slot: usize,
     index: u32,
@@ -280,6 +729,153 @@ impl From<RoiDto> for Roi {
     }
 }
 
+fn status_dto(status: &CameraSlotStatus) -> CameraStatusDto {
+    CameraStatusDto {
+        slot: status.slot,
+        index: status.index,
+        connected: status.connected,
+        message: status.message.clone(),
+    }
+}
+
+fn encode_frame_jpeg(frame: &Frame) -> Result<Vec<u8>> {
+    let image = RgbImage::from_raw(frame.width, frame.height, frame.rgb.clone())
+        .context("failed to create image from stream frame")?;
+    let mut bytes = Cursor::new(Vec::new());
+    JpegEncoder::new_with_quality(&mut bytes, 72)
+        .encode_image(&image)
+        .context("failed to encode stream frame as JPEG")?;
+    Ok(bytes.into_inner())
+}
+
+fn publish_stream_packet(
+    hub: &FrameHub,
+    session_id: u64,
+    app: &tauri::AppHandle,
+    packet: FramePacket,
+) -> Result<()> {
+    let started = Instant::now();
+    let jpeg = encode_frame_jpeg(&packet.frame)?;
+    let encode_ms = started.elapsed().as_millis();
+    let slot = packet.slot;
+    let index = packet.index;
+    let seq = packet.seq;
+    let Some(frame) = hub.publish_slot_frame(session_id, packet, jpeg, encode_ms)? else {
+        return Ok(());
+    };
+    let fps = if frame.capture_ms == 0 {
+        None
+    } else {
+        Some(1000.0 / frame.capture_ms as f64)
+    };
+    let _ = app.emit(
+        "camera-stream-event",
+        CameraStreamEventDto {
+            kind: "frame".to_string(),
+            slot: Some(slot),
+            index: Some(index),
+            seq: Some(seq),
+            width: Some(frame.width),
+            height: Some(frame.height),
+            fps,
+            capture_ms: Some(frame.capture_ms),
+            encode_ms: Some(frame.encode_ms),
+            message: None,
+            statuses: hub.statuses().unwrap_or_default(),
+        },
+    );
+    Ok(())
+}
+
+fn compose_grid_frame(
+    frames: Vec<Option<Arc<Frame>>>,
+    tile_width: u32,
+    tile_height: u32,
+    columns: u32,
+) -> Result<Option<Frame>> {
+    if frames.is_empty() || tile_width == 0 || tile_height == 0 || columns == 0 {
+        return Ok(None);
+    }
+    let rows = (frames.len() as u32 + columns - 1) / columns;
+    let output_width = tile_width * columns;
+    let output_height = tile_height * rows;
+    let mut output = vec![0u8; output_width as usize * output_height as usize * 3];
+
+    for (idx, frame) in frames.into_iter().enumerate() {
+        let tile_x = (idx as u32 % columns) * tile_width;
+        let tile_y = (idx as u32 / columns) * tile_height;
+        match frame {
+            Some(frame) => blit_fit_rgb(&frame, &mut output, output_width, tile_width, tile_height, tile_x, tile_y),
+            None => fill_tile(&mut output, output_width, tile_width, tile_height, tile_x, tile_y, 12),
+        }
+    }
+
+    Frame::new_rgb(output_width, output_height, output)
+        .map(Some)
+        .context("failed to build grid stream frame")
+}
+
+fn blit_fit_rgb(
+    src: &Frame,
+    dst: &mut [u8],
+    dst_width: u32,
+    tile_width: u32,
+    tile_height: u32,
+    dst_x: u32,
+    dst_y: u32,
+) {
+    fill_tile(dst, dst_width, tile_width, tile_height, dst_x, dst_y, 12);
+    if src.width == tile_width && src.height == tile_height {
+        blit_rgb(src, dst, dst_width, dst_x, dst_y);
+        return;
+    }
+
+    let scale = (tile_width as f32 / src.width as f32).min(tile_height as f32 / src.height as f32);
+    let fit_width = ((src.width as f32 * scale).round() as u32).clamp(1, tile_width);
+    let fit_height = ((src.height as f32 * scale).round() as u32).clamp(1, tile_height);
+    let Some(image) = RgbImage::from_raw(src.width, src.height, src.rgb.clone()) else {
+        return;
+    };
+    let resized = imageops::resize(
+        &image,
+        fit_width,
+        fit_height,
+        imageops::FilterType::Triangle,
+    );
+    let Ok(frame) = Frame::new_rgb(fit_width, fit_height, resized.into_raw()) else {
+        return;
+    };
+    let offset_x = dst_x + (tile_width - fit_width) / 2;
+    let offset_y = dst_y + (tile_height - fit_height) / 2;
+    blit_rgb(&frame, dst, dst_width, offset_x, offset_y);
+}
+
+fn blit_rgb(src: &Frame, dst: &mut [u8], dst_width: u32, dst_x: u32, dst_y: u32) {
+    let row_bytes = src.width as usize * 3;
+    for y in 0..src.height {
+        let src_start = y as usize * row_bytes;
+        let dst_start = ((dst_y + y) * dst_width * 3 + dst_x * 3) as usize;
+        dst[dst_start..dst_start + row_bytes]
+            .copy_from_slice(&src.rgb[src_start..src_start + row_bytes]);
+    }
+}
+
+fn fill_tile(
+    dst: &mut [u8],
+    dst_width: u32,
+    width: u32,
+    height: u32,
+    dst_x: u32,
+    dst_y: u32,
+    value: u8,
+) {
+    for y in 0..height {
+        let start = ((dst_y + y) * dst_width * 3 + dst_x * 3) as usize;
+        let end = start + width as usize * 3;
+        dst[start..end].fill(value);
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SerialPortDto {
     name: String,
@@ -302,9 +898,18 @@ struct SolveFaceletsResponse {
     encoded_steps: String,
 }
 
+const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5);
+
 #[tauri::command]
-fn list_cameras() -> Result<Vec<CameraDeviceDto>, String> {
-    robo_camera::list_cameras()
+fn list_cameras(state: tauri::State<'_, AppState>) -> Result<Vec<CameraDeviceDto>, String> {
+    let now = Instant::now();
+    if let Ok(cache) = state.discovery_cache.lock() {
+        if let Some(cached) = cache.cameras.as_ref().filter(|cached| cached.expires_at > now) {
+            return Ok(cached.value.clone());
+        }
+    }
+
+    let devices: Vec<CameraDeviceDto> = robo_camera::list_cameras()
         .map(|devices| {
             devices
                 .into_iter()
@@ -315,12 +920,34 @@ fn list_cameras() -> Result<Vec<CameraDeviceDto>, String> {
                 })
                 .collect()
         })
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+
+    if let Ok(mut cache) = state.discovery_cache.lock() {
+        cache.cameras = Some(CachedValue {
+            value: devices.clone(),
+            expires_at: now + DISCOVERY_CACHE_TTL,
+        });
+    }
+    Ok(devices)
 }
 
 #[tauri::command]
-fn list_camera_formats(index: u32) -> Result<Vec<CameraFormatDto>, String> {
-    robo_camera::list_camera_formats(index)
+fn list_camera_formats(
+    state: tauri::State<'_, AppState>,
+    index: u32,
+) -> Result<Vec<CameraFormatDto>, String> {
+    let now = Instant::now();
+    if let Ok(cache) = state.discovery_cache.lock() {
+        if let Some(cached) = cache
+            .formats
+            .get(&index)
+            .filter(|cached| cached.expires_at > now)
+        {
+            return Ok(cached.value.clone());
+        }
+    }
+
+    let formats: Vec<CameraFormatDto> = robo_camera::list_camera_formats(index)
         .map(|formats| {
             formats
                 .into_iter()
@@ -332,7 +959,18 @@ fn list_camera_formats(index: u32) -> Result<Vec<CameraFormatDto>, String> {
                 })
                 .collect()
         })
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+
+    if let Ok(mut cache) = state.discovery_cache.lock() {
+        cache.formats.insert(
+            index,
+            CachedValue {
+                value: formats.clone(),
+                expires_at: now + DISCOVERY_CACHE_TTL,
+            },
+        );
+    }
+    Ok(formats)
 }
 
 #[tauri::command]
@@ -360,6 +998,73 @@ fn close_cameras(state: tauri::State<'_, AppState>) -> Result<(), String> {
         .map_err(|_| "camera state is poisoned".to_string())?
         .close()
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn open_camera_stream(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    configs: Vec<CameraConfigDto>,
+) -> Result<CameraStreamInfoDto, String> {
+    let configs = configs
+        .into_iter()
+        .map(CameraConfig::from)
+        .collect::<Vec<_>>();
+    let mut runtime = state
+        .camera_stream
+        .lock()
+        .map_err(|_| "camera stream state is poisoned".to_string())?;
+    if let Some(existing) = runtime.as_mut() {
+        existing.close();
+    }
+    *runtime = None;
+    let next_runtime = match CameraStreamRuntime::open(configs, Arc::clone(&state.stream_hub), app) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            let _ = state.stream_hub.clear();
+            return Err(err.to_string());
+        }
+    };
+    *runtime = Some(next_runtime);
+    state
+        .stream_hub
+        .stream_info(state.frame_server_port)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn close_camera_stream(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if let Some(mut runtime) = state
+        .camera_stream
+        .lock()
+        .map_err(|_| "camera stream state is poisoned".to_string())?
+        .take()
+    {
+        runtime.close();
+    }
+    state.stream_hub.clear().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn camera_stream_info(state: tauri::State<'_, AppState>) -> Result<CameraStreamInfoDto, String> {
+    state
+        .stream_hub
+        .stream_info(state.frame_server_port)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn snapshot_frame(state: tauri::State<'_, AppState>) -> Result<tauri::ipc::Response, String> {
+    let frame = state
+        .stream_hub
+        .inner
+        .lock()
+        .map_err(|_| "stream hub is poisoned".to_string())?
+        .grid
+        .as_ref()
+        .map(|frame| (*frame.jpeg).clone())
+        .ok_or_else(|| "no stream frame available".to_string())?;
+    Ok(tauri::ipc::Response::new(frame))
 }
 
 #[tauri::command]
@@ -450,6 +1155,23 @@ fn solve_current_frame(
     let recognizer = ColorClusterRecognizer;
     let face = recognizer
         .recognize(&capture.frame, &rois)
+        .map_err(|err| err.to_string())?;
+    solve_face(face)
+}
+
+#[tauri::command]
+fn solve_latest_frame(
+    state: tauri::State<'_, AppState>,
+    rois: Vec<RoiDto>,
+) -> Result<SolveFaceletsResponse, String> {
+    let frame = state
+        .stream_hub
+        .latest_grid_rgb()
+        .map_err(|err| err.to_string())?;
+    let rois = rois.into_iter().map(Roi::from).collect::<Vec<_>>();
+    let recognizer = ColorClusterRecognizer;
+    let face = recognizer
+        .recognize(&frame, &rois)
         .map_err(|err| err.to_string())?;
     solve_face(face)
 }
@@ -612,7 +1334,64 @@ fn encode_capture(capture: MultiCameraCapture, state: &AppState) -> Result<Frame
     })
 }
 
-fn start_frame_server(latest_frame: Arc<Mutex<Option<LatestFrame>>>) -> Result<u16> {
+enum StreamRoute {
+    Grid,
+    Slot(usize),
+}
+
+struct MjpegStreamReader {
+    hub: Arc<FrameHub>,
+    route: StreamRoute,
+    last_seq: u64,
+    pending: Cursor<Vec<u8>>,
+}
+
+impl MjpegStreamReader {
+    fn new(hub: Arc<FrameHub>, route: StreamRoute) -> Self {
+        Self {
+            hub,
+            route,
+            last_seq: 0,
+            pending: Cursor::new(Vec::new()),
+        }
+    }
+
+    fn load_next_frame(&mut self) -> std::io::Result<()> {
+        let frame = match self.route {
+            StreamRoute::Grid => self.hub.wait_grid_frame(self.last_seq),
+            StreamRoute::Slot(slot) => self.hub.wait_slot_frame(slot, self.last_seq),
+        };
+        let Some(frame) = frame else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "camera stream closed",
+            ));
+        };
+        self.last_seq = frame.seq;
+        let mut part = Vec::new();
+        part.extend_from_slice(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ");
+        part.extend_from_slice(frame.jpeg.len().to_string().as_bytes());
+        part.extend_from_slice(b"\r\n\r\n");
+        part.extend_from_slice(&frame.jpeg);
+        part.extend_from_slice(b"\r\n");
+        self.pending = Cursor::new(part);
+        Ok(())
+    }
+}
+
+impl Read for MjpegStreamReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pending.position() as usize >= self.pending.get_ref().len() {
+            self.load_next_frame()?;
+        }
+        self.pending.read(buf)
+    }
+}
+
+fn start_frame_server(
+    latest_frame: Arc<Mutex<Option<LatestFrame>>>,
+    stream_hub: Arc<FrameHub>,
+) -> Result<u16> {
     let server = Server::http("127.0.0.1:0").map_err(|err| anyhow::anyhow!("{err}"))?;
     let port = match server.server_addr() {
         tiny_http::ListenAddr::IP(addr) => addr.port(),
@@ -621,31 +1400,80 @@ fn start_frame_server(latest_frame: Arc<Mutex<Option<LatestFrame>>>) -> Result<u
     };
 
     thread::spawn(move || {
-        let content_type = Header::from_bytes(&b"Content-Type"[..], &b"image/jpeg"[..]).ok();
-        let cache_control =
-            Header::from_bytes(&b"Cache-Control"[..], &b"no-store, max-age=0"[..]).ok();
-
         for request in server.incoming_requests() {
-            let frame = latest_frame
-                .lock()
-                .ok()
-                .and_then(|frame| frame.as_ref().map(|frame| frame.bytes.clone()));
-
-            let mut response = match frame {
-                Some(bytes) => Response::from_data(bytes),
-                None => Response::from_string("no camera frame available").with_status_code(404),
-            };
-            if let Some(header) = content_type.clone() {
-                response.add_header(header);
-            }
-            if let Some(header) = cache_control.clone() {
-                response.add_header(header);
-            }
-            let _ = request.respond(response);
+            let latest_frame = Arc::clone(&latest_frame);
+            let stream_hub = Arc::clone(&stream_hub);
+            thread::spawn(move || {
+                let url = request.url().to_string();
+                if url.starts_with("/grid.mjpeg") {
+                    respond_mjpeg(request, MjpegStreamReader::new(stream_hub, StreamRoute::Grid));
+                    return;
+                }
+                if let Some(slot) = parse_slot_stream_url(&url) {
+                    respond_mjpeg(
+                        request,
+                        MjpegStreamReader::new(stream_hub, StreamRoute::Slot(slot)),
+                    );
+                    return;
+                }
+                respond_latest_frame(request, latest_frame);
+            });
         }
     });
 
     Ok(port)
+}
+
+fn parse_slot_stream_url(url: &str) -> Option<usize> {
+    let path = url.split('?').next().unwrap_or(url);
+    let suffix = path.strip_prefix("/slot/")?.strip_suffix(".mjpeg")?;
+    suffix.parse().ok()
+}
+
+fn respond_mjpeg(request: tiny_http::Request, reader: MjpegStreamReader) {
+    let content_type =
+        Header::from_bytes(&b"Content-Type"[..], &b"multipart/x-mixed-replace; boundary=frame"[..])
+            .ok();
+    let cache_control =
+        Header::from_bytes(&b"Cache-Control"[..], &b"no-store, max-age=0"[..]).ok();
+    let mut response = Response::new(
+        200.into(),
+        Vec::new(),
+        reader,
+        None,
+        None,
+    );
+    if let Some(header) = content_type {
+        response.add_header(header);
+    }
+    if let Some(header) = cache_control {
+        response.add_header(header);
+    }
+    let _ = request.respond(response);
+}
+
+fn respond_latest_frame(
+    request: tiny_http::Request,
+    latest_frame: Arc<Mutex<Option<LatestFrame>>>,
+) {
+    let content_type = Header::from_bytes(&b"Content-Type"[..], &b"image/jpeg"[..]).ok();
+    let cache_control =
+        Header::from_bytes(&b"Cache-Control"[..], &b"no-store, max-age=0"[..]).ok();
+    let frame = latest_frame
+        .lock()
+        .ok()
+        .and_then(|frame| frame.as_ref().map(|frame| frame.bytes.clone()));
+    let mut response = match frame {
+        Some(bytes) => Response::from_data(bytes),
+        None => Response::from_string("no camera frame available").with_status_code(404),
+    };
+    if let Some(header) = content_type {
+        response.add_header(header);
+    }
+    if let Some(header) = cache_control {
+        response.add_header(header);
+    }
+    let _ = request.respond(response);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -658,11 +1486,16 @@ pub fn run() {
             list_camera_formats,
             open_cameras,
             close_cameras,
+            open_camera_stream,
+            close_camera_stream,
+            camera_stream_info,
+            snapshot_frame,
             capture_frame,
             latest_frame_data_url,
             list_camera_controls,
             set_camera_control,
             solve_current_frame,
+            solve_latest_frame,
             solve_facelets,
             list_serial_ports,
             open_serial,

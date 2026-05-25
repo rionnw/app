@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
@@ -8,7 +9,6 @@ type StickerRegion = { id: string; face: Face; index: number; rect: RoiRect | nu
 type CameraDevice = { index: string; name: string; description: string };
 type CameraConfig = { index: number; width: number; height: number; fps: number; frameFormat: string };
 type CameraStatus = { slot: number; index: number; connected: boolean; message: string };
-type CameraEvent = { slot: number; index: number; kind: "connected" | "disconnected"; message: string };
 type CameraControl = {
   id: string;
   name: string;
@@ -21,13 +21,25 @@ type CameraControl = {
   active: boolean;
   flags: string[];
 };
-type FrameResponse = {
+type CameraStreamInfo = {
+  gridUrl: string;
+  slotUrls: string[];
   width: number;
   height: number;
-  seq: number;
-  frameUrl: string;
   statuses: CameraStatus[];
-  events: CameraEvent[];
+};
+type CameraStreamEvent = {
+  kind: "frame" | "status" | "connected" | "disconnected" | "error";
+  slot: number | null;
+  index: number | null;
+  seq: number | null;
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+  captureMs: number | null;
+  encodeMs: number | null;
+  message: string | null;
+  statuses: CameraStatus[];
 };
 type SerialPort = { name: string; port_type: string };
 type SerialReadResponse = {
@@ -72,6 +84,21 @@ const presetLabel = (format: { width: number; height: number; fps: number; frame
 const presetValue = (format: { width: number; height: number; fps: number; frameFormat: string }) =>
   `${format.width}x${format.height}@${format.fps}:${format.frameFormat}`;
 
+const isSupportedPreviewFormat = (format: { width: number; height: number; fps: number }) => {
+  const pixels = format.width * format.height;
+  const aspectRatio = format.width / format.height;
+  const commonAspectRatio =
+    Math.abs(aspectRatio - 4 / 3) < 0.04 || Math.abs(aspectRatio - 16 / 9) < 0.04;
+
+  return (
+    format.fps >= 30 &&
+    format.width >= 320 &&
+    format.height >= 240 &&
+    pixels <= 1920 * 1080 &&
+    commonAspectRatio
+  );
+};
+
 const sameCameraStatuses = (left: CameraStatus[], right: CameraStatus[]) =>
   left.length === right.length &&
   left.every((item, index) => {
@@ -97,9 +124,6 @@ function App() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const roiInputRef = useRef<HTMLInputElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
-  const previewImageRef = useRef<HTMLImageElement>(null);
-  const previewFallbackRef = useRef(false);
-  const previewTransportRef = useRef<"protocol" | "dataUrl">("protocol");
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
 
   const [devices, setDevices] = useState<CameraDevice[]>([]);
@@ -113,6 +137,7 @@ function App() {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [imageName, setImageName] = useState("实时相机画面");
+  const [frameStats, setFrameStats] = useState("stream idle");
   const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
   const [imageBox, setImageBox] = useState<ImageBox>({ left: 0, top: 0, width: 0, height: 0 });
 
@@ -150,12 +175,10 @@ function App() {
     if (!naturalSize.width || !naturalSize.height) return "-";
     return `${naturalSize.width} x ${naturalSize.height}`;
   }, [naturalSize]);
-  const previewIntervalMs = useMemo(() => {
-    const maxFps = Math.max(1, ...cameraConfigs.map((config) => config.fps || 1));
-    return Math.max(16, Math.round(1000 / maxFps));
-  }, [cameraConfigs]);
+  const maxConfiguredFps = useMemo(() => Math.max(1, ...cameraConfigs.map((config) => config.fps || 1)), [cameraConfigs]);
   const activeCameraConfig = cameraConfigs[controlSlot] ?? cameraConfigs[0];
   const slotParamsVisible = loadedControlSlot === controlSlot;
+  const cameraPositionLocked = slotParamsVisible;
 
   const addLog = (text: string, kind: LogItem["kind"] = "info") => {
     setLogs((items) => [{ time: nowTime(), text, kind }, ...items].slice(0, 120));
@@ -212,23 +235,23 @@ function App() {
     try {
       if (config) {
         const formats = await invoke<CameraPreset[]>("list_camera_formats", { index: config.index });
-        setCameraFormats(
-          formats.length
-            ? formats.map((format) => ({ ...format, label: presetLabel(format) }))
-            : cameraPresets,
-        );
+        const supportedFormats = formats.filter(isSupportedPreviewFormat);
+        setCameraFormats(supportedFormats.map((format) => ({ ...format, label: presetLabel(format) })));
+        if (formats.length && !supportedFormats.length) {
+          addLog("原生格式已读取，但没有符合 30 FPS 与分辨率过滤条件的格式。", "warn");
+        }
       }
       if (!cameraOpen) {
         setCameraControls([]);
         addLog(`槽 ${slot + 1} 已读取相机格式；打开相机后可读取硬件控制参数。`);
         return;
       }
-      const controls = await invoke<CameraControl[]>("list_camera_controls", { slot });
-      setCameraControls(controls);
-      addLog(`槽 ${slot + 1} 读取到 ${controls.length} 个可调相机参数。`);
+      setCameraControls([]);
+      addLog("流式预览中暂不读取硬件控制参数；请关闭相机后再调整参数。", "warn");
+      return;
     } catch (error) {
       setCameraControls([]);
-      setCameraFormats(cameraPresets);
+      setCameraFormats([]);
       addLog(String(error), "warn");
     }
   };
@@ -311,54 +334,42 @@ function App() {
   }, [naturalSize]);
 
   useEffect(() => {
-    if (!cameraOpen) return;
-    let stopped = false;
-    let busy = false;
-
-    const tick = async () => {
-      if (busy || stopped) return;
-      busy = true;
-      try {
-        const frame = await invoke<FrameResponse>("capture_frame");
-        if (!stopped) {
-          const frameSrc =
-            previewTransportRef.current === "dataUrl" || !frame.frameUrl
-              ? await invoke<string>("latest_frame_data_url")
-              : frame.frameUrl;
-          if (previewImageRef.current) {
-            previewImageRef.current.src = frameSrc;
-          } else {
-            setImageSrc(frameSrc);
-          }
-          setNaturalSize((size) =>
-            size.width === frame.width && size.height === frame.height
-              ? size
-              : { width: frame.width, height: frame.height },
-          );
-          setImageName((name) => (name === "实时相机画面" ? name : "实时相机画面"));
-          setCameraStatuses((statuses) => (sameCameraStatuses(statuses, frame.statuses) ? statuses : frame.statuses));
-          frame.events.forEach((event) => {
-            const text =
-              event.kind === "connected"
-                ? `相机槽 ${event.slot + 1} / index ${event.index} 已连接或恢复。`
-                : `相机槽 ${event.slot + 1} / index ${event.index} 断联：${event.message}`;
-            addLog(text, event.kind === "connected" ? "info" : "warn");
-          });
-        }
-      } catch (error) {
-        addLog(String(error), "error");
-      } finally {
-        busy = false;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    listen<CameraStreamEvent>("camera-stream-event", (event) => {
+      const payload = event.payload;
+      if (payload.statuses.length) {
+        setCameraStatuses((statuses) =>
+          sameCameraStatuses(statuses, payload.statuses) ? statuses : payload.statuses,
+        );
       }
-    };
-
-    tick();
-    const timer = window.setInterval(tick, previewIntervalMs);
+      if (payload.kind === "frame" && payload.slot !== null) {
+        const fps = payload.fps === null ? "-" : payload.fps.toFixed(1);
+        const captureMs = payload.captureMs === null ? "-" : payload.captureMs.toString();
+        const encodeMs = payload.encodeMs === null ? "-" : payload.encodeMs.toString();
+        setFrameStats(`槽 ${payload.slot + 1}: ${fps} FPS / 抓帧 ${captureMs} ms / 编码 ${encodeMs} ms`);
+      }
+      if (payload.kind === "connected" && payload.slot !== null) {
+        addLog(`相机槽 ${payload.slot + 1} / index ${payload.index} 已连接或恢复。`);
+      }
+      if (payload.kind === "disconnected" && payload.slot !== null) {
+        addLog(`相机槽 ${payload.slot + 1} / index ${payload.index} 断联：${payload.message ?? ""}`, "warn");
+      }
+      if (payload.kind === "error" && payload.message) {
+        addLog(payload.message, "error");
+      }
+    }).then((nextUnlisten) => {
+      if (disposed) {
+        nextUnlisten();
+      } else {
+        unlisten = nextUnlisten;
+      }
+    });
     return () => {
-      stopped = true;
-      window.clearInterval(timer);
+      disposed = true;
+      unlisten?.();
     };
-  }, [cameraOpen, previewIntervalMs]);
+  }, []);
 
   const applyCameraConfig = async (index: number, patch: Partial<CameraConfig>) => {
     const next = cameraConfigs.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item));
@@ -380,8 +391,12 @@ function App() {
   const reopenIfNeeded = async (configs: CameraConfig[]) => {
     if (!cameraOpen) return;
     try {
-      await invoke("open_cameras", { configs });
-      addLog("相机布局已更新，正在按新顺序预览。");
+      const stream = await invoke<CameraStreamInfo>("open_camera_stream", { configs });
+      setImageSrc(stream.gridUrl);
+      setNaturalSize({ width: stream.width, height: stream.height });
+      setCameraStatuses(stream.statuses);
+      setFrameStats("stream restarting");
+      addLog("相机流已按新配置重启。");
       refreshCameraControls(controlSlot);
     } catch (error) {
       addLog(String(error), "error");
@@ -389,6 +404,10 @@ function App() {
   };
 
   const selectCameraSlot = async (slot: number) => {
+    if (cameraPositionLocked) {
+      addLog("参数调节界面打开时不能交换相机位置，请先切换或关闭参数面板。", "warn");
+      return;
+    }
     if (swapSlot === null) {
       setSwapSlot(slot);
       addLog(`已选择槽 ${slot + 1}，再点另一个槽进行互换。`);
@@ -407,12 +426,15 @@ function App() {
 
   const openCamera = async () => {
     try {
-      previewFallbackRef.current = false;
-      previewTransportRef.current = "protocol";
-      await invoke("open_cameras", { configs: cameraConfigs });
+      const stream = await invoke<CameraStreamInfo>("open_camera_stream", { configs: cameraConfigs });
+      setImageSrc(stream.gridUrl);
+      setNaturalSize({ width: stream.width, height: stream.height });
+      setCameraStatuses(stream.statuses);
+      setImageName("实时相机流");
+      setFrameStats("stream starting");
       setCameraOpen(true);
       setStatus("相机预览中");
-      addLog("相机预览已启动。断联槽位会用占位画面保留。");
+      addLog("相机流已启动。图像通过本地 MJPEG 流传输，状态由后台事件推送。");
     } catch (error) {
       addLog(String(error), "error");
     }
@@ -420,19 +442,26 @@ function App() {
 
   const closeCamera = async () => {
     try {
-      await invoke("close_cameras");
+      await invoke("close_camera_stream");
       setCameraOpen(false);
       setCameraStatuses([]);
       setCameraControls([]);
       setLoadedControlSlot(null);
+      setImageSrc(null);
+      setNaturalSize({ width: 0, height: 0 });
+      setFrameStats("stream idle");
       setStatus("空闲");
-      addLog("相机已关闭。");
+      addLog("相机流已关闭。");
     } catch (error) {
       addLog(String(error), "error");
     }
   };
 
   const setCameraControlValue = async (control: CameraControl, value: number) => {
+    if (cameraOpen) {
+      addLog("流式预览中暂不写入硬件控制参数；请关闭相机后再调整参数。", "warn");
+      return;
+    }
     setCameraControls((items) => items.map((item) => (item.id === control.id ? { ...item, value } : item)));
     try {
       await invoke("set_camera_control", { slot: controlSlot, id: control.id, value });
@@ -447,6 +476,13 @@ function App() {
     setLoadedControlSlot(null);
     setCameraControls([]);
     setCameraFormats([]);
+  };
+
+  const closeCameraControlsPanel = () => {
+    setLoadedControlSlot(null);
+    setCameraControls([]);
+    setCameraFormats([]);
+    setSwapSlot(null);
   };
 
   const normalizedPointFromEvent = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -513,7 +549,8 @@ function App() {
         width: Math.max(1, Math.round((region.rect?.w || 0) * naturalSize.width)),
         height: Math.max(1, Math.round((region.rect?.h || 0) * naturalSize.height)),
       }));
-      const result = await invoke<SolveResponse>("solve_current_frame", { rois });
+      const command = cameraOpen ? "solve_latest_frame" : "solve_current_frame";
+      const result = await invoke<SolveResponse>(command, { rois });
       applySolveResult(result);
       addLog("当前相机帧已识别并解算。");
     } catch (error) {
@@ -592,20 +629,9 @@ function App() {
     reader.readAsDataURL(file);
   };
 
-  const fallbackPreviewImage = async () => {
-    if (previewFallbackRef.current) return;
-    previewFallbackRef.current = true;
-    try {
-      const dataUrl = await invoke<string>("latest_frame_data_url");
-      previewTransportRef.current = "dataUrl";
-      if (previewImageRef.current) {
-        previewImageRef.current.src = dataUrl;
-      } else {
-        setImageSrc(dataUrl);
-      }
-      addLog("预览协议加载失败，已临时降级为 data URL。", "warn");
-    } catch (error) {
-      addLog(String(error), "error");
+  const handleStreamImageError = () => {
+    if (cameraOpen) {
+      addLog("相机 MJPEG 流加载失败，请关闭后重新打开相机。", "error");
     }
   };
 
@@ -679,6 +705,7 @@ function App() {
             <div className="image-meta">
               <span>{imageName}</span>
               <span>{imageAspectLabel}</span>
+              <span>{frameStats}</span>
               <span>ROI {markedCount}/54</span>
             </div>
           </div>
@@ -694,7 +721,6 @@ function App() {
             {imageSrc ? (
               <>
                 <img
-                  ref={previewImageRef}
                   alt="cube camera frame"
                   className="stitched-image"
                   src={imageSrc}
@@ -711,7 +737,7 @@ function App() {
                       return size.width === width && size.height === height ? size : { width, height };
                     })
                   }
-                  onError={fallbackPreviewImage}
+                  onError={handleStreamImageError}
                 />
                 {showRoi && (
                   <svg
@@ -831,6 +857,8 @@ function App() {
                     className={`slot-button ${swapSlot === index ? "is-selected" : ""}`}
                     type="button"
                     key={index}
+                    disabled={cameraPositionLocked}
+                    title={cameraPositionLocked ? "参数调节界面打开时不能交换相机位置" : "点击两个槽位交换相机位置"}
                     onClick={() => selectCameraSlot(index)}
                   >
                     <span>槽 {index + 1}</span>
@@ -854,6 +882,9 @@ function App() {
                 <button type="button" onClick={restoreDefaultCameraControls} disabled={!cameraControls.length}>
                   默认
                 </button>
+                <button type="button" onClick={closeCameraControlsPanel} disabled={!slotParamsVisible}>
+                  关闭
+                </button>
               </div>
             </div>
             <label className="field">
@@ -868,8 +899,8 @@ function App() {
             </label>
             <p className="hint-line">
               {slotParamsVisible
-                ? `预览间隔按 FPS 自动计算：约 ${previewIntervalMs} ms。`
-                : "点击读取后展开该槽位的 Index、分辨率、FPS 和可调参数。"}
+                ? `参数调节界面已打开，相机位置交换已锁定；当前最高配置 ${maxConfiguredFps} FPS。`
+                : "点击读取后展开该槽位的 Index、分辨率、FPS 和可调参数；格式列表只显示 30 FPS 及以上的常用分辨率。"}
             </p>
             {slotParamsVisible && activeCameraConfig && (
               <div className="slot-param-panel">
@@ -887,13 +918,18 @@ function App() {
                     <span>格式</span>
                     <select
                       value={presetValue(activeCameraConfig)}
+                      disabled={slotParamsVisible && !cameraFormats.length}
                       onChange={(event) => updateCameraPreset(controlSlot, event.target.value)}
                     >
-                      {(cameraFormats.length ? cameraFormats : cameraPresets).map((preset) => (
-                        <option value={presetValue(preset)} key={presetValue(preset)}>
-                          {preset.label}
-                        </option>
-                      ))}
+                      {(slotParamsVisible ? cameraFormats : cameraPresets).length ? (
+                        (slotParamsVisible ? cameraFormats : cameraPresets).map((preset) => (
+                          <option value={presetValue(preset)} key={presetValue(preset)}>
+                            {preset.label}
+                          </option>
+                        ))
+                      ) : (
+                        <option value={presetValue(activeCameraConfig)}>无符合条件的原生格式</option>
+                      )}
                     </select>
                   </label>
                 </div>

@@ -11,7 +11,12 @@ use nokhwa::{
 };
 use robo_core::{CameraSource, Frame};
 use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     str::FromStr,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -230,6 +235,60 @@ pub struct MultiCameraCapture {
     pub events: Vec<CameraStatusEvent>,
 }
 
+#[derive(Clone, Debug)]
+pub struct FramePacket {
+    pub slot: usize,
+    pub index: u32,
+    pub seq: u64,
+    pub frame: Frame,
+    pub capture_ms: u128,
+}
+
+#[derive(Clone, Debug)]
+pub enum CameraSlotWorkerEvent {
+    Frame(FramePacket),
+    Status(CameraSlotStatus),
+    Event(CameraStatusEvent),
+}
+
+pub struct CameraSlotWorker {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl CameraSlotWorker {
+    pub fn spawn(
+        slot: usize,
+        config: CameraConfig,
+        events: mpsc::Sender<CameraSlotWorkerEvent>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            run_slot_worker(slot, config, events, worker_stop);
+        });
+
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+
+    pub fn close(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Do not synchronously join here: some camera drivers can block inside
+        // open_stream/frame(). Dropping the handle detaches the thread after the
+        // stop flag is set, so UI close/reopen never hangs on a stuck device.
+        let _ = self.join.take();
+    }
+}
+
+impl Drop for CameraSlotWorker {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl MultiCameraSource {
     pub fn open(configs: Vec<CameraConfig>, columns: u32) -> Result<Self> {
         anyhow::ensure!(!configs.is_empty(), "at least one camera is required");
@@ -428,6 +487,144 @@ fn ensure_slot_camera(
         }
     }
     Ok(())
+}
+
+fn run_slot_worker(
+    slot: usize,
+    config: CameraConfig,
+    events: mpsc::Sender<CameraSlotWorkerEvent>,
+    stop: Arc<AtomicBool>,
+) {
+    let target_interval = if config.fps == 0 {
+        Duration::from_millis(33)
+    } else {
+        Duration::from_secs_f64(1.0 / config.fps as f64)
+    };
+    let mut camera: Option<NokhwaCamera> = None;
+    let mut connected = false;
+    let mut seq = 0u64;
+    let mut last_open_attempt: Option<Instant> = None;
+    let mut last_error: Option<String> = None;
+
+    while !stop.load(Ordering::SeqCst) {
+        if camera.is_none() {
+            let now = Instant::now();
+            if last_open_attempt
+                .is_some_and(|attempt| now.duration_since(attempt) < RECONNECT_INTERVAL)
+            {
+                sleep_until_next_attempt(&stop, Duration::from_millis(25));
+                continue;
+            }
+            last_open_attempt = Some(now);
+
+            match NokhwaCamera::open(config.clone()) {
+                Ok(next_camera) => {
+                    camera = Some(next_camera);
+                    last_error = None;
+                    if !connected {
+                        let _ = events.send(CameraSlotWorkerEvent::Event(CameraStatusEvent {
+                            slot,
+                            index: config.index,
+                            kind: CameraStatusEventKind::Connected,
+                            message: "camera connected".to_string(),
+                        }));
+                    }
+                    connected = true;
+                    let _ = events.send(CameraSlotWorkerEvent::Status(CameraSlotStatus {
+                        slot,
+                        index: config.index,
+                        connected: true,
+                        message: "connected".to_string(),
+                    }));
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    if connected {
+                        let _ = events.send(CameraSlotWorkerEvent::Event(CameraStatusEvent {
+                            slot,
+                            index: config.index,
+                            kind: CameraStatusEventKind::Disconnected,
+                            message: message.clone(),
+                        }));
+                    }
+                    connected = false;
+                    last_error = Some(message.clone());
+                    let _ = events.send(CameraSlotWorkerEvent::Status(CameraSlotStatus {
+                        slot,
+                        index: config.index,
+                        connected: false,
+                        message,
+                    }));
+                    sleep_until_next_attempt(&stop, RECONNECT_INTERVAL);
+                }
+            }
+            continue;
+        }
+
+        let started = Instant::now();
+        let result = camera
+            .as_mut()
+            .expect("camera is checked above")
+            .capture();
+        match result {
+            Ok(frame) => {
+                seq += 1;
+                let _ = events.send(CameraSlotWorkerEvent::Frame(FramePacket {
+                    slot,
+                    index: config.index,
+                    seq,
+                    frame,
+                    capture_ms: started.elapsed().as_millis(),
+                }));
+                if connected {
+                    let elapsed = started.elapsed();
+                    if elapsed < target_interval {
+                        sleep_until_next_attempt(&stop, target_interval - elapsed);
+                    }
+                }
+            }
+            Err(err) => {
+                camera = None;
+                let message = err.to_string();
+                if connected {
+                    let _ = events.send(CameraSlotWorkerEvent::Event(CameraStatusEvent {
+                        slot,
+                        index: config.index,
+                        kind: CameraStatusEventKind::Disconnected,
+                        message: message.clone(),
+                    }));
+                }
+                connected = false;
+                last_error = Some(message.clone());
+                let _ = events.send(CameraSlotWorkerEvent::Status(CameraSlotStatus {
+                    slot,
+                    index: config.index,
+                    connected: false,
+                    message,
+                }));
+            }
+        }
+    }
+
+    if connected {
+        let _ = events.send(CameraSlotWorkerEvent::Status(CameraSlotStatus {
+            slot,
+            index: config.index,
+            connected: false,
+            message: last_error.unwrap_or_else(|| "camera stream stopped".to_string()),
+        }));
+    }
+}
+
+fn sleep_until_next_attempt(stop: &AtomicBool, duration: Duration) {
+    let started = Instant::now();
+    while !stop.load(Ordering::SeqCst) {
+        let elapsed = started.elapsed();
+        if elapsed >= duration {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10).min(duration - elapsed));
+    }
 }
 
 fn control_info_from_description(
