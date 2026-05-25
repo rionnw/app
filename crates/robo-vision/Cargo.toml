@@ -1,0 +1,11 @@
+[package]
+name = "robo-vision"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image = "0.25"
+imageproc = "0.26"
+robo-core = { path = "../robo-core" }

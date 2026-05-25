@@ -1,0 +1,9 @@
+[package]
+name = "robo-pipeline"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+robo-core = { path = "../robo-core" }

@@ -1,0 +1,12 @@
+[package]
+name = "robo-solver"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+robo-core = { path = "../robo-core" }
+
+[build-dependencies]
+cc = "1"

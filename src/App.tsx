@@ -1,37 +1,48 @@
+import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 type Face = "U" | "R" | "F" | "D" | "L" | "B";
-
-type RoiRect = {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-};
-
-type StickerRegion = {
+type RoiRect = { x: number; y: number; w: number; h: number };
+type StickerRegion = { id: string; face: Face; index: number; rect: RoiRect | null };
+type CameraDevice = { index: string; name: string; description: string };
+type CameraConfig = { index: number; width: number; height: number; fps: number; frameFormat: string };
+type CameraStatus = { slot: number; index: number; connected: boolean; message: string };
+type CameraEvent = { slot: number; index: number; kind: "connected" | "disconnected"; message: string };
+type CameraControl = {
   id: string;
-  face: Face;
-  index: number;
-  rect: RoiRect | null;
-  locked: boolean;
+  name: string;
+  kind: "integer" | "float" | "boolean";
+  value: number;
+  default: number;
+  min: number | null;
+  max: number | null;
+  step: number | null;
+  active: boolean;
+  flags: string[];
 };
-
-type ImageBox = {
-  left: number;
-  top: number;
+type FrameResponse = {
   width: number;
   height: number;
+  seq: number;
+  frameUrl: string;
+  statuses: CameraStatus[];
+  events: CameraEvent[];
 };
-
-type LogItem = {
-  time: string;
+type SerialPort = { name: string; port_type: string };
+type SerialReadResponse = {
   text: string;
-  kind: "info" | "warn" | "error";
+  motion_finished: boolean;
+  param_write_ok: boolean;
+  param_write_error: boolean;
 };
+type SolveResponse = { facelets: string; moves: string[]; steps: string[]; encoded_steps: string };
+type ImageBox = { left: number; top: number; width: number; height: number };
+type LogItem = { time: string; text: string; kind: "info" | "warn" | "error" };
+type CameraPreset = { label: string; width: number; height: number; fps: number; frameFormat: string };
 
 const faces: Face[] = ["U", "R", "F", "D", "L", "B"];
+const solvedFacelets = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB";
 
 const defaultRegions = (): StickerRegion[] =>
   faces.flatMap((face) =>
@@ -40,9 +51,39 @@ const defaultRegions = (): StickerRegion[] =>
       face,
       index: index + 1,
       rect: null,
-      locked: false,
     })),
   );
+
+const defaultCameraConfigs = (): CameraConfig[] =>
+  Array.from({ length: 4 }, (_, index) => ({ index, width: 640, height: 480, fps: 30, frameFormat: "MJPEG" }));
+
+const cameraPresets: CameraPreset[] = [
+  { label: "320 x 240 @ 30 MJPEG", width: 320, height: 240, fps: 30, frameFormat: "MJPEG" },
+  { label: "640 x 480 @ 30 MJPEG", width: 640, height: 480, fps: 30, frameFormat: "MJPEG" },
+  { label: "800 x 600 @ 30 MJPEG", width: 800, height: 600, fps: 30, frameFormat: "MJPEG" },
+  { label: "1280 x 720 @ 30 MJPEG", width: 1280, height: 720, fps: 30, frameFormat: "MJPEG" },
+  { label: "1280 x 720 @ 60 MJPEG", width: 1280, height: 720, fps: 60, frameFormat: "MJPEG" },
+  { label: "1920 x 1080 @ 30 MJPEG", width: 1920, height: 1080, fps: 30, frameFormat: "MJPEG" },
+];
+
+const presetLabel = (format: { width: number; height: number; fps: number; frameFormat: string }) =>
+  `${format.width} x ${format.height} @ ${format.fps} ${format.frameFormat}`;
+
+const presetValue = (format: { width: number; height: number; fps: number; frameFormat: string }) =>
+  `${format.width}x${format.height}@${format.fps}:${format.frameFormat}`;
+
+const sameCameraStatuses = (left: CameraStatus[], right: CameraStatus[]) =>
+  left.length === right.length &&
+  left.every((item, index) => {
+    const other = right[index];
+    return (
+      other &&
+      item.slot === other.slot &&
+      item.index === other.index &&
+      item.connected === other.connected &&
+      item.message === other.message
+    );
+  });
 
 const nowTime = () =>
   new Intl.DateTimeFormat("zh-CN", {
@@ -56,46 +97,201 @@ function App() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const roiInputRef = useRef<HTMLInputElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
+  const previewImageRef = useRef<HTMLImageElement>(null);
+  const previewFallbackRef = useRef(false);
+  const previewTransportRef = useRef<"protocol" | "dataUrl">("protocol");
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
 
-  const [toolsOpen, setToolsOpen] = useState(false);
+  const [devices, setDevices] = useState<CameraDevice[]>([]);
+  const [cameraConfigs, setCameraConfigs] = useState<CameraConfig[]>(defaultCameraConfigs);
+  const [cameraStatuses, setCameraStatuses] = useState<CameraStatus[]>([]);
+  const [swapSlot, setSwapSlot] = useState<number | null>(null);
+  const [controlSlot, setControlSlot] = useState(0);
+  const [loadedControlSlot, setLoadedControlSlot] = useState<number | null>(null);
+  const [cameraControls, setCameraControls] = useState<CameraControl[]>([]);
+  const [cameraFormats, setCameraFormats] = useState<CameraPreset[]>([]);
   const [cameraOpen, setCameraOpen] = useState(false);
-  const [serialConnected, setSerialConnected] = useState(true);
-  const [selectedPort, setSelectedPort] = useState("COM4");
   const [imageSrc, setImageSrc] = useState<string | null>(null);
-  const [imageName, setImageName] = useState("后台拼接图像");
+  const [imageName, setImageName] = useState("实时相机画面");
   const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
   const [imageBox, setImageBox] = useState<ImageBox>({ left: 0, top: 0, width: 0, height: 0 });
+
   const [regions, setRegions] = useState<StickerRegion[]>(defaultRegions);
   const [currentRegionId, setCurrentRegionId] = useState("U1");
   const [annotationMode, setAnnotationMode] = useState(false);
   const [showRoi, setShowRoi] = useState(true);
   const [draftRect, setDraftRect] = useState<RoiRect | null>(null);
-  const [elapsed, setElapsed] = useState("00.00");
-  const [runStatus, setRunStatus] = useState("空闲");
-  const [solution, setSolution] = useState("未解算");
-  const [logs, setLogs] = useState<LogItem[]>([
-    { time: nowTime(), text: "RobotApp initialized.", kind: "info" },
-  ]);
+
+  const [ports, setPorts] = useState<SerialPort[]>([]);
+  const [selectedPort, setSelectedPort] = useState("");
+  const [baudRate, setBaudRate] = useState(115200);
+  const [serialOpen, setSerialOpen] = useState(false);
+
+  const [status, setStatus] = useState("空闲");
+  const [facelets, setFacelets] = useState(solvedFacelets);
+  const [moves, setMoves] = useState<string[]>([]);
+  const [steps, setSteps] = useState<string[]>([]);
+  const [encodedSteps, setEncodedSteps] = useState("");
+  const [timerRunning, setTimerRunning] = useState(false);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const [logs, setLogs] = useState<LogItem[]>([{ time: nowTime(), text: "robo-ui 已启动。", kind: "info" }]);
 
   const markedCount = regions.filter((region) => region.rect).length;
-
+  const elapsedText = useMemo(() => {
+    const centiseconds = Math.floor(elapsedMs / 10);
+    const minutes = Math.floor(centiseconds / 6000);
+    const seconds = Math.floor((centiseconds % 6000) / 100);
+    const cs = centiseconds % 100;
+    return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}.${cs
+      .toString()
+      .padStart(2, "0")}`;
+  }, [elapsedMs]);
   const imageAspectLabel = useMemo(() => {
     if (!naturalSize.width || !naturalSize.height) return "-";
     return `${naturalSize.width} x ${naturalSize.height}`;
   }, [naturalSize]);
+  const previewIntervalMs = useMemo(() => {
+    const maxFps = Math.max(1, ...cameraConfigs.map((config) => config.fps || 1));
+    return Math.max(16, Math.round(1000 / maxFps));
+  }, [cameraConfigs]);
+  const activeCameraConfig = cameraConfigs[controlSlot] ?? cameraConfigs[0];
+  const slotParamsVisible = loadedControlSlot === controlSlot;
+
+  const addLog = (text: string, kind: LogItem["kind"] = "info") => {
+    setLogs((items) => [{ time: nowTime(), text, kind }, ...items].slice(0, 120));
+  };
+
+  const isControlWritable = (control: CameraControl) =>
+    control.active &&
+    !control.flags.some((flag) => {
+      const normalized = flag.toLowerCase();
+      return normalized.includes("readonly") || normalized.includes("disabled");
+    });
+
+  const cameraControlStorageKey = (slot = controlSlot) => `robo-ui.camera-controls.slot-${slot}`;
+
+  const saveCameraControls = () => {
+    const values = cameraControls.map((control) => ({ id: control.id, value: control.value }));
+    localStorage.setItem(cameraControlStorageKey(), JSON.stringify(values));
+    addLog(`已保存槽 ${controlSlot + 1} 的相机参数。`);
+  };
+
+  const restoreDefaultCameraControls = async () => {
+    const writableControls = cameraControls.filter(isControlWritable);
+    for (const control of writableControls) {
+      await setCameraControlValue(control, control.default);
+    }
+    addLog(`槽 ${controlSlot + 1} 已恢复默认参数。`);
+    refreshCameraControls(controlSlot);
+  };
+
+  const refreshCameras = async () => {
+    try {
+      const nextDevices = await invoke<CameraDevice[]>("list_cameras");
+      setDevices(nextDevices);
+      addLog(`扫描到 ${nextDevices.length} 个相机。`);
+    } catch (error) {
+      addLog(String(error), "error");
+    }
+  };
+
+  const refreshPorts = async () => {
+    try {
+      const nextPorts = await invoke<SerialPort[]>("list_serial_ports");
+      setPorts(nextPorts);
+      setSelectedPort((current) => current || nextPorts[0]?.name || "");
+      addLog(`扫描到 ${nextPorts.length} 个串口。`);
+    } catch (error) {
+      addLog(String(error), "error");
+    }
+  };
+
+  const refreshCameraControls = async (slot = controlSlot) => {
+    setLoadedControlSlot(slot);
+    const config = cameraConfigs[slot];
+    try {
+      if (config) {
+        const formats = await invoke<CameraPreset[]>("list_camera_formats", { index: config.index });
+        setCameraFormats(
+          formats.length
+            ? formats.map((format) => ({ ...format, label: presetLabel(format) }))
+            : cameraPresets,
+        );
+      }
+      if (!cameraOpen) {
+        setCameraControls([]);
+        addLog(`槽 ${slot + 1} 已读取相机格式；打开相机后可读取硬件控制参数。`);
+        return;
+      }
+      const controls = await invoke<CameraControl[]>("list_camera_controls", { slot });
+      setCameraControls(controls);
+      addLog(`槽 ${slot + 1} 读取到 ${controls.length} 个可调相机参数。`);
+    } catch (error) {
+      setCameraControls([]);
+      setCameraFormats(cameraPresets);
+      addLog(String(error), "warn");
+    }
+  };
+
+  useEffect(() => {
+    refreshCameras();
+    refreshPorts();
+  }, []);
+
+  useEffect(() => {
+    if (!timerRunning) return;
+    const startAt = performance.now() - elapsedMs;
+    const timer = window.setInterval(() => {
+      setElapsedMs(performance.now() - startAt);
+    }, 33);
+    return () => window.clearInterval(timer);
+  }, [timerRunning]);
+
+  useEffect(() => {
+    if (!serialOpen) return;
+    let stopped = false;
+    let busy = false;
+
+    const tick = async () => {
+      if (busy || stopped) return;
+      busy = true;
+      try {
+        const result = await invoke<SerialReadResponse>("read_serial");
+        if (!result.text) return;
+
+        if (result.motion_finished) {
+          setTimerRunning(false);
+          addLog("收到结束信号 ND，计时已停止。");
+        } else if (result.param_write_ok) {
+          addLog("参数写入成功。");
+        } else if (result.param_write_error) {
+          addLog("参数写入失败，请检查设备连接。", "error");
+        } else if (result.text.trim()) {
+          addLog(`串口：${result.text.trim()}`);
+        }
+      } catch (error) {
+        addLog(String(error), "warn");
+      } finally {
+        busy = false;
+      }
+    };
+
+    const timer = window.setInterval(tick, 80);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [serialOpen]);
 
   useEffect(() => {
     const updateImageBox = () => {
       const stage = stageRef.current;
       if (!stage || !naturalSize.width || !naturalSize.height) return;
-
       const stageRect = stage.getBoundingClientRect();
       const imageRatio = naturalSize.width / naturalSize.height;
       const stageRatio = stageRect.width / stageRect.height;
       const width = stageRatio > imageRatio ? stageRect.height * imageRatio : stageRect.width;
       const height = stageRatio > imageRatio ? stageRect.height : stageRect.width / imageRatio;
-
       setImageBox({
         left: (stageRect.width - width) / 2,
         top: (stageRect.height - height) / 2,
@@ -105,26 +301,152 @@ function App() {
     };
 
     updateImageBox();
-
     const observer = new ResizeObserver(updateImageBox);
     if (stageRef.current) observer.observe(stageRef.current);
     window.addEventListener("resize", updateImageBox);
-
     return () => {
       observer.disconnect();
       window.removeEventListener("resize", updateImageBox);
     };
   }, [naturalSize]);
 
-  const addLog = (text: string, kind: LogItem["kind"] = "info") => {
-    setLogs((items) => [{ time: nowTime(), text, kind }, ...items].slice(0, 80));
+  useEffect(() => {
+    if (!cameraOpen) return;
+    let stopped = false;
+    let busy = false;
+
+    const tick = async () => {
+      if (busy || stopped) return;
+      busy = true;
+      try {
+        const frame = await invoke<FrameResponse>("capture_frame");
+        if (!stopped) {
+          const frameSrc =
+            previewTransportRef.current === "dataUrl" || !frame.frameUrl
+              ? await invoke<string>("latest_frame_data_url")
+              : frame.frameUrl;
+          if (previewImageRef.current) {
+            previewImageRef.current.src = frameSrc;
+          } else {
+            setImageSrc(frameSrc);
+          }
+          setNaturalSize((size) =>
+            size.width === frame.width && size.height === frame.height
+              ? size
+              : { width: frame.width, height: frame.height },
+          );
+          setImageName((name) => (name === "实时相机画面" ? name : "实时相机画面"));
+          setCameraStatuses((statuses) => (sameCameraStatuses(statuses, frame.statuses) ? statuses : frame.statuses));
+          frame.events.forEach((event) => {
+            const text =
+              event.kind === "connected"
+                ? `相机槽 ${event.slot + 1} / index ${event.index} 已连接或恢复。`
+                : `相机槽 ${event.slot + 1} / index ${event.index} 断联：${event.message}`;
+            addLog(text, event.kind === "connected" ? "info" : "warn");
+          });
+        }
+      } catch (error) {
+        addLog(String(error), "error");
+      } finally {
+        busy = false;
+      }
+    };
+
+    tick();
+    const timer = window.setInterval(tick, previewIntervalMs);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [cameraOpen, previewIntervalMs]);
+
+  const applyCameraConfig = async (index: number, patch: Partial<CameraConfig>) => {
+    const next = cameraConfigs.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item));
+    setCameraConfigs(next);
+    await reopenIfNeeded(next);
   };
 
-  const selectNextMissingRegion = (afterId = currentRegionId) => {
-    const startIndex = regions.findIndex((region) => region.id === afterId);
-    const ordered = [...regions.slice(startIndex + 1), ...regions.slice(0, startIndex + 1)];
-    const next = ordered.find((region) => !region.rect);
-    if (next) setCurrentRegionId(next.id);
+  const updateCameraPreset = async (index: number, value: string) => {
+    const preset = cameraPresets.find((item) => presetValue(item) === value);
+    if (!preset) return;
+    await applyCameraConfig(index, {
+      width: preset.width,
+      height: preset.height,
+      fps: preset.fps,
+      frameFormat: preset.frameFormat,
+    });
+  };
+
+  const reopenIfNeeded = async (configs: CameraConfig[]) => {
+    if (!cameraOpen) return;
+    try {
+      await invoke("open_cameras", { configs });
+      addLog("相机布局已更新，正在按新顺序预览。");
+      refreshCameraControls(controlSlot);
+    } catch (error) {
+      addLog(String(error), "error");
+    }
+  };
+
+  const selectCameraSlot = async (slot: number) => {
+    if (swapSlot === null) {
+      setSwapSlot(slot);
+      addLog(`已选择槽 ${slot + 1}，再点另一个槽进行互换。`);
+      return;
+    }
+    if (swapSlot === slot) {
+      setSwapSlot(null);
+      return;
+    }
+    const next = [...cameraConfigs];
+    [next[swapSlot], next[slot]] = [next[slot], next[swapSlot]];
+    setCameraConfigs(next);
+    setSwapSlot(null);
+    await reopenIfNeeded(next);
+  };
+
+  const openCamera = async () => {
+    try {
+      previewFallbackRef.current = false;
+      previewTransportRef.current = "protocol";
+      await invoke("open_cameras", { configs: cameraConfigs });
+      setCameraOpen(true);
+      setStatus("相机预览中");
+      addLog("相机预览已启动。断联槽位会用占位画面保留。");
+    } catch (error) {
+      addLog(String(error), "error");
+    }
+  };
+
+  const closeCamera = async () => {
+    try {
+      await invoke("close_cameras");
+      setCameraOpen(false);
+      setCameraStatuses([]);
+      setCameraControls([]);
+      setLoadedControlSlot(null);
+      setStatus("空闲");
+      addLog("相机已关闭。");
+    } catch (error) {
+      addLog(String(error), "error");
+    }
+  };
+
+  const setCameraControlValue = async (control: CameraControl, value: number) => {
+    setCameraControls((items) => items.map((item) => (item.id === control.id ? { ...item, value } : item)));
+    try {
+      await invoke("set_camera_control", { slot: controlSlot, id: control.id, value });
+    } catch (error) {
+      addLog(String(error), "error");
+      refreshCameraControls(controlSlot);
+    }
+  };
+
+  const selectControlSlot = (slot: number) => {
+    setControlSlot(slot);
+    setLoadedControlSlot(null);
+    setCameraControls([]);
+    setCameraFormats([]);
   };
 
   const normalizedPointFromEvent = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -149,7 +471,6 @@ function App() {
     if (!dragStartRef.current) return;
     const point = normalizedPointFromEvent(event);
     if (!point) return;
-
     const x = Math.min(dragStartRef.current.x, point.x);
     const y = Math.min(dragStartRef.current.y, point.y);
     const w = Math.abs(point.x - dragStartRef.current.x);
@@ -157,21 +478,108 @@ function App() {
     setDraftRect({ x, y, w, h });
   };
 
+  const selectNextMissingRegion = (afterId = currentRegionId) => {
+    const startIndex = regions.findIndex((region) => region.id === afterId);
+    const ordered = [...regions.slice(startIndex + 1), ...regions.slice(0, startIndex + 1)];
+    const next = ordered.find((region) => !region.rect);
+    if (next) setCurrentRegionId(next.id);
+  };
+
   const finishAnnotation = () => {
     if (!dragStartRef.current || !draftRect) return;
     dragStartRef.current = null;
-
-    if (draftRect.w < 0.005 || draftRect.h < 0.005) {
+    if (draftRect.w < 0.004 || draftRect.h < 0.004) {
       setDraftRect(null);
       return;
     }
-
     setRegions((items) =>
       items.map((region) => (region.id === currentRegionId ? { ...region, rect: draftRect } : region)),
     );
-    addLog(`ROI ${currentRegionId} marked.`);
+    addLog(`已标注 ${currentRegionId}。`);
     setDraftRect(null);
     selectNextMissingRegion(currentRegionId);
+  };
+
+  const solveFromFrame = async () => {
+    if (markedCount < 54 || !naturalSize.width || !naturalSize.height) {
+      addLog(`ROI 未完成：${markedCount}/54。`, "warn");
+      return;
+    }
+    try {
+      setStatus("识别解算中");
+      const rois = regions.map((region) => ({
+        x: Math.round((region.rect?.x || 0) * naturalSize.width),
+        y: Math.round((region.rect?.y || 0) * naturalSize.height),
+        width: Math.max(1, Math.round((region.rect?.w || 0) * naturalSize.width)),
+        height: Math.max(1, Math.round((region.rect?.h || 0) * naturalSize.height)),
+      }));
+      const result = await invoke<SolveResponse>("solve_current_frame", { rois });
+      applySolveResult(result);
+      addLog("当前相机帧已识别并解算。");
+    } catch (error) {
+      setStatus("解算失败");
+      addLog(String(error), "error");
+    }
+  };
+
+  const solveFromFacelets = async () => {
+    try {
+      setStatus("解算中");
+      const result = await invoke<SolveResponse>("solve_facelets", { facelets });
+      applySolveResult(result);
+      addLog("已按 facelets 字符串解算。");
+    } catch (error) {
+      setStatus("解算失败");
+      addLog(String(error), "error");
+    }
+  };
+
+  const applySolveResult = (result: SolveResponse) => {
+    setFacelets(result.facelets);
+    setMoves(result.moves);
+    setSteps(result.steps);
+    setEncodedSteps(result.encoded_steps);
+    setStatus("已生成步骤");
+  };
+
+  const openSerial = async () => {
+    if (!selectedPort) {
+      addLog("请先选择串口。", "warn");
+      return;
+    }
+    try {
+      await invoke("open_serial", { portName: selectedPort, baudRate });
+      setSerialOpen(true);
+      addLog(`串口 ${selectedPort} 已打开。`);
+    } catch (error) {
+      addLog(String(error), "error");
+    }
+  };
+
+  const closeSerial = async () => {
+    try {
+      await invoke("close_serial");
+      setSerialOpen(false);
+      setTimerRunning(false);
+      addLog("串口已关闭。");
+    } catch (error) {
+      addLog(String(error), "error");
+    }
+  };
+
+  const sendToRobot = async () => {
+    if (!encodedSteps) {
+      addLog("没有可发送的步骤。", "warn");
+      return;
+    }
+    try {
+      await invoke("send_steps", { encodedSteps });
+      setElapsedMs(0);
+      setTimerRunning(true);
+      addLog("步骤已发送到串口。");
+    } catch (error) {
+      addLog(String(error), "error");
+    }
   };
 
   const loadImageFile = (file: File) => {
@@ -179,82 +587,44 @@ function App() {
     reader.onload = () => {
       setImageSrc(String(reader.result));
       setImageName(file.name);
-      addLog(`Loaded stitched image: ${file.name}`);
+      addLog(`已读取图片：${file.name}`);
     };
     reader.readAsDataURL(file);
   };
 
-  const handleImageInput = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) loadImageFile(file);
-    setToolsOpen(false);
-    event.target.value = "";
+  const fallbackPreviewImage = async () => {
+    if (previewFallbackRef.current) return;
+    previewFallbackRef.current = true;
+    try {
+      const dataUrl = await invoke<string>("latest_frame_data_url");
+      previewTransportRef.current = "dataUrl";
+      if (previewImageRef.current) {
+        previewImageRef.current.src = dataUrl;
+      } else {
+        setImageSrc(dataUrl);
+      }
+      addLog("预览协议加载失败，已临时降级为 data URL。", "warn");
+    } catch (error) {
+      addLog(String(error), "error");
+    }
   };
 
   const handleRoiInput = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-
     const reader = new FileReader();
     reader.onload = () => {
       try {
         const data = JSON.parse(String(reader.result)) as StickerRegion[];
-        const knownIds = new Set(defaultRegions().map((region) => region.id));
-        const nextRegions = data.filter((region) => knownIds.has(region.id));
-        if (nextRegions.length !== 54) throw new Error("ROI count must be 54");
-        setRegions(nextRegions);
-        addLog(`Loaded ROI config: ${file.name}`);
+        if (data.length !== 54) throw new Error("ROI 数量必须是 54。");
+        setRegions(data);
+        addLog(`已读取 ROI：${file.name}`);
       } catch (error) {
-        addLog(error instanceof Error ? error.message : "Failed to load ROI config.", "error");
+        addLog(error instanceof Error ? error.message : String(error), "error");
       }
     };
     reader.readAsText(file);
-    setToolsOpen(false);
     event.target.value = "";
-  };
-
-  const toggleCamera = () => {
-    setCameraOpen((open) => {
-      const next = !open;
-      addLog(next ? "Cameras opening..." : "Cameras closed.");
-      if (next) setTimeout(() => addLog("Opened cameras."), 250);
-      return next;
-    });
-  };
-
-  const startSolve = () => {
-    if (!imageSrc) {
-      addLog("No stitched image available for solving.", "warn");
-      return;
-    }
-    if (markedCount < 54) {
-      addLog(`ROI incomplete: ${markedCount}/54.`, "warn");
-      return;
-    }
-
-    setSolution("R U R' U' F2 D L2");
-    setRunStatus("已解算");
-    addLog("Cube state recognized. Solution generated.");
-  };
-
-  const startRun = () => {
-    if (!serialConnected) {
-      addLog("Serial port is not connected.", "error");
-      return;
-    }
-    if (solution === "未解算") {
-      addLog("Solve before running robot.", "warn");
-      return;
-    }
-
-    setRunStatus("运行中");
-    setElapsed("00.00");
-    addLog("Robot run started.");
-    window.setTimeout(() => {
-      setElapsed("03.42");
-      setRunStatus("完成");
-      addLog("Robot run finished.");
-    }, 900);
   };
 
   const downloadText = (filename: string, text: string, type = "application/json") => {
@@ -266,201 +636,46 @@ function App() {
     URL.revokeObjectURL(url);
   };
 
-  const saveRoi = () => {
-    downloadText("robot-roi.json", JSON.stringify(regions, null, 2));
-    addLog("ROI config exported.");
-    setToolsOpen(false);
-  };
-
-  const saveOriginalImage = () => {
-    if (!imageSrc) {
-      addLog("No image to save.", "warn");
-      return;
-    }
-    const link = document.createElement("a");
-    link.href = imageSrc;
-    link.download = imageName || "stitched-image.png";
-    link.click();
-    addLog("Original image saved.");
-    setToolsOpen(false);
-  };
-
-  const saveAnnotatedImage = async () => {
-    if (!imageSrc || !naturalSize.width || !naturalSize.height) {
-      addLog("No image to save.", "warn");
-      return;
-    }
-
-    const image = new Image();
-    image.src = imageSrc;
-    await image.decode();
-
-    const canvas = document.createElement("canvas");
-    canvas.width = naturalSize.width;
-    canvas.height = naturalSize.height;
-    const context = canvas.getContext("2d");
-    if (!context) return;
-
-    context.drawImage(image, 0, 0);
-    context.lineWidth = Math.max(3, naturalSize.width * 0.003);
-    context.font = `${Math.max(18, naturalSize.width * 0.018)}px sans-serif`;
-    context.textBaseline = "top";
-
-    regions.forEach((region) => {
-      if (!region.rect) return;
-      const { x, y, w, h } = region.rect;
-      const px = x * naturalSize.width;
-      const py = y * naturalSize.height;
-      const pw = w * naturalSize.width;
-      const ph = h * naturalSize.height;
-      context.strokeStyle = region.id === currentRegionId ? "#f5c542" : "#31c96b";
-      context.fillStyle = "rgba(49, 201, 107, 0.16)";
-      context.fillRect(px, py, pw, ph);
-      context.strokeRect(px, py, pw, ph);
-      context.fillStyle = "#ffffff";
-      context.fillText(region.id, px + 6, py + 5);
-    });
-
-    const link = document.createElement("a");
-    link.href = canvas.toDataURL("image/png");
-    link.download = "stitched-image-roi.png";
-    link.click();
-    addLog("Annotated image saved.");
-    setToolsOpen(false);
-  };
-
-  const clearImage = () => {
-    setImageSrc(null);
-    setImageName("后台拼接图像");
-    setNaturalSize({ width: 0, height: 0 });
-    addLog("Image cleared.");
-    setToolsOpen(false);
-  };
-
-  const clearRoi = () => {
-    setRegions(defaultRegions());
-    setCurrentRegionId("U1");
-    addLog("ROI cleared.");
-    setToolsOpen(false);
-  };
-
-  const exportLogs = () => {
-    downloadText(
-      "robot-log.txt",
-      logs.map((item) => `[${item.time}] ${item.kind.toUpperCase()} ${item.text}`).join("\n"),
-      "text/plain",
-    );
-  };
-
   return (
     <main className="robot-shell">
-      <input ref={imageInputRef} type="file" accept="image/*" hidden onChange={handleImageInput} />
+      <input
+        ref={imageInputRef}
+        type="file"
+        accept="image/*"
+        hidden
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          if (file) loadImageFile(file);
+          event.target.value = "";
+        }}
+      />
       <input ref={roiInputRef} type="file" accept="application/json,.json" hidden onChange={handleRoiInput} />
 
-      <header className="menu-bar">
-        <div className="tool-menu">
-          <button className="menu-trigger" type="button" onClick={() => setToolsOpen((open) => !open)}>
-            工具
-            <span aria-hidden="true">⌄</span>
+      <header className="top-bar">
+        <div>
+          <h1>robo-ui</h1>
+          <span>{status}</span>
+        </div>
+        <div className="top-actions">
+          <button type="button" onClick={() => imageInputRef.current?.click()}>
+            读取图片
           </button>
-          {toolsOpen && (
-            <div className="tool-popover">
-              <section>
-                <h2>图像</h2>
-                <button type="button" onClick={() => imageInputRef.current?.click()}>
-                  读取图片
-                </button>
-                <button type="button" onClick={saveOriginalImage}>
-                  保存图片
-                </button>
-                <button type="button" onClick={saveAnnotatedImage}>
-                  保存带标注图片
-                </button>
-                <button type="button" onClick={clearImage}>
-                  清空图片
-                </button>
-              </section>
-              <section>
-                <h2>ROI 标注</h2>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAnnotationMode((mode) => !mode);
-                    setToolsOpen(false);
-                  }}
-                >
-                  {annotationMode ? "退出标记 ROI" : "标记 ROI"}
-                </button>
-                <button type="button" onClick={saveRoi}>
-                  保存 ROI
-                </button>
-                <button type="button" onClick={() => roiInputRef.current?.click()}>
-                  读取 ROI
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowRoi((visible) => !visible);
-                    setToolsOpen(false);
-                  }}
-                >
-                  {showRoi ? "隐藏 ROI" : "显示 ROI"}
-                </button>
-                <button type="button" onClick={clearRoi}>
-                  清空 ROI
-                </button>
-              </section>
-              <section>
-                <h2>调试</h2>
-                <button
-                  type="button"
-                  onClick={() => {
-                    addLog("Serial ports refreshed.");
-                    setToolsOpen(false);
-                  }}
-                >
-                  刷新串口
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    addLog("Parameters read from device.");
-                    setToolsOpen(false);
-                  }}
-                >
-                  读取参数
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    addLog("Parameters written to device.");
-                    setToolsOpen(false);
-                  }}
-                >
-                  写入参数
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setLogs([]);
-                    setToolsOpen(false);
-                  }}
-                >
-                  清空日志
-                </button>
-                <button type="button" onClick={exportLogs}>
-                  导出日志
-                </button>
-              </section>
-            </div>
-          )}
+          <button type="button" onClick={() => roiInputRef.current?.click()}>
+            读取 ROI
+          </button>
+          <button type="button" onClick={() => downloadText("robot-roi.json", JSON.stringify(regions, null, 2))}>
+            保存 ROI
+          </button>
+          <button type="button" onClick={() => setRegions(defaultRegions())}>
+            清空 ROI
+          </button>
         </div>
       </header>
 
       <section className="workspace">
         <section className="image-panel">
           <div className="panel-title">
-            <h1>魔方图像</h1>
+            <h2>图像与 ROI</h2>
             <div className="image-meta">
               <span>{imageName}</span>
               <span>{imageAspectLabel}</span>
@@ -479,7 +694,8 @@ function App() {
             {imageSrc ? (
               <>
                 <img
-                  alt="Stitched cube"
+                  ref={previewImageRef}
+                  alt="cube camera frame"
                   className="stitched-image"
                   src={imageSrc}
                   style={{
@@ -489,11 +705,13 @@ function App() {
                     height: imageBox.height,
                   }}
                   onLoad={(event) =>
-                    setNaturalSize({
-                      width: event.currentTarget.naturalWidth,
-                      height: event.currentTarget.naturalHeight,
+                    setNaturalSize((size) => {
+                      const width = event.currentTarget.naturalWidth;
+                      const height = event.currentTarget.naturalHeight;
+                      return size.width === width && size.height === height ? size : { width, height };
                     })
                   }
+                  onError={fallbackPreviewImage}
                 />
                 {showRoi && (
                   <svg
@@ -518,7 +736,7 @@ function App() {
                             height={region.rect.h}
                             vectorEffect="non-scaling-stroke"
                           />
-                          <text className="roi-label" x={region.rect.x + 0.006} y={region.rect.y + 0.018}>
+                          <text className="roi-label" x={region.rect.x + 0.006} y={region.rect.y + 0.022}>
                             {region.id}
                           </text>
                         </g>
@@ -539,55 +757,261 @@ function App() {
               </>
             ) : (
               <div className="empty-image">
-                <strong>等待拼接图像</strong>
-                <span>通过工具菜单读取图片，或打开相机后由后台推送图像。</span>
+                <strong>等待相机画面</strong>
+                <span>打开相机或读取一张图片后，可以在这里标注 54 个 ROI。</span>
               </div>
             )}
           </div>
 
           <div className="bottom-actions">
-            <button type="button" onClick={toggleCamera}>
+            <button type="button" onClick={cameraOpen ? closeCamera : openCamera}>
               {cameraOpen ? "关闭相机" : "打开相机"}
             </button>
-            <button type="button" onClick={startSolve}>
-              开始解算
+            <button type="button" onClick={() => setAnnotationMode((mode) => !mode)}>
+              {annotationMode ? "退出标注" : "标注 ROI"}
             </button>
-            <button type="button" onClick={startRun}>
-              开始运行
+            <button type="button" onClick={solveFromFrame}>
+              识别并解算
+            </button>
+            <button type="button" onClick={sendToRobot}>
+              发送步骤
             </button>
           </div>
         </section>
 
         <aside className="side-panel">
-          <section className="timer-card">
-            <h2>运动计时</h2>
-            <div className="timer-display">{elapsed}</div>
-            <div className="status-line">状态：{runStatus}</div>
+          <section className="panel-card timer-card">
+            <div className="card-title">
+              <h2>计时器</h2>
+              <button
+                type="button"
+                onClick={() => {
+                  setElapsedMs(0);
+                  setTimerRunning(false);
+                }}
+              >
+                复位
+              </button>
+            </div>
+            <div className="timer-display">{elapsedText}</div>
+            <div className="button-row">
+              <button type="button" onClick={() => setTimerRunning(true)}>
+                开始
+              </button>
+              <button type="button" onClick={() => setTimerRunning(false)}>
+                停止
+              </button>
+            </div>
+            <p className="hint-line">{timerRunning ? "运行中，等待下位机 ND 结束信号。" : "发送步骤后自动开始计时。"}</p>
           </section>
 
           <section className="panel-card">
-            <h2>串口</h2>
-            <label className="field">
-              <span>串口信息</span>
-              <select value={selectedPort} onChange={(event) => setSelectedPort(event.target.value)}>
-                <option>COM4</option>
-                <option>COM5</option>
-                <option>/dev/tty.usbserial</option>
-              </select>
-            </label>
-            <div className="button-row">
-              <button type="button" onClick={() => setSerialConnected((connected) => !connected)}>
-                {serialConnected ? "关闭" : "连接"}
-              </button>
-              <button type="button" onClick={() => addLog("Serial ports refreshed.")}>
-                刷新
+            <div className="card-title">
+              <h2>相机</h2>
+              <button type="button" onClick={refreshCameras}>
+                扫描
               </button>
             </div>
-            <p className="strong-line">串口状态：{serialConnected ? "已连接" : "未连接"}</p>
+            <div className="device-list">
+              {devices.length ? (
+                devices.map((device) => (
+                  <span key={device.index}>
+                    {device.index}: {device.name}
+                  </span>
+                ))
+              ) : (
+                <span>未发现相机</span>
+              )}
+            </div>
+            <div className="slot-list">
+              {cameraConfigs.map((config, index) => {
+                const slotStatus = cameraStatuses.find((item) => item.slot === index);
+                return (
+                  <button
+                    className={`slot-button ${swapSlot === index ? "is-selected" : ""}`}
+                    type="button"
+                    key={index}
+                    onClick={() => selectCameraSlot(index)}
+                  >
+                    <span>槽 {index + 1}</span>
+                    <strong>Index {config.index}</strong>
+                    <em className={slotStatus?.connected ? "ok" : "bad"}>
+                      {slotStatus ? (slotStatus.connected ? "在线" : "断联") : "未预览"}
+                    </em>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="sub-card-title">
+              <h3>槽位参数</h3>
+              <div className="card-actions">
+                <button type="button" onClick={() => refreshCameraControls(controlSlot)}>
+                  读取
+                </button>
+                <button type="button" onClick={saveCameraControls} disabled={!cameraControls.length}>
+                  保存
+                </button>
+                <button type="button" onClick={restoreDefaultCameraControls} disabled={!cameraControls.length}>
+                  默认
+                </button>
+              </div>
+            </div>
+            <label className="field">
+              <span>参数槽</span>
+              <select value={controlSlot} onChange={(event) => selectControlSlot(Number(event.target.value))}>
+                {cameraConfigs.map((_, index) => (
+                  <option value={index} key={index}>
+                    槽 {index + 1}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="hint-line">
+              {slotParamsVisible
+                ? `预览间隔按 FPS 自动计算：约 ${previewIntervalMs} ms。`
+                : "点击读取后展开该槽位的 Index、分辨率、FPS 和可调参数。"}
+            </p>
+            {slotParamsVisible && activeCameraConfig && (
+              <div className="slot-param-panel">
+                <div className="camera-grid">
+                  <label>
+                    <span>Index</span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={activeCameraConfig.index}
+                      onChange={(event) => applyCameraConfig(controlSlot, { index: Number(event.target.value) })}
+                    />
+                  </label>
+                  <label className="preset-field">
+                    <span>格式</span>
+                    <select
+                      value={presetValue(activeCameraConfig)}
+                      onChange={(event) => updateCameraPreset(controlSlot, event.target.value)}
+                    >
+                      {(cameraFormats.length ? cameraFormats : cameraPresets).map((preset) => (
+                        <option value={presetValue(preset)} key={presetValue(preset)}>
+                          {preset.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <div className="control-list">
+                  {cameraControls.length ? (
+                    cameraControls.map((control) => {
+                      const writable = isControlWritable(control);
+                      return (
+                        <label
+                          className={`control-row ${writable ? "" : "is-disabled"}`}
+                          key={control.id}
+                          title={writable ? "" : `该参数不可调：${control.flags.join(", ") || "inactive"}`}
+                        >
+                          <span>{control.name || control.id}</span>
+                          {control.kind === "boolean" ? (
+                            <input
+                              type="checkbox"
+                              disabled={!writable}
+                              checked={control.value >= 0.5}
+                              onChange={(event) => setCameraControlValue(control, event.target.checked ? 1 : 0)}
+                            />
+                          ) : (
+                            <input
+                              type="range"
+                              disabled={!writable}
+                              min={control.min ?? control.value - 100}
+                              max={control.max ?? control.value + 100}
+                              step={control.step && control.step > 0 ? control.step : control.kind === "integer" ? 1 : 0.1}
+                              value={control.value}
+                              onChange={(event) => setCameraControlValue(control, Number(event.target.value))}
+                            />
+                          )}
+                          <em>{control.kind === "boolean" ? (control.value >= 0.5 ? "开" : "关") : control.value.toFixed(2)}</em>
+                        </label>
+                      );
+                    })
+                  ) : (
+                    <p className="hint-line">打开相机后可读取该槽位支持的硬件参数。</p>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+
+          <section className="panel-card">
+            <div className="card-title">
+              <h2>ROI</h2>
+              <button type="button" onClick={() => setShowRoi((visible) => !visible)}>
+                {showRoi ? "隐藏" : "显示"}
+              </button>
+            </div>
+            <label className="field">
+              <span>当前格</span>
+              <select value={currentRegionId} onChange={(event) => setCurrentRegionId(event.target.value)}>
+                {regions.map((region) => (
+                  <option value={region.id} key={region.id}>
+                    {region.id} {region.rect ? "已标注" : "未标注"}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </section>
+
+          <section className="panel-card">
+            <div className="card-title">
+              <h2>串口</h2>
+              <button type="button" onClick={refreshPorts}>
+                扫描
+              </button>
+            </div>
+            <label className="field">
+              <span>端口</span>
+              <select value={selectedPort} onChange={(event) => setSelectedPort(event.target.value)}>
+                {ports.map((port) => (
+                  <option value={port.name} key={port.name}>
+                    {port.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>波特率</span>
+              <input type="number" min={1200} value={baudRate} onChange={(event) => setBaudRate(Number(event.target.value))} />
+            </label>
+            <div className="button-row">
+              <button type="button" onClick={serialOpen ? closeSerial : openSerial}>
+                {serialOpen ? "关闭" : "连接"}
+              </button>
+              <button type="button" onClick={sendToRobot}>
+                发送
+              </button>
+            </div>
+          </section>
+
+          <section className="panel-card solve-card">
+            <div className="card-title">
+              <h2>解算结果</h2>
+              <button type="button" onClick={solveFromFacelets}>
+                字符串解算
+              </button>
+            </div>
+            <textarea value={facelets} onChange={(event) => setFacelets(event.target.value)} spellCheck={false} />
+            <div className="result-box">
+              <label>Moves</label>
+              <pre>{moves.join(" ") || "未生成"}</pre>
+            </div>
+            <div className="result-box">
+              <label>Steps</label>
+              <pre>{steps.join("\n") || "未生成"}</pre>
+            </div>
+            <div className="result-box">
+              <label>Encoded</label>
+              <pre>{encodedSteps || "未生成"}</pre>
+            </div>
           </section>
 
           <section className="panel-card log-card">
-            <h2>信息输出</h2>
+            <h2>日志</h2>
             <div className="log-output">
               {logs.map((item, index) => (
                 <p key={`${item.time}-${index}`} className={`log-line ${item.kind}`}>

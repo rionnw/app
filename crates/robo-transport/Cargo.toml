@@ -1,0 +1,10 @@
+[package]
+name = "robo-transport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+robo-core = { path = "../robo-core" }
+serialport = "4.9.0"
