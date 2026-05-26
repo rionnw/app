@@ -21,7 +21,7 @@
   --control-height: 36px;
   --radius: 8px;
   --space: clamp(8px, 1vw, 14px);
-  --side-width: clamp(360px, 30vw, 460px);
+  --side-width: clamp(300px, 28vw, 420px);
 }
 
 * {
@@ -187,7 +187,7 @@ textarea:focus {
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) var(--side-width);
+  grid-template-columns: minmax(0, 1fr) minmax(300px, var(--side-width));
   gap: var(--space);
   min-height: 0;
   padding: var(--space);
@@ -207,6 +207,23 @@ textarea:focus {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.panel-title {
+  flex-wrap: wrap;
+}
+
+.panel-heading {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.panel-heading button {
+  min-height: 30px;
+  padding: 0 10px;
+  white-space: nowrap;
 }
 
 .panel-title h2,
@@ -236,6 +253,9 @@ textarea:focus {
 
 .image-meta {
   display: flex;
+  flex: 1 1 280px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   min-width: 0;
   gap: 8px;
   color: var(--muted);
@@ -306,8 +326,8 @@ textarea:focus {
   fill: #ffffff;
   paint-order: stroke;
   stroke: #0f172a;
-  stroke-width: 0.004;
-  font-size: 0.024px;
+  stroke-width: 0.003;
+  font-size: 0.016px;
   font-weight: 800;
   pointer-events: none;
 }
@@ -336,7 +356,7 @@ textarea:focus {
 
 .bottom-actions {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: var(--space);
 }
 
@@ -356,6 +376,7 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   gap: var(--space);
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
   padding-right: 4px;
@@ -738,20 +759,22 @@ pre {
   color: var(--danger);
 }
 
-@media (max-width: 1040px) {
+@media (max-width: 760px) {
   .robot-shell {
     overflow: auto;
     height: auto;
+    min-height: 100dvh;
   }
 
   .workspace {
     grid-template-columns: 1fr;
-    min-height: 1280px;
+    grid-template-rows: clamp(420px, calc(100dvh - 180px), 640px) auto;
+    min-height: 0;
     overflow: visible;
   }
 
   .image-panel {
-    min-height: 640px;
+    min-height: 0;
   }
 
   .side-panel {

@@ -1,8 +1,11 @@
 use std::{
-    collections::HashMap,
-    io::Cursor,
-    io::Read,
-    sync::{mpsc, Arc, Condvar, Mutex},
+    collections::{HashMap, VecDeque},
+    io::{Cursor, Read},
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -11,9 +14,9 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use image::{codecs::jpeg::JpegEncoder, imageops, RgbImage};
 use robo_camera::{
-    frame_format_from_str, CameraConfig, CameraControlKind, CameraSlotStatus,
-    CameraSlotWorker, CameraSlotWorkerEvent, CameraStatusEventKind, FramePacket,
-    MultiCameraCapture, MultiCameraSource,
+    frame_format_from_str, CameraConfig, CameraControlKind, CameraSlotStatus, CameraSlotWorker,
+    CameraSlotWorkerEvent, CameraStatusEventKind, FramePacket, MultiCameraCapture,
+    MultiCameraSource,
 };
 use robo_core::{CubeFace, Frame, Recognizer, Roi, Solver, Steps, Translator, Transport};
 use robo_solver::Min2PhaseSolver;
@@ -21,18 +24,53 @@ use robo_translator::BasicTranslator;
 use robo_transport::SerialTransport;
 use robo_vision::ColorClusterRecognizer;
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tiny_http::{Header, Response, Server};
 
 struct AppState {
     camera: Mutex<CameraWorker>,
+    mock_camera: Mutex<MockCameraWorker>,
     camera_stream: Mutex<Option<CameraStreamRuntime>>,
-    serial: Mutex<Option<SerialTransport>>,
+    serial: Mutex<Option<SerialRuntime>>,
     latest_frame: Arc<Mutex<Option<LatestFrame>>>,
     latest_frame_seq: Mutex<u64>,
     stream_hub: Arc<FrameHub>,
     discovery_cache: Mutex<DiscoveryCache>,
     frame_server_port: u16,
+    mode: RuntimeMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeMode {
+    mock_camera: bool,
+    mock_serial: bool,
+}
+
+impl RuntimeMode {
+    fn from_env() -> Self {
+        Self::from_env_values(
+            std::env::var("ROBO_UI_MOCK_CAMERA").ok().as_deref(),
+            std::env::var("ROBO_UI_MOCK_SERIAL").ok().as_deref(),
+        )
+    }
+
+    fn from_env_values(mock_camera: Option<&str>, mock_serial: Option<&str>) -> Self {
+        Self {
+            mock_camera: env_flag_enabled(mock_camera),
+            mock_serial: env_flag_enabled(mock_serial),
+        }
+    }
+}
+
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Clone)]
@@ -49,12 +87,14 @@ struct StreamFrame {
     rgb: Arc<Frame>,
     capture_ms: u128,
     encode_ms: u128,
+    created_at: Instant,
 }
 
 #[derive(Clone)]
 struct SlotStreamState {
     status: CameraSlotStatus,
     frame: Option<StreamFrame>,
+    last_diagnostic_log_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -74,6 +114,8 @@ struct FrameHubInner {
     grid_seq: u64,
     active: bool,
     last_grid_encode_at: Option<Instant>,
+    last_grid_diagnostic_log_at: Option<Instant>,
+    last_snapshot_diagnostic_log_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -88,11 +130,14 @@ struct CachedValue<T> {
 }
 
 struct CameraStreamRuntime {
-    workers: Vec<CameraSlotWorker>,
+    workers: Vec<CameraStreamWorker>,
     aggregator: Option<JoinHandle<()>>,
 }
 
 const GRID_ENCODE_INTERVAL: Duration = Duration::from_millis(33);
+const DIAGNOSTIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const DIAGNOSTIC_WARN_THRESHOLD: Duration = Duration::from_millis(200);
+const BACKEND_DIAGNOSTIC_PREFIX: &str = "[backend-diagnostic]";
 
 impl Default for AppState {
     fn default() -> Self {
@@ -102,6 +147,7 @@ impl Default for AppState {
             start_frame_server(Arc::clone(&latest_frame), Arc::clone(&stream_hub)).unwrap_or(0);
         Self {
             camera: Mutex::default(),
+            mock_camera: Mutex::default(),
             camera_stream: Mutex::default(),
             serial: Mutex::default(),
             latest_frame,
@@ -109,6 +155,7 @@ impl Default for AppState {
             stream_hub,
             discovery_cache: Mutex::default(),
             frame_server_port,
+            mode: RuntimeMode::from_env(),
         }
     }
 }
@@ -244,6 +291,393 @@ impl CameraWorker {
     }
 }
 
+#[derive(Default)]
+struct MockCameraWorker {
+    configs: Vec<CameraConfig>,
+    control_values: HashMap<(usize, String), f64>,
+    seq: u64,
+}
+
+impl MockCameraWorker {
+    fn open(&mut self, configs: Vec<CameraConfig>) -> Result<()> {
+        anyhow::ensure!(!configs.is_empty(), "at least one mock camera is required");
+        self.configs = configs;
+        self.control_values.clear();
+        self.seq = 0;
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        self.configs.clear();
+        self.control_values.clear();
+        self.seq = 0;
+    }
+
+    fn capture(&mut self) -> Result<MultiCameraCapture> {
+        anyhow::ensure!(!self.configs.is_empty(), "mock camera is not open");
+        self.seq = self.seq.wrapping_add(1);
+        let frames = self
+            .configs
+            .iter()
+            .enumerate()
+            .map(|(slot, config)| {
+                mock_camera_frame(slot, config, self.seq)
+                    .map(Arc::new)
+                    .map(Some)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tile_width = self
+            .configs
+            .iter()
+            .map(|config| config.width)
+            .max()
+            .unwrap_or(640);
+        let tile_height = self
+            .configs
+            .iter()
+            .map(|config| config.height)
+            .max()
+            .unwrap_or(480);
+        let frame = compose_grid_frame(frames, tile_width, tile_height, 2)?
+            .context("failed to compose mock camera capture")?;
+        Ok(MultiCameraCapture {
+            frame,
+            statuses: self
+                .configs
+                .iter()
+                .enumerate()
+                .map(|(slot, config)| {
+                    mock_camera_status(slot, config, true, "mock camera connected")
+                })
+                .collect(),
+            events: Vec::new(),
+        })
+    }
+
+    fn controls(&self, slot: usize) -> Result<Vec<robo_camera::CameraControlInfo>> {
+        anyhow::ensure!(
+            slot < self.configs.len(),
+            "mock camera slot {slot} is not open"
+        );
+        Ok(mock_camera_controls(slot)
+            .into_iter()
+            .map(|mut control| {
+                if let Some(value) = self.control_values.get(&(slot, control.id.clone())) {
+                    control.value = *value;
+                }
+                control
+            })
+            .collect())
+    }
+
+    fn set_control(&mut self, slot: usize, id: String, value: f64) -> Result<()> {
+        let controls = self.controls(slot)?;
+        anyhow::ensure!(
+            controls.iter().any(|control| control.id == id),
+            "unknown mock camera control {id}"
+        );
+        self.control_values.insert((slot, id), value);
+        Ok(())
+    }
+}
+
+struct MockCameraStreamWorker {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl MockCameraStreamWorker {
+    fn spawn(
+        slot: usize,
+        config: CameraConfig,
+        events: mpsc::Sender<CameraSlotWorkerEvent>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            let _ = events.send(CameraSlotWorkerEvent::Status(mock_camera_status(
+                slot,
+                &config,
+                true,
+                "mock camera connected",
+            )));
+            let _ = events.send(CameraSlotWorkerEvent::Event(
+                robo_camera::CameraStatusEvent {
+                    slot,
+                    index: config.index,
+                    kind: CameraStatusEventKind::Connected,
+                    message: "mock camera connected".to_string(),
+                },
+            ));
+
+            let frame_interval = Duration::from_millis((1000 / config.fps.max(1) as u64).max(1));
+            let mut seq = 0u64;
+            while !worker_stop.load(Ordering::SeqCst) {
+                seq = seq.wrapping_add(1);
+                match mock_camera_frame(slot, &config, seq) {
+                    Ok(frame) => {
+                        if events
+                            .send(CameraSlotWorkerEvent::Frame(FramePacket {
+                                slot,
+                                index: config.index,
+                                seq,
+                                frame,
+                                capture_ms: frame_interval.as_millis(),
+                            }))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = events.send(CameraSlotWorkerEvent::Status(mock_camera_status(
+                            slot,
+                            &config,
+                            false,
+                            &err.to_string(),
+                        )));
+                        break;
+                    }
+                }
+                thread::sleep(frame_interval);
+            }
+
+            let _ = events.send(CameraSlotWorkerEvent::Event(
+                robo_camera::CameraStatusEvent {
+                    slot,
+                    index: config.index,
+                    kind: CameraStatusEventKind::Disconnected,
+                    message: "mock camera stopped".to_string(),
+                },
+            ));
+        });
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn close(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn mock_camera_devices() -> Vec<CameraDeviceDto> {
+    (0..4)
+        .map(|index| CameraDeviceDto {
+            index: index.to_string(),
+            name: format!("Mock Camera {}", index + 1),
+            description: format!("Synthetic mock camera slot {}", index + 1),
+        })
+        .collect()
+}
+
+fn mock_camera_formats(_index: u32) -> Vec<CameraFormatDto> {
+    [(640, 480), (1280, 720), (1920, 1080)]
+        .into_iter()
+        .map(|(width, height)| CameraFormatDto {
+            width,
+            height,
+            fps: 30,
+            frame_format: "MJPEG".to_string(),
+        })
+        .collect()
+}
+
+fn mock_camera_status(
+    slot: usize,
+    config: &CameraConfig,
+    connected: bool,
+    message: &str,
+) -> CameraSlotStatus {
+    CameraSlotStatus {
+        slot,
+        index: config.index,
+        connected,
+        message: message.to_string(),
+    }
+}
+
+fn mock_camera_controls(slot: usize) -> Vec<robo_camera::CameraControlInfo> {
+    vec![
+        robo_camera::CameraControlInfo {
+            id: "brightness".to_string(),
+            name: format!("Mock Brightness {}", slot + 1),
+            kind: CameraControlKind::Integer,
+            value: 50.0,
+            default: 50.0,
+            min: Some(0.0),
+            max: Some(100.0),
+            step: Some(1.0),
+            active: true,
+            flags: vec!["mock".to_string()],
+        },
+        robo_camera::CameraControlInfo {
+            id: "exposure".to_string(),
+            name: format!("Mock Exposure {}", slot + 1),
+            kind: CameraControlKind::Float,
+            value: 0.5,
+            default: 0.5,
+            min: Some(0.0),
+            max: Some(1.0),
+            step: Some(0.05),
+            active: true,
+            flags: vec!["mock".to_string()],
+        },
+        robo_camera::CameraControlInfo {
+            id: "auto_exposure".to_string(),
+            name: format!("Mock Auto Exposure {}", slot + 1),
+            kind: CameraControlKind::Boolean,
+            value: 1.0,
+            default: 1.0,
+            min: Some(0.0),
+            max: Some(1.0),
+            step: Some(1.0),
+            active: true,
+            flags: vec!["mock".to_string()],
+        },
+    ]
+}
+
+fn mock_camera_frame(slot: usize, config: &CameraConfig, seq: u64) -> Result<Frame> {
+    let width = config.width.max(1);
+    let height = config.height.max(1);
+    let palette = [
+        [220u8, 64u8, 64u8],
+        [64u8, 180u8, 96u8],
+        [64u8, 112u8, 220u8],
+        [220u8, 180u8, 64u8],
+    ];
+    let base = palette[slot % palette.len()];
+    let mut rgb = vec![0u8; width as usize * height as usize * 3];
+    let moving_bar = (seq as u32 * 7) % width;
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = ((y * width + x) * 3) as usize;
+            let gradient = ((x * 80 / width) + (y * 50 / height)) as u8;
+            rgb[idx] = base[0].saturating_add(gradient / 4);
+            rgb[idx + 1] = base[1].saturating_add(gradient / 3);
+            rgb[idx + 2] = base[2].saturating_add(gradient / 2);
+            if x.abs_diff(moving_bar) < 4 {
+                rgb[idx] = 255;
+                rgb[idx + 1] = 255u8.saturating_sub((slot as u8).saturating_mul(35));
+                rgb[idx + 2] = 255;
+            }
+        }
+    }
+
+    let band_height = (height / 8).clamp(24, 96);
+    fill_rect(
+        &mut rgb,
+        width,
+        height,
+        0,
+        0,
+        width,
+        band_height,
+        [16, 16, 16],
+    );
+    draw_number(
+        &mut rgb,
+        width,
+        height,
+        12,
+        6,
+        (slot + 1) as u32,
+        [255, 255, 255],
+    );
+    draw_number(
+        &mut rgb,
+        width,
+        height,
+        (width / 4).max(72),
+        6,
+        (seq % 10_000) as u32,
+        [255, 240, 160],
+    );
+
+    Frame::new_rgb(width, height, rgb).context("failed to build mock camera frame")
+}
+
+fn draw_number(
+    rgb: &mut [u8],
+    width: u32,
+    height: u32,
+    mut x: u32,
+    y: u32,
+    value: u32,
+    color: [u8; 3],
+) {
+    let digits = value.to_string();
+    for digit in digits.bytes().filter_map(|digit| digit.checked_sub(b'0')) {
+        draw_digit(rgb, width, height, x, y, digit, color);
+        x += 18;
+    }
+}
+
+fn draw_digit(rgb: &mut [u8], width: u32, height: u32, x: u32, y: u32, digit: u8, color: [u8; 3]) {
+    let segments = match digit {
+        0 => [true, true, true, true, true, true, false],
+        1 => [false, true, true, false, false, false, false],
+        2 => [true, true, false, true, true, false, true],
+        3 => [true, true, true, true, false, false, true],
+        4 => [false, true, true, false, false, true, true],
+        5 => [true, false, true, true, false, true, true],
+        6 => [true, false, true, true, true, true, true],
+        7 => [true, true, true, false, false, false, false],
+        8 => [true, true, true, true, true, true, true],
+        9 => [true, true, true, true, false, true, true],
+        _ => return,
+    };
+    let rects = [
+        (x + 2, y, 10, 3),
+        (x + 12, y + 2, 3, 10),
+        (x + 12, y + 14, 3, 10),
+        (x + 2, y + 24, 10, 3),
+        (x, y + 14, 3, 10),
+        (x, y + 2, 3, 10),
+        (x + 2, y + 12, 10, 3),
+    ];
+    for (enabled, (rect_x, rect_y, rect_width, rect_height)) in segments.into_iter().zip(rects) {
+        if enabled {
+            fill_rect(
+                rgb,
+                width,
+                height,
+                rect_x,
+                rect_y,
+                rect_width,
+                rect_height,
+                color,
+            );
+        }
+    }
+}
+
+fn fill_rect(
+    rgb: &mut [u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    rect_width: u32,
+    rect_height: u32,
+    color: [u8; 3],
+) {
+    let max_x = (x + rect_width).min(width);
+    let max_y = (y + rect_height).min(height);
+    for py in y.min(height)..max_y {
+        for px in x.min(width)..max_x {
+            let idx = ((py * width + px) * 3) as usize;
+            rgb[idx..idx + 3].copy_from_slice(&color);
+        }
+    }
+}
+
 impl CameraStreamRuntime {
     fn open(configs: Vec<CameraConfig>, hub: Arc<FrameHub>, app: tauri::AppHandle) -> Result<Self> {
         let session_id = hub.configure(&configs)?;
@@ -252,82 +686,38 @@ impl CameraStreamRuntime {
             .iter()
             .cloned()
             .enumerate()
-            .map(|(slot, config)| CameraSlotWorker::spawn(slot, config, tx.clone()))
+            .map(|(slot, config)| {
+                CameraStreamWorker::Real(CameraSlotWorker::spawn(slot, config, tx.clone()))
+            })
             .collect::<Vec<_>>();
         drop(tx);
 
-        let aggregator_hub = Arc::clone(&hub);
-        let aggregator = thread::spawn(move || {
-            while let Ok(event) = rx.recv() {
-                match event {
-                    CameraSlotWorkerEvent::Frame(packet) => {
-                        if let Err(err) = publish_stream_packet(&aggregator_hub, session_id, &app, packet) {
-                            let _ = app.emit(
-                                "camera-stream-event",
-                                CameraStreamEventDto {
-                                    kind: "error".to_string(),
-                                    slot: None,
-                                    index: None,
-                                    seq: None,
-                                    width: None,
-                                    height: None,
-                                    fps: None,
-                                    capture_ms: None,
-                                    encode_ms: None,
-                                    message: Some(err.to_string()),
-                                    statuses: aggregator_hub.statuses().unwrap_or_default(),
-                                },
-                            );
-                        }
-                    }
-                    CameraSlotWorkerEvent::Status(status) => {
-                        let statuses = aggregator_hub
-                            .update_status(session_id, status)
-                            .unwrap_or_default();
-                        let _ = app.emit(
-                            "camera-stream-event",
-                            CameraStreamEventDto {
-                                kind: "status".to_string(),
-                                slot: None,
-                                index: None,
-                                seq: None,
-                                width: None,
-                                height: None,
-                                fps: None,
-                                capture_ms: None,
-                                encode_ms: None,
-                                message: None,
-                                statuses,
-                            },
-                        );
-                    }
-                    CameraSlotWorkerEvent::Event(event) => {
-                        if !aggregator_hub.is_active_session(session_id) {
-                            continue;
-                        }
-                        let _ = app.emit(
-                            "camera-stream-event",
-                            CameraStreamEventDto {
-                                kind: match event.kind {
-                                    CameraStatusEventKind::Connected => "connected".to_string(),
-                                    CameraStatusEventKind::Disconnected => "disconnected".to_string(),
-                                },
-                                slot: Some(event.slot),
-                                index: Some(event.index),
-                                seq: None,
-                                width: None,
-                                height: None,
-                                fps: None,
-                                capture_ms: None,
-                                encode_ms: None,
-                                message: Some(event.message),
-                                statuses: aggregator_hub.statuses().unwrap_or_default(),
-                            },
-                        );
-                    }
-                }
-            }
-        });
+        let aggregator = spawn_camera_stream_aggregator(Arc::clone(&hub), session_id, app, rx);
+
+        Ok(Self {
+            workers,
+            aggregator: Some(aggregator),
+        })
+    }
+
+    fn open_mock(
+        configs: Vec<CameraConfig>,
+        hub: Arc<FrameHub>,
+        app: tauri::AppHandle,
+    ) -> Result<Self> {
+        let session_id = hub.configure(&configs)?;
+        let (tx, rx) = mpsc::channel();
+        let workers = configs
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(slot, config)| {
+                CameraStreamWorker::Mock(MockCameraStreamWorker::spawn(slot, config, tx.clone()))
+            })
+            .collect::<Vec<_>>();
+        drop(tx);
+
+        let aggregator = spawn_camera_stream_aggregator(Arc::clone(&hub), session_id, app, rx);
 
         Ok(Self {
             workers,
@@ -353,11 +743,110 @@ impl Drop for CameraStreamRuntime {
     }
 }
 
+enum CameraStreamWorker {
+    Real(CameraSlotWorker),
+    Mock(MockCameraStreamWorker),
+}
+
+impl CameraStreamWorker {
+    fn close(&mut self) {
+        match self {
+            Self::Real(worker) => worker.close(),
+            Self::Mock(worker) => worker.close(),
+        }
+    }
+}
+
+fn spawn_camera_stream_aggregator(
+    hub: Arc<FrameHub>,
+    session_id: u64,
+    app: tauri::AppHandle,
+    rx: mpsc::Receiver<CameraSlotWorkerEvent>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        while let Ok(event) = rx.recv() {
+            match event {
+                CameraSlotWorkerEvent::Frame(packet) => {
+                    if let Err(err) = publish_stream_packet(&hub, session_id, &app, packet) {
+                        let _ = app.emit(
+                            "camera-stream-event",
+                            CameraStreamEventDto {
+                                kind: "error".to_string(),
+                                slot: None,
+                                index: None,
+                                seq: None,
+                                width: None,
+                                height: None,
+                                fps: None,
+                                capture_ms: None,
+                                encode_ms: None,
+                                message: Some(err.to_string()),
+                                statuses: hub.statuses().unwrap_or_default(),
+                            },
+                        );
+                    }
+                }
+                CameraSlotWorkerEvent::Status(status) => {
+                    let statuses = hub.update_status(session_id, status).unwrap_or_default();
+                    let _ = app.emit(
+                        "camera-stream-event",
+                        CameraStreamEventDto {
+                            kind: "status".to_string(),
+                            slot: None,
+                            index: None,
+                            seq: None,
+                            width: None,
+                            height: None,
+                            fps: None,
+                            capture_ms: None,
+                            encode_ms: None,
+                            message: None,
+                            statuses,
+                        },
+                    );
+                }
+                CameraSlotWorkerEvent::Event(event) => {
+                    if !hub.is_active_session(session_id) {
+                        continue;
+                    }
+                    let _ = app.emit(
+                        "camera-stream-event",
+                        CameraStreamEventDto {
+                            kind: match event.kind {
+                                CameraStatusEventKind::Connected => "connected".to_string(),
+                                CameraStatusEventKind::Disconnected => "disconnected".to_string(),
+                            },
+                            slot: Some(event.slot),
+                            index: Some(event.index),
+                            seq: None,
+                            width: None,
+                            height: None,
+                            fps: None,
+                            capture_ms: None,
+                            encode_ms: None,
+                            message: Some(event.message),
+                            statuses: hub.statuses().unwrap_or_default(),
+                        },
+                    );
+                }
+            }
+        }
+    })
+}
+
 impl FrameHub {
     fn configure(&self, configs: &[CameraConfig]) -> Result<u64> {
         anyhow::ensure!(!configs.is_empty(), "at least one camera is required");
-        let tile_width = configs.iter().map(|config| config.width).max().unwrap_or(640);
-        let tile_height = configs.iter().map(|config| config.height).max().unwrap_or(480);
+        let tile_width = configs
+            .iter()
+            .map(|config| config.width)
+            .max()
+            .unwrap_or(640);
+        let tile_height = configs
+            .iter()
+            .map(|config| config.height)
+            .max()
+            .unwrap_or(480);
         let slots = configs
             .iter()
             .cloned()
@@ -370,6 +859,7 @@ impl FrameHub {
                     message: "waiting for camera".to_string(),
                 },
                 frame: None,
+                last_diagnostic_log_at: None,
             })
             .collect();
 
@@ -388,6 +878,8 @@ impl FrameHub {
             grid_seq: 0,
             active: true,
             last_grid_encode_at: None,
+            last_grid_diagnostic_log_at: None,
+            last_snapshot_diagnostic_log_at: None,
         };
         self.changed.notify_all();
         Ok(session_id)
@@ -425,7 +917,11 @@ impl FrameHub {
                 .collect(),
             width: inner.tile_width * columns,
             height: inner.tile_height * rows.max(1),
-            statuses: inner.slots.iter().map(|slot| status_dto(&slot.status)).collect(),
+            statuses: inner
+                .slots
+                .iter()
+                .map(|slot| status_dto(&slot.status))
+                .collect(),
         })
     }
 
@@ -439,12 +935,20 @@ impl FrameHub {
             .lock()
             .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
         if inner.session_id != session_id {
-            return Ok(inner.slots.iter().map(|slot| status_dto(&slot.status)).collect());
+            return Ok(inner
+                .slots
+                .iter()
+                .map(|slot| status_dto(&slot.status))
+                .collect());
         }
         if let Some(slot) = inner.slots.get_mut(status.slot) {
             slot.status = status;
         }
-        let statuses = inner.slots.iter().map(|slot| status_dto(&slot.status)).collect();
+        let statuses = inner
+            .slots
+            .iter()
+            .map(|slot| status_dto(&slot.status))
+            .collect();
         self.changed.notify_all();
         Ok(statuses)
     }
@@ -456,14 +960,23 @@ impl FrameHub {
         jpeg: Vec<u8>,
         encode_ms: u128,
     ) -> Result<Option<StreamFrame>> {
+        let FramePacket {
+            slot,
+            index,
+            seq,
+            frame,
+            capture_ms,
+        } = packet;
+        let created_at = Instant::now();
         let stream_frame = StreamFrame {
-            seq: packet.seq,
-            width: packet.frame.width,
-            height: packet.frame.height,
+            seq,
+            width: frame.width,
+            height: frame.height,
             jpeg: Arc::new(jpeg),
-            rgb: Arc::new(packet.frame),
-            capture_ms: packet.capture_ms,
+            rgb: Arc::new(frame),
+            capture_ms,
             encode_ms,
+            created_at,
         };
 
         let (frames, tile_width, tile_height, columns, should_encode_grid) = {
@@ -474,17 +987,39 @@ impl FrameHub {
             if inner.session_id != session_id {
                 return Ok(None);
             }
-            let slot = inner
+            let slot_state = inner
                 .slots
-                .get_mut(packet.slot)
-                .with_context(|| format!("stream slot {} does not exist", packet.slot))?;
-            slot.status = CameraSlotStatus {
-                slot: packet.slot,
-                index: packet.index,
+                .get_mut(slot)
+                .with_context(|| format!("stream slot {} does not exist", slot))?;
+            let slot_interval = slot_state
+                .frame
+                .as_ref()
+                .map(|frame| created_at.duration_since(frame.created_at));
+            let slot_warning = slot_interval
+                .map(|interval| interval > DIAGNOSTIC_WARN_THRESHOLD)
+                .unwrap_or(false);
+            if should_log_diagnostic(
+                &mut slot_state.last_diagnostic_log_at,
+                created_at,
+                slot_warning,
+            ) {
+                println!(
+                    "{BACKEND_DIAGNOSTIC_PREFIX} category=slot_frame level={} slot={} packet_seq={} capture_ms={} encode_ms={} interval_ms={}",
+                    diagnostic_level(slot_warning),
+                    slot,
+                    seq,
+                    stream_frame.capture_ms,
+                    stream_frame.encode_ms,
+                    diagnostic_duration_ms(slot_interval)
+                );
+            }
+            slot_state.status = CameraSlotStatus {
+                slot,
+                index,
                 connected: true,
                 message: "connected".to_string(),
             };
-            slot.frame = Some(stream_frame.clone());
+            slot_state.frame = Some(stream_frame.clone());
             let frames = inner
                 .slots
                 .iter()
@@ -509,10 +1044,14 @@ impl FrameHub {
         };
 
         if should_encode_grid {
-            if let Some(grid_frame) = compose_grid_frame(frames, tile_width, tile_height, columns)? {
+            let compose_started = Instant::now();
+            if let Some(grid_frame) = compose_grid_frame(frames, tile_width, tile_height, columns)?
+            {
+                let compose_ms = compose_started.elapsed().as_millis();
                 let started = Instant::now();
                 let grid_jpeg = encode_frame_jpeg(&grid_frame)?;
                 let grid_encode_ms = started.elapsed().as_millis();
+                let grid_created_at = Instant::now();
                 let mut inner = self
                     .inner
                     .lock()
@@ -520,8 +1059,31 @@ impl FrameHub {
                 if inner.session_id != session_id || !inner.active {
                     return Ok(None);
                 }
+                let grid_interval = inner
+                    .grid
+                    .as_ref()
+                    .map(|frame| grid_created_at.duration_since(frame.created_at));
                 inner.grid_seq += 1;
                 let grid_seq = inner.grid_seq;
+                let grid_warning = grid_interval
+                    .map(|interval| interval > DIAGNOSTIC_WARN_THRESHOLD)
+                    .unwrap_or(false)
+                    || compose_ms > DIAGNOSTIC_WARN_THRESHOLD.as_millis()
+                    || grid_encode_ms > DIAGNOSTIC_WARN_THRESHOLD.as_millis();
+                if should_log_diagnostic(
+                    &mut inner.last_grid_diagnostic_log_at,
+                    grid_created_at,
+                    grid_warning,
+                ) {
+                    println!(
+                        "{BACKEND_DIAGNOSTIC_PREFIX} category=grid_frame level={} grid_seq={} compose_ms={} encode_ms={} interval_ms={}",
+                        diagnostic_level(grid_warning),
+                        grid_seq,
+                        compose_ms,
+                        grid_encode_ms,
+                        diagnostic_duration_ms(grid_interval)
+                    );
+                }
                 inner.grid = Some(StreamFrame {
                     seq: grid_seq,
                     width: grid_frame.width,
@@ -530,6 +1092,7 @@ impl FrameHub {
                     rgb: Arc::new(grid_frame),
                     capture_ms: stream_frame.capture_ms,
                     encode_ms: grid_encode_ms,
+                    created_at: grid_created_at,
                 });
                 self.changed.notify_all();
             }
@@ -748,6 +1311,41 @@ fn encode_frame_jpeg(frame: &Frame) -> Result<Vec<u8>> {
     Ok(bytes.into_inner())
 }
 
+fn should_log_diagnostic(last_log_at: &mut Option<Instant>, now: Instant, warning: bool) -> bool {
+    let should_log = warning
+        || last_log_at
+            .map(|last| now.duration_since(last) >= DIAGNOSTIC_LOG_INTERVAL)
+            .unwrap_or(true);
+    if should_log {
+        *last_log_at = Some(now);
+    }
+    should_log
+}
+
+fn should_log_throttled_diagnostic(last_log_at: &mut Option<Instant>, now: Instant) -> bool {
+    let should_log = last_log_at
+        .map(|last| now.duration_since(last) >= DIAGNOSTIC_LOG_INTERVAL)
+        .unwrap_or(true);
+    if should_log {
+        *last_log_at = Some(now);
+    }
+    should_log
+}
+
+fn diagnostic_level(warning: bool) -> &'static str {
+    if warning {
+        "warn"
+    } else {
+        "info"
+    }
+}
+
+fn diagnostic_duration_ms(duration: Option<Duration>) -> String {
+    duration
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|| "na".to_string())
+}
+
 fn publish_stream_packet(
     hub: &FrameHub,
     session_id: u64,
@@ -805,8 +1403,24 @@ fn compose_grid_frame(
         let tile_x = (idx as u32 % columns) * tile_width;
         let tile_y = (idx as u32 / columns) * tile_height;
         match frame {
-            Some(frame) => blit_fit_rgb(&frame, &mut output, output_width, tile_width, tile_height, tile_x, tile_y),
-            None => fill_tile(&mut output, output_width, tile_width, tile_height, tile_x, tile_y, 12),
+            Some(frame) => blit_fit_rgb(
+                &frame,
+                &mut output,
+                output_width,
+                tile_width,
+                tile_height,
+                tile_x,
+                tile_y,
+            ),
+            None => fill_tile(
+                &mut output,
+                output_width,
+                tile_width,
+                tile_height,
+                tile_x,
+                tile_y,
+                12,
+            ),
         }
     }
 
@@ -890,6 +1504,53 @@ struct SerialReadResponse {
     param_write_error: bool,
 }
 
+enum SerialRuntime {
+    Real(SerialTransport),
+    Mock(MockSerialTransport),
+}
+
+impl SerialRuntime {
+    fn send_steps(&mut self, steps: &Steps) -> Result<()> {
+        match self {
+            Self::Real(transport) => transport.send_steps(steps),
+            Self::Mock(transport) => transport.send_steps(steps),
+        }
+    }
+
+    fn read_available(&mut self) -> Result<Vec<u8>> {
+        match self {
+            Self::Real(transport) => transport.read_available(),
+            Self::Mock(transport) => transport.read_available(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MockSerialTransport {
+    last_payload: Option<String>,
+    responses: VecDeque<Vec<u8>>,
+}
+
+impl MockSerialTransport {
+    fn read_available(&mut self) -> Result<Vec<u8>> {
+        Ok(self.responses.pop_front().unwrap_or_default())
+    }
+
+    #[cfg(test)]
+    fn last_payload(&self) -> Option<&str> {
+        self.last_payload.as_deref()
+    }
+}
+
+impl Transport for MockSerialTransport {
+    fn send_steps(&mut self, steps: &Steps) -> Result<()> {
+        self.last_payload = Some(steps.encoded.clone());
+        self.responses.push_back(b"OK\n".to_vec());
+        self.responses.push_back(b"ND\n".to_vec());
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SolveFaceletsResponse {
     facelets: String,
@@ -900,11 +1561,53 @@ struct SolveFaceletsResponse {
 
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5);
 
+fn format_diagnostic_log(message: &str) -> String {
+    format!(
+        "[diagnostic] {}",
+        message.replace('\r', "\\r").replace('\n', "\\n")
+    )
+}
+
+#[tauri::command]
+fn diagnostic_log(message: String) -> Result<(), String> {
+    println!("{}", format_diagnostic_log(&message));
+    Ok(())
+}
+
+#[tauri::command]
+fn save_text_file(
+    app: tauri::AppHandle,
+    filename: String,
+    contents: String,
+) -> Result<String, String> {
+    let safe_filename = Path::new(&filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "文件名无效。".to_string())?;
+    let path = app
+        .path()
+        .download_dir()
+        .map_err(|err| err.to_string())?
+        .join(safe_filename);
+
+    std::fs::write(&path, contents).map_err(|err| err.to_string())?;
+    Ok(path.display().to_string())
+}
+
 #[tauri::command]
 fn list_cameras(state: tauri::State<'_, AppState>) -> Result<Vec<CameraDeviceDto>, String> {
+    if state.mode.mock_camera {
+        return Ok(mock_camera_devices());
+    }
+
     let now = Instant::now();
     if let Ok(cache) = state.discovery_cache.lock() {
-        if let Some(cached) = cache.cameras.as_ref().filter(|cached| cached.expires_at > now) {
+        if let Some(cached) = cache
+            .cameras
+            .as_ref()
+            .filter(|cached| cached.expires_at > now)
+        {
             return Ok(cached.value.clone());
         }
     }
@@ -936,6 +1639,10 @@ fn list_camera_formats(
     state: tauri::State<'_, AppState>,
     index: u32,
 ) -> Result<Vec<CameraFormatDto>, String> {
+    if state.mode.mock_camera {
+        return Ok(mock_camera_formats(index));
+    }
+
     let now = Instant::now();
     if let Ok(cache) = state.discovery_cache.lock() {
         if let Some(cached) = cache
@@ -982,6 +1689,15 @@ fn open_cameras(
         .into_iter()
         .map(CameraConfig::from)
         .collect::<Vec<_>>();
+    if state.mode.mock_camera {
+        return state
+            .mock_camera
+            .lock()
+            .map_err(|_| "mock camera state is poisoned".to_string())?
+            .open(configs)
+            .map_err(|err| err.to_string());
+    }
+
     state
         .camera
         .lock()
@@ -992,6 +1708,15 @@ fn open_cameras(
 
 #[tauri::command]
 fn close_cameras(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if state.mode.mock_camera {
+        state
+            .mock_camera
+            .lock()
+            .map_err(|_| "mock camera state is poisoned".to_string())?
+            .close();
+        return Ok(());
+    }
+
     state
         .camera
         .lock()
@@ -1018,7 +1743,11 @@ fn open_camera_stream(
         existing.close();
     }
     *runtime = None;
-    let next_runtime = match CameraStreamRuntime::open(configs, Arc::clone(&state.stream_hub), app) {
+    let next_runtime = match if state.mode.mock_camera {
+        CameraStreamRuntime::open_mock(configs, Arc::clone(&state.stream_hub), app)
+    } else {
+        CameraStreamRuntime::open(configs, Arc::clone(&state.stream_hub), app)
+    } {
         Ok(runtime) => runtime,
         Err(err) => {
             let _ = state.stream_hub.clear();
@@ -1055,26 +1784,38 @@ fn camera_stream_info(state: tauri::State<'_, AppState>) -> Result<CameraStreamI
 
 #[tauri::command]
 fn snapshot_frame(state: tauri::State<'_, AppState>) -> Result<tauri::ipc::Response, String> {
-    let frame = state
-        .stream_hub
-        .inner
-        .lock()
-        .map_err(|_| "stream hub is poisoned".to_string())?
-        .grid
-        .as_ref()
-        .map(|frame| (*frame.jpeg).clone())
-        .ok_or_else(|| "no stream frame available".to_string())?;
+    let (frame, grid_seq, age, should_log) = {
+        let mut inner = state
+            .stream_hub
+            .inner
+            .lock()
+            .map_err(|_| "stream hub is poisoned".to_string())?;
+        let now = Instant::now();
+        let Some(grid) = inner.grid.as_ref() else {
+            return Err("no stream frame available".to_string());
+        };
+        let frame = (*grid.jpeg).clone();
+        let grid_seq = grid.seq;
+        let age = now.duration_since(grid.created_at);
+        let should_log =
+            should_log_throttled_diagnostic(&mut inner.last_snapshot_diagnostic_log_at, now);
+        (frame, grid_seq, age, should_log)
+    };
+    if should_log {
+        let warning = age > DIAGNOSTIC_WARN_THRESHOLD;
+        println!(
+            "{BACKEND_DIAGNOSTIC_PREFIX} category=snapshot_frame level={} grid_seq={} age_ms={}",
+            diagnostic_level(warning),
+            grid_seq,
+            age.as_millis()
+        );
+    }
     Ok(tauri::ipc::Response::new(frame))
 }
 
 #[tauri::command]
 fn capture_frame(state: tauri::State<'_, AppState>) -> Result<FrameResponse, String> {
-    let capture = state
-        .camera
-        .lock()
-        .map_err(|_| "camera state is poisoned".to_string())?
-        .capture()
-        .map_err(|err| err.to_string())?;
+    let capture = capture_from_state(&state).map_err(|err| err.to_string())?;
     encode_capture(capture, &state).map_err(|err| err.to_string())
 }
 
@@ -1098,12 +1839,20 @@ fn list_camera_controls(
     state: tauri::State<'_, AppState>,
     slot: usize,
 ) -> Result<Vec<CameraControlDto>, String> {
-    let controls = state
-        .camera
-        .lock()
-        .map_err(|_| "camera state is poisoned".to_string())?
-        .controls(slot)
-        .map_err(|err| err.to_string())?;
+    let controls = if state.mode.mock_camera {
+        state
+            .mock_camera
+            .lock()
+            .map_err(|_| "mock camera state is poisoned".to_string())?
+            .controls(slot)
+    } else {
+        state
+            .camera
+            .lock()
+            .map_err(|_| "camera state is poisoned".to_string())?
+            .controls(slot)
+    }
+    .map_err(|err| err.to_string())?;
     Ok(controls
         .into_iter()
         .map(|control| CameraControlDto {
@@ -1132,12 +1881,21 @@ fn set_camera_control(
     id: String,
     value: f64,
 ) -> Result<(), String> {
-    state
-        .camera
-        .lock()
-        .map_err(|_| "camera state is poisoned".to_string())?
-        .set_control(slot, id, value)
-        .map_err(|err| err.to_string())
+    if state.mode.mock_camera {
+        state
+            .mock_camera
+            .lock()
+            .map_err(|_| "mock camera state is poisoned".to_string())?
+            .set_control(slot, id, value)
+            .map_err(|err| err.to_string())
+    } else {
+        state
+            .camera
+            .lock()
+            .map_err(|_| "camera state is poisoned".to_string())?
+            .set_control(slot, id, value)
+            .map_err(|err| err.to_string())
+    }
 }
 
 #[tauri::command]
@@ -1145,12 +1903,7 @@ fn solve_current_frame(
     state: tauri::State<'_, AppState>,
     rois: Vec<RoiDto>,
 ) -> Result<SolveFaceletsResponse, String> {
-    let capture = state
-        .camera
-        .lock()
-        .map_err(|_| "camera state is poisoned".to_string())?
-        .capture()
-        .map_err(|err| err.to_string())?;
+    let capture = capture_from_state(&state).map_err(|err| err.to_string())?;
     let rois = rois.into_iter().map(Roi::from).collect::<Vec<_>>();
     let recognizer = ColorClusterRecognizer;
     let face = recognizer
@@ -1177,13 +1930,34 @@ fn solve_latest_frame(
 }
 
 #[tauri::command]
+fn solve_image_file(
+    image_data_url: String,
+    rois: Vec<RoiDto>,
+) -> Result<SolveFaceletsResponse, String> {
+    let frame = decode_image_data_url(&image_data_url).map_err(|err| err.to_string())?;
+    let rois = rois.into_iter().map(Roi::from).collect::<Vec<_>>();
+    let recognizer = ColorClusterRecognizer;
+    let face = recognizer
+        .recognize(&frame, &rois)
+        .map_err(|err| err.to_string())?;
+    solve_face(face)
+}
+
+#[tauri::command]
 fn solve_facelets(facelets: String) -> Result<SolveFaceletsResponse, String> {
     let face = CubeFace::new(facelets).map_err(|err| err.to_string())?;
     solve_face(face)
 }
 
 #[tauri::command]
-fn list_serial_ports() -> Result<Vec<SerialPortDto>, String> {
+fn list_serial_ports(state: tauri::State<'_, AppState>) -> Result<Vec<SerialPortDto>, String> {
+    if state.mode.mock_serial {
+        return Ok(vec![SerialPortDto {
+            name: "ROBO_MOCK_SERIAL".to_string(),
+            port_type: "Mock".to_string(),
+        }]);
+    }
+
     serialport::available_ports()
         .map(|ports| {
             ports
@@ -1203,7 +1977,14 @@ fn open_serial(
     port_name: String,
     baud_rate: u32,
 ) -> Result<(), String> {
-    let transport = SerialTransport::open(&port_name, baud_rate).map_err(|err| err.to_string())?;
+    let transport = if state.mode.mock_serial {
+        let _ = (port_name, baud_rate);
+        SerialRuntime::Mock(MockSerialTransport::default())
+    } else {
+        SerialRuntime::Real(
+            SerialTransport::open(&port_name, baud_rate).map_err(|err| err.to_string())?,
+        )
+    };
     *state
         .serial
         .lock()
@@ -1271,6 +2052,37 @@ fn solve_face(face: CubeFace) -> Result<SolveFaceletsResponse, String> {
     })
 }
 
+fn decode_image_data_url(data_url: &str) -> Result<Frame> {
+    let encoded = data_url
+        .split_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(data_url);
+    let bytes = STANDARD
+        .decode(encoded)
+        .context("failed to decode image data URL")?;
+    let image = image::load_from_memory(&bytes)
+        .context("failed to decode image file")?
+        .to_rgb8();
+    let (width, height) = image.dimensions();
+    Frame::new_rgb(width, height, image.into_raw()).context("failed to build frame from image file")
+}
+
+fn capture_from_state(state: &AppState) -> Result<MultiCameraCapture> {
+    if state.mode.mock_camera {
+        state
+            .mock_camera
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mock camera state is poisoned"))?
+            .capture()
+    } else {
+        state
+            .camera
+            .lock()
+            .map_err(|_| anyhow::anyhow!("camera state is poisoned"))?
+            .capture()
+    }
+}
+
 fn encode_capture(capture: MultiCameraCapture, state: &AppState) -> Result<FrameResponse> {
     let frame = capture.frame;
     let width = frame.width;
@@ -1332,6 +2144,105 @@ fn encode_capture(capture: MultiCameraCapture, state: &AppState) -> Result<Frame
             })
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_image_data_url_to_rgb_frame() {
+        let image = RgbImage::from_raw(2, 1, vec![255, 0, 0, 0, 255, 0])
+            .expect("test image should be valid");
+        let mut bytes = Cursor::new(Vec::new());
+        JpegEncoder::new_with_quality(&mut bytes, 90)
+            .encode_image(&image)
+            .expect("test image should encode");
+        let data_url = format!(
+            "data:image/jpeg;base64,{}",
+            STANDARD.encode(bytes.into_inner())
+        );
+        let frame = decode_image_data_url(&data_url).expect("data URL should decode");
+
+        assert_eq!(frame.width, 2);
+        assert_eq!(frame.height, 1);
+        assert_eq!(frame.rgb.len(), 6);
+    }
+
+    #[test]
+    fn runtime_mode_parses_mock_env_flags() {
+        assert_eq!(
+            RuntimeMode::from_env_values(Some("1"), Some("true")),
+            RuntimeMode {
+                mock_camera: true,
+                mock_serial: true,
+            }
+        );
+        assert_eq!(
+            RuntimeMode::from_env_values(Some("off"), None),
+            RuntimeMode {
+                mock_camera: false,
+                mock_serial: false,
+            }
+        );
+    }
+
+    #[test]
+    fn diagnostic_log_format_has_stable_single_line_prefix() {
+        assert_eq!(
+            format_diagnostic_log("图像加载完成\nnext"),
+            "[diagnostic] 图像加载完成\\nnext"
+        );
+    }
+
+    #[test]
+    fn mock_camera_devices_and_formats_are_stable() {
+        let devices = mock_camera_devices();
+        assert_eq!(devices.len(), 4);
+        assert_eq!(devices[0].index, "0");
+        assert!(devices[0].name.contains("Mock Camera 1"));
+
+        let formats = mock_camera_formats(2);
+        assert_eq!(formats.len(), 3);
+        assert_eq!(
+            (formats[0].width, formats[0].height, formats[0].fps),
+            (640, 480, 30)
+        );
+        assert!(formats.iter().all(|format| format.frame_format == "MJPEG"));
+    }
+
+    #[test]
+    fn mock_camera_frame_generation_is_rgb_and_changes() {
+        let first = mock_camera_frame(1, &CameraConfig::default(), 1).expect("first frame");
+        let second = mock_camera_frame(1, &CameraConfig::default(), 2).expect("second frame");
+
+        assert_eq!(first.width, 640);
+        assert_eq!(first.height, 480);
+        assert_eq!(first.rgb.len(), 640 * 480 * 3);
+        assert_ne!(first.rgb, second.rgb);
+    }
+
+    #[test]
+    fn mock_serial_queues_ok_then_motion_done() {
+        let mut serial = MockSerialTransport::default();
+        serial
+            .send_steps(&Steps {
+                commands: Vec::new(),
+                encoded: "R U R'".to_string(),
+            })
+            .expect("mock send should succeed");
+
+        assert_eq!(serial.last_payload(), Some("R U R'"));
+        assert_eq!(
+            serial.read_available().expect("first read"),
+            b"OK\n".to_vec()
+        );
+        assert_eq!(
+            serial.read_available().expect("second read"),
+            b"ND\n".to_vec()
+        );
+        assert!(serial.read_available().expect("drained").is_empty());
+    }
 }
 
 enum StreamRoute {
@@ -1406,7 +2317,10 @@ fn start_frame_server(
             thread::spawn(move || {
                 let url = request.url().to_string();
                 if url.starts_with("/grid.mjpeg") {
-                    respond_mjpeg(request, MjpegStreamReader::new(stream_hub, StreamRoute::Grid));
+                    respond_mjpeg(
+                        request,
+                        MjpegStreamReader::new(stream_hub, StreamRoute::Grid),
+                    );
                     return;
                 }
                 if let Some(slot) = parse_slot_stream_url(&url) {
@@ -1431,18 +2345,13 @@ fn parse_slot_stream_url(url: &str) -> Option<usize> {
 }
 
 fn respond_mjpeg(request: tiny_http::Request, reader: MjpegStreamReader) {
-    let content_type =
-        Header::from_bytes(&b"Content-Type"[..], &b"multipart/x-mixed-replace; boundary=frame"[..])
-            .ok();
-    let cache_control =
-        Header::from_bytes(&b"Cache-Control"[..], &b"no-store, max-age=0"[..]).ok();
-    let mut response = Response::new(
-        200.into(),
-        Vec::new(),
-        reader,
-        None,
-        None,
-    );
+    let content_type = Header::from_bytes(
+        &b"Content-Type"[..],
+        &b"multipart/x-mixed-replace; boundary=frame"[..],
+    )
+    .ok();
+    let cache_control = Header::from_bytes(&b"Cache-Control"[..], &b"no-store, max-age=0"[..]).ok();
+    let mut response = Response::new(200.into(), Vec::new(), reader, None, None);
     if let Some(header) = content_type {
         response.add_header(header);
     }
@@ -1457,8 +2366,7 @@ fn respond_latest_frame(
     latest_frame: Arc<Mutex<Option<LatestFrame>>>,
 ) {
     let content_type = Header::from_bytes(&b"Content-Type"[..], &b"image/jpeg"[..]).ok();
-    let cache_control =
-        Header::from_bytes(&b"Cache-Control"[..], &b"no-store, max-age=0"[..]).ok();
+    let cache_control = Header::from_bytes(&b"Cache-Control"[..], &b"no-store, max-age=0"[..]).ok();
     let frame = latest_frame
         .lock()
         .ok()
@@ -1482,6 +2390,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            diagnostic_log,
+            save_text_file,
             list_cameras,
             list_camera_formats,
             open_cameras,
@@ -1496,6 +2406,7 @@ pub fn run() {
             set_camera_control,
             solve_current_frame,
             solve_latest_frame,
+            solve_image_file,
             solve_facelets,
             list_serial_ports,
             open_serial,

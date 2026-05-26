@@ -9,3 +9,7 @@ anyhow.workspace = true
 image = "0.25"
 imageproc = "0.26"
 robo-core = { path = "../robo-core" }
+
+[dev-dependencies]
+robo-solver = { path = "../robo-solver" }
+serde_json.workspace = true

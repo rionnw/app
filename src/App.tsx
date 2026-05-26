@@ -3,6 +3,20 @@ import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import {
+  createCanvasFrameDiagnostic,
+  resolveCanvasPreviewFps,
+  shouldRequestCanvasFrame,
+} from "./canvasPreview";
+import {
+  createCameraFrameGapDiagnostic,
+  createImageBoxDiagnostic,
+  createImageLoadDiagnostic,
+  hasMaterialImageBoxChange,
+  isCameraFrameGapAbnormal,
+  sendDiagnosticLog,
+  shouldLogThrottledDiagnostic,
+} from "./imageDiagnostics";
+import {
   applyViewPreset,
   createInitialPanelVisibility,
   createSavedPanelVisibility,
@@ -14,10 +28,17 @@ import {
   type PanelVisibility,
   type ViewPreset,
 } from "./panelView";
+import { getLoadedImageSize, updateImageSize } from "./imageLayout";
+import { createFixedPixelRoi } from "./roiAnnotation";
+import {
+  createDefaultRoiRegions,
+  createRobotAppRoiExport,
+  getRoiIndexView,
+  normalizeLoadedRoiRegions,
+  type RoiRegion,
+} from "./roiIndexView";
+import { createSolveFrameRequest, type SolveImageSource } from "./solveAction";
 
-type Face = "U" | "R" | "F" | "D" | "L" | "B";
-type RoiRect = { x: number; y: number; w: number; h: number };
-type StickerRegion = { id: string; face: Face; index: number; rect: RoiRect | null };
 type CameraDevice = { index: string; name: string; description: string };
 type CameraConfig = { index: number; width: number; height: number; fps: number; frameFormat: string };
 type CameraStatus = { slot: number; index: number; connected: boolean; message: string };
@@ -65,19 +86,24 @@ type ImageBox = { left: number; top: number; width: number; height: number };
 type LogItem = { time: string; text: string; kind: "info" | "warn" | "error" };
 type CameraPreset = { label: string; width: number; height: number; fps: number; frameFormat: string };
 
-const faces: Face[] = ["U", "R", "F", "D", "L", "B"];
 const solvedFacelets = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB";
+const firstRoiRegionId = getRoiIndexView(0).label;
 const panelVisibilityStorageKey = "robo-ui.panel-visibility";
+const imageLayoutDiagnosticThrottleMs = 3_000;
+const cameraGapDiagnosticThrottleMs = 5_000;
+const canvasFrameDiagnosticThrottleMs = 3_000;
+const roiLabelOffset = 0.006;
+const roiLabelInset = 0.012;
 
-const defaultRegions = (): StickerRegion[] =>
-  faces.flatMap((face) =>
-    Array.from({ length: 9 }, (_, index) => ({
-      id: `${face}${index + 1}`,
-      face,
-      index: index + 1,
-      rect: null,
-    })),
-  );
+const clampUnit = (value: number) => Math.min(1 - roiLabelInset, Math.max(roiLabelInset, value));
+
+const getRoiLabelPosition = (rect: RoiRegion["rect"]) => {
+  if (!rect) return { x: roiLabelInset, y: roiLabelInset };
+  return {
+    x: clampUnit(rect.x + rect.w / 2),
+    y: clampUnit(rect.y + rect.h + roiLabelOffset),
+  };
+};
 
 const defaultCameraConfigs = (): CameraConfig[] =>
   Array.from({ length: 4 }, (_, index) => ({ index, width: 640, height: 480, fps: 30, frameFormat: "MJPEG" }));
@@ -125,6 +151,22 @@ const sameCameraStatuses = (left: CameraStatus[], right: CameraStatus[]) =>
     );
   });
 
+const toFrameArrayBuffer = (frame: ArrayBuffer | Uint8Array | number[]) => {
+  if (frame instanceof ArrayBuffer) return frame;
+  const bytes = frame instanceof Uint8Array ? frame : new Uint8Array(frame);
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
+};
+
+const loadImageElement = async (url: string) => {
+  const image = new Image();
+  image.decoding = "async";
+  image.src = url;
+  await image.decode();
+  return image;
+};
+
 const nowTime = () =>
   new Intl.DateTimeFormat("zh-CN", {
     hour: "2-digit",
@@ -137,7 +179,16 @@ function App() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const roiInputRef = useRef<HTMLInputElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
-  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imageLoadTimingRef = useRef<{ src: string; startedAtMs: number } | null>(null);
+  const lastImageSrcRef = useRef<string | null>(null);
+  const lastLoggedImageBoxRef = useRef<{ box: ImageBox | null; loggedAtMs: number | null }>({
+    box: null,
+    loggedAtMs: null,
+  });
+  const lastCameraFrameAtBySlotRef = useRef<Record<number, number>>({});
+  const lastCameraFrameGapLogAtBySlotRef = useRef<Record<number, number>>({});
+  const lastCanvasFrameLogAtRef = useRef<number | null>(null);
 
   const [devices, setDevices] = useState<CameraDevice[]>([]);
   const [cameraConfigs, setCameraConfigs] = useState<CameraConfig[]>(defaultCameraConfigs);
@@ -148,18 +199,18 @@ function App() {
   const [cameraControls, setCameraControls] = useState<CameraControl[]>([]);
   const [cameraFormats, setCameraFormats] = useState<CameraPreset[]>([]);
   const [cameraOpen, setCameraOpen] = useState(false);
+  const [imageSource, setImageSource] = useState<SolveImageSource>(null);
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [imageName, setImageName] = useState("实时相机画面");
   const [frameStats, setFrameStats] = useState("stream idle");
   const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
   const [imageBox, setImageBox] = useState<ImageBox>({ left: 0, top: 0, width: 0, height: 0 });
 
-  const [regions, setRegions] = useState<StickerRegion[]>(defaultRegions);
-  const [currentRegionId, setCurrentRegionId] = useState("U1");
+  const [regions, setRegions] = useState<RoiRegion[]>(createDefaultRoiRegions);
+  const [currentRegionId, setCurrentRegionId] = useState(firstRoiRegionId);
   const [annotationMode, setAnnotationMode] = useState(false);
   const [showRoi, setShowRoi] = useState(true);
   const [focusCurrentRoi, setFocusCurrentRoi] = useState(false);
-  const [draftRect, setDraftRect] = useState<RoiRect | null>(null);
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
   const [panelVisibility, setPanelVisibility] = useState<PanelVisibility>(() => {
     try {
@@ -198,6 +249,7 @@ function App() {
     return `${naturalSize.width} x ${naturalSize.height}`;
   }, [naturalSize]);
   const maxConfiguredFps = useMemo(() => Math.max(1, ...cameraConfigs.map((config) => config.fps || 1)), [cameraConfigs]);
+  const canvasPreviewFps = useMemo(() => resolveCanvasPreviewFps(maxConfiguredFps), [maxConfiguredFps]);
   const activeCameraConfig = cameraConfigs[controlSlot] ?? cameraConfigs[0];
   const slotParamsVisible = loadedControlSlot === controlSlot;
   const cameraPositionLocked = slotParamsVisible;
@@ -213,9 +265,15 @@ function App() {
   const currentRegionIndex = regions.findIndex((region) => region.id === currentRegionId);
   const currentRegion = regions[currentRegionIndex] ?? regions[0];
   const visibleRegions = focusCurrentRoi ? regions.filter((region) => region.id === currentRegionId) : regions;
+  const showCanvasPreview = cameraOpen && imageSource === "camera";
 
   const addLog = (text: string, kind: LogItem["kind"] = "info") => {
     setLogs((items) => [{ time: nowTime(), text, kind }, ...items].slice(0, 120));
+  };
+
+  const addDiagnosticLog = (text: string, kind: LogItem["kind"] = "info") => {
+    addLog(text, kind);
+    void sendDiagnosticLog(text, invoke);
   };
 
   const isControlWritable = (control: CameraControl) =>
@@ -346,6 +404,30 @@ function App() {
   }, [serialOpen]);
 
   useEffect(() => {
+    if (!imageSrc) {
+      imageLoadTimingRef.current = null;
+      lastImageSrcRef.current = null;
+      lastLoggedImageBoxRef.current = { box: null, loggedAtMs: null };
+      return;
+    }
+
+    if (lastImageSrcRef.current === imageSrc) return;
+
+    if (imageSource === "camera") {
+      imageLoadTimingRef.current = null;
+      lastImageSrcRef.current = imageSrc;
+      lastLoggedImageBoxRef.current = { box: null, loggedAtMs: null };
+      addLog(`图像源切换：camera ${imageName}，使用画布拉取最新帧。`);
+      return;
+    }
+
+    imageLoadTimingRef.current = { src: imageSrc, startedAtMs: performance.now() };
+    lastImageSrcRef.current = imageSrc;
+    lastLoggedImageBoxRef.current = { box: null, loggedAtMs: null };
+    addLog(`图像源切换：${imageSource ?? "unknown"} ${imageName}，等待加载。`);
+  }, [imageSrc, imageSource, imageName]);
+
+  useEffect(() => {
     const updateImageBox = () => {
       const stage = stageRef.current;
       if (!stage || !naturalSize.width || !naturalSize.height) return;
@@ -354,12 +436,27 @@ function App() {
       const stageRatio = stageRect.width / stageRect.height;
       const width = stageRatio > imageRatio ? stageRect.height * imageRatio : stageRect.width;
       const height = stageRatio > imageRatio ? stageRect.height : stageRect.width / imageRatio;
-      setImageBox({
+      const nextImageBox = {
         left: (stageRect.width - width) / 2,
         top: (stageRect.height - height) / 2,
         width,
         height,
-      });
+      };
+      setImageBox(nextImageBox);
+
+      const nowMs = performance.now();
+      const lastLogged = lastLoggedImageBoxRef.current;
+      if (
+        hasMaterialImageBoxChange(lastLogged.box, nextImageBox) &&
+        shouldLogThrottledDiagnostic({
+          nowMs,
+          lastLoggedAtMs: lastLogged.loggedAtMs,
+          intervalMs: imageLayoutDiagnosticThrottleMs,
+        })
+      ) {
+        lastLoggedImageBoxRef.current = { box: nextImageBox, loggedAtMs: nowMs };
+        addDiagnosticLog(createImageBoxDiagnostic(nextImageBox));
+      }
     };
 
     updateImageBox();
@@ -383,6 +480,24 @@ function App() {
         );
       }
       if (payload.kind === "frame" && payload.slot !== null) {
+        const nowMs = performance.now();
+        const previousFrameAtMs = lastCameraFrameAtBySlotRef.current[payload.slot] ?? null;
+        lastCameraFrameAtBySlotRef.current[payload.slot] = nowMs;
+        if (previousFrameAtMs !== null) {
+          const gapMs = nowMs - previousFrameAtMs;
+          const lastGapLoggedAtMs = lastCameraFrameGapLogAtBySlotRef.current[payload.slot] ?? null;
+          if (
+            isCameraFrameGapAbnormal({ gapMs, fps: payload.fps }) &&
+            shouldLogThrottledDiagnostic({
+              nowMs,
+              lastLoggedAtMs: lastGapLoggedAtMs,
+              intervalMs: cameraGapDiagnosticThrottleMs,
+            })
+          ) {
+            lastCameraFrameGapLogAtBySlotRef.current[payload.slot] = nowMs;
+            addDiagnosticLog(createCameraFrameGapDiagnostic({ slot: payload.slot, gapMs, fps: payload.fps }), "warn");
+          }
+        }
         const fps = payload.fps === null ? "-" : payload.fps.toFixed(1);
         const captureMs = payload.captureMs === null ? "-" : payload.captureMs.toString();
         const encodeMs = payload.encodeMs === null ? "-" : payload.encodeMs.toString();
@@ -410,6 +525,104 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!showCanvasPreview || !naturalSize.width || !naturalSize.height) return;
+
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+
+    canvas.width = naturalSize.width;
+    canvas.height = naturalSize.height;
+
+    let stopped = false;
+    let frameRequest = 0;
+    let inFlight = false;
+    let lastRequestAtMs: number | null = null;
+
+    const drawLatestFrame = async (requestAtMs: number) => {
+      inFlight = true;
+      lastRequestAtMs = requestAtMs;
+      let objectUrl: string | null = null;
+      let bitmap: ImageBitmap | null = null;
+
+      try {
+        const fetchStartedAtMs = performance.now();
+        const frame = await invoke<ArrayBuffer | Uint8Array | number[]>("snapshot_frame");
+        const fetchedAtMs = performance.now();
+        if (stopped) return;
+
+        const blob = new Blob([toFrameArrayBuffer(frame)], { type: "image/jpeg" });
+        const decodeStartedAtMs = performance.now();
+        let drawable: CanvasImageSource;
+        if ("createImageBitmap" in window) {
+          bitmap = await createImageBitmap(blob);
+          drawable = bitmap;
+        } else {
+          objectUrl = URL.createObjectURL(blob);
+          drawable = await loadImageElement(objectUrl);
+        }
+        const decodedAtMs = performance.now();
+        if (stopped) return;
+
+        if (canvas.width !== naturalSize.width) canvas.width = naturalSize.width;
+        if (canvas.height !== naturalSize.height) canvas.height = naturalSize.height;
+        context.drawImage(drawable, 0, 0, naturalSize.width, naturalSize.height);
+        const drawnAtMs = performance.now();
+
+        if (
+          shouldLogThrottledDiagnostic({
+            nowMs: drawnAtMs,
+            lastLoggedAtMs: lastCanvasFrameLogAtRef.current,
+            intervalMs: canvasFrameDiagnosticThrottleMs,
+          })
+        ) {
+          lastCanvasFrameLogAtRef.current = drawnAtMs;
+          addDiagnosticLog(
+            createCanvasFrameDiagnostic({
+              fetchMs: fetchedAtMs - fetchStartedAtMs,
+              decodeMs: decodedAtMs - decodeStartedAtMs,
+              drawMs: drawnAtMs - decodedAtMs,
+              width: naturalSize.width,
+              height: naturalSize.height,
+            }),
+          );
+        }
+      } catch (error) {
+        const nowMs = performance.now();
+        if (
+          !stopped &&
+          shouldLogThrottledDiagnostic({
+            nowMs,
+            lastLoggedAtMs: lastCanvasFrameLogAtRef.current,
+            intervalMs: canvasFrameDiagnosticThrottleMs,
+          })
+        ) {
+          lastCanvasFrameLogAtRef.current = nowMs;
+          addDiagnosticLog(`画布预览帧失败：${String(error)}`, "warn");
+        }
+      } finally {
+        bitmap?.close();
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        inFlight = false;
+      }
+    };
+
+    const tick = (nowMs: number) => {
+      if (stopped) return;
+      if (shouldRequestCanvasFrame({ inFlight, lastRequestAtMs, nowMs, targetFps: canvasPreviewFps })) {
+        void drawLatestFrame(nowMs);
+      }
+      frameRequest = requestAnimationFrame(tick);
+    };
+
+    frameRequest = requestAnimationFrame(tick);
+    return () => {
+      stopped = true;
+      cancelAnimationFrame(frameRequest);
+    };
+  }, [showCanvasPreview, naturalSize.width, naturalSize.height, canvasPreviewFps]);
+
   const applyCameraConfig = async (index: number, patch: Partial<CameraConfig>) => {
     const next = cameraConfigs.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item));
     setCameraConfigs(next);
@@ -431,11 +644,15 @@ function App() {
     if (!cameraOpen) return;
     try {
       const stream = await invoke<CameraStreamInfo>("open_camera_stream", { configs });
+      lastCameraFrameAtBySlotRef.current = {};
+      lastCameraFrameGapLogAtBySlotRef.current = {};
+      lastCanvasFrameLogAtRef.current = null;
       setImageSrc(stream.gridUrl);
+      setImageSource("camera");
       setNaturalSize({ width: stream.width, height: stream.height });
       setCameraStatuses(stream.statuses);
       setFrameStats("stream restarting");
-      addLog("相机流已按新配置重启。");
+      addLog(`相机流已按新配置重启，画布预览目标 ${canvasPreviewFps} FPS。`);
       refreshCameraControls(controlSlot);
     } catch (error) {
       addLog(String(error), "error");
@@ -466,14 +683,18 @@ function App() {
   const openCamera = async () => {
     try {
       const stream = await invoke<CameraStreamInfo>("open_camera_stream", { configs: cameraConfigs });
+      lastCameraFrameAtBySlotRef.current = {};
+      lastCameraFrameGapLogAtBySlotRef.current = {};
+      lastCanvasFrameLogAtRef.current = null;
       setImageSrc(stream.gridUrl);
+      setImageSource("camera");
       setNaturalSize({ width: stream.width, height: stream.height });
       setCameraStatuses(stream.statuses);
       setImageName("实时相机流");
       setFrameStats("stream starting");
       setCameraOpen(true);
       setStatus("相机预览中");
-      addLog("相机流已启动。图像通过本地 MJPEG 流传输，状态由后台事件推送。");
+      addLog(`相机流已启动。图像通过画布拉取最新合成帧，目标 ${canvasPreviewFps} FPS。`);
     } catch (error) {
       addLog(String(error), "error");
     }
@@ -487,6 +708,10 @@ function App() {
       setCameraControls([]);
       setLoadedControlSlot(null);
       setImageSrc(null);
+      setImageSource(null);
+      lastCameraFrameAtBySlotRef.current = {};
+      lastCameraFrameGapLogAtBySlotRef.current = {};
+      lastCanvasFrameLogAtRef.current = null;
       setNaturalSize({ width: 0, height: 0 });
       setFrameStats("stream idle");
       setStatus("空闲");
@@ -542,24 +767,16 @@ function App() {
     return { x, y };
   };
 
-  const beginAnnotation = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!annotationMode || !imageSrc) return;
+  const placeFixedRoi = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!annotationMode || !imageSrc || !naturalSize.width || !naturalSize.height) return;
     const point = normalizedPointFromEvent(event);
     if (!point) return;
-    dragStartRef.current = point;
-    setDraftRect({ x: point.x, y: point.y, w: 0, h: 0 });
-    event.currentTarget.setPointerCapture(event.pointerId);
-  };
-
-  const updateAnnotation = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!dragStartRef.current) return;
-    const point = normalizedPointFromEvent(event);
-    if (!point) return;
-    const x = Math.min(dragStartRef.current.x, point.x);
-    const y = Math.min(dragStartRef.current.y, point.y);
-    const w = Math.abs(point.x - dragStartRef.current.x);
-    const h = Math.abs(point.y - dragStartRef.current.y);
-    setDraftRect({ x, y, w, h });
+    const rect = createFixedPixelRoi(point, naturalSize);
+    setRegions((items) =>
+      items.map((region) => (region.id === currentRegionId ? { ...region, rect } : region)),
+    );
+    addLog(`已标注 ${currentRegionId}：10 x 10 px。`);
+    selectNextMissingRegion(currentRegionId);
   };
 
   const selectNextMissingRegion = (afterId = currentRegionId) => {
@@ -570,7 +787,8 @@ function App() {
   };
 
   const selectRegionByOffset = (offset: number) => {
-    const nextIndex = (currentRegionIndex + offset + regions.length) % regions.length;
+    const safeRegionIndex = currentRegionIndex >= 0 ? currentRegionIndex : 0;
+    const nextIndex = (safeRegionIndex + offset + regions.length) % regions.length;
     setCurrentRegionId(regions[nextIndex].id);
   };
 
@@ -581,38 +799,36 @@ function App() {
     addLog(`已清除 ${currentRegionId}。`);
   };
 
-  const finishAnnotation = () => {
-    if (!dragStartRef.current || !draftRect) return;
-    dragStartRef.current = null;
-    if (draftRect.w < 0.004 || draftRect.h < 0.004) {
-      setDraftRect(null);
-      return;
+  const getFrameRois = () =>
+    [...regions].sort((left, right) => left.index - right.index).map((region) => ({
+      x: Math.round((region.rect?.x || 0) * naturalSize.width),
+      y: Math.round((region.rect?.y || 0) * naturalSize.height),
+      width: Math.max(1, Math.round((region.rect?.w || 0) * naturalSize.width)),
+      height: Math.max(1, Math.round((region.rect?.h || 0) * naturalSize.height)),
+    }));
+
+  const solveCurrentImage = async () => {
+    if (markedCount < 54 || !naturalSize.width || !naturalSize.height) {
+      addLog(`ROI 未完成：${markedCount}/54。`, "warn");
+      return null;
     }
-    setRegions((items) =>
-      items.map((region) => (region.id === currentRegionId ? { ...region, rect: draftRect } : region)),
-    );
-    addLog(`已标注 ${currentRegionId}。`);
-    setDraftRect(null);
-    selectNextMissingRegion(currentRegionId);
+
+    setStatus("识别解算中");
+    const request = createSolveFrameRequest({
+      cameraOpen,
+      imageSource,
+      imageSrc,
+      rois: getFrameRois(),
+    });
+    const result = await invoke<SolveResponse>(request.command, request.args);
+    applySolveResult(result);
+    addLog(request.successLog);
+    return result;
   };
 
   const solveFromFrame = async () => {
-    if (markedCount < 54 || !naturalSize.width || !naturalSize.height) {
-      addLog(`ROI 未完成：${markedCount}/54。`, "warn");
-      return;
-    }
     try {
-      setStatus("识别解算中");
-      const rois = regions.map((region) => ({
-        x: Math.round((region.rect?.x || 0) * naturalSize.width),
-        y: Math.round((region.rect?.y || 0) * naturalSize.height),
-        width: Math.max(1, Math.round((region.rect?.w || 0) * naturalSize.width)),
-        height: Math.max(1, Math.round((region.rect?.h || 0) * naturalSize.height)),
-      }));
-      const command = cameraOpen ? "solve_latest_frame" : "solve_current_frame";
-      const result = await invoke<SolveResponse>(command, { rois });
-      applySolveResult(result);
-      addLog("当前相机帧已识别并解算。");
+      await solveCurrentImage();
     } catch (error) {
       setStatus("解算失败");
       addLog(String(error), "error");
@@ -679,11 +895,39 @@ function App() {
     }
   };
 
-  const loadImageFile = (file: File) => {
+  const runDirectly = async () => {
+    try {
+      const result = await solveCurrentImage();
+      if (!result?.encoded_steps) return;
+      await invoke("send_steps", { encodedSteps: result.encoded_steps });
+      setElapsedMs(0);
+      setTimerRunning(true);
+      addLog("识别、解算、转换完成，步骤已发送到串口。");
+    } catch (error) {
+      setStatus("运行失败");
+      addLog(String(error), "error");
+    }
+  };
+
+  const loadImageFile = async (file: File) => {
+    if (cameraOpen) {
+      try {
+        await invoke("close_camera_stream");
+        setCameraOpen(false);
+        setCameraStatuses([]);
+        setCameraControls([]);
+        setLoadedControlSlot(null);
+      } catch (error) {
+        addLog(`切换到文件图片时关闭相机流失败：${String(error)}`, "warn");
+      }
+    }
     const reader = new FileReader();
     reader.onload = () => {
+      setImageSource("file");
       setImageSrc(String(reader.result));
       setImageName(file.name);
+      setFrameStats("file loaded");
+      setStatus("已读取图片");
       addLog(`已读取图片：${file.name}`);
     };
     reader.readAsDataURL(file);
@@ -701,9 +945,9 @@ function App() {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const data = JSON.parse(String(reader.result)) as StickerRegion[];
-        if (data.length !== 54) throw new Error("ROI 数量必须是 54。");
+        const data = normalizeLoadedRoiRegions(JSON.parse(String(reader.result)), naturalSize);
         setRegions(data);
+        setCurrentRegionId(data.find((region) => !region.rect)?.id ?? data[0].id);
         addLog(`已读取 ROI：${file.name}`);
       } catch (error) {
         addLog(error instanceof Error ? error.message : String(error), "error");
@@ -718,8 +962,41 @@ function App() {
     const link = document.createElement("a");
     link.href = url;
     link.download = filename;
+    link.style.display = "none";
+    document.body.appendChild(link);
     link.click();
-    URL.revokeObjectURL(url);
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  };
+
+  const getSavedRoiText = () => {
+    const hasNaturalSize = naturalSize.width > 0 && naturalSize.height > 0;
+    const payload = hasNaturalSize
+      ? createRobotAppRoiExport(regions, naturalSize)
+      : [...regions].sort((left, right) => left.index - right.index);
+
+    return {
+      text: JSON.stringify(payload, null, 2),
+      format: hasNaturalSize ? "RobotApp 像素格式" : "内部归一化格式",
+    };
+  };
+
+  const saveRoi = async () => {
+    const filename = "robot-roi.json";
+    const { text, format } = getSavedRoiText();
+
+    try {
+      const path = await invoke<string>("save_text_file", { filename, contents: text });
+      addLog(`ROI 已保存：${path}（${format}）。`);
+    } catch (error) {
+      try {
+        downloadText(filename, text);
+        addLog(`Tauri 保存失败，已尝试浏览器下载：${String(error)}`, "warn");
+        addLog(`已触发 ROI 下载：${filename}（${format}）。`);
+      } catch (fallbackError) {
+        addLog(`ROI 保存失败：${String(fallbackError)}`, "error");
+      }
+    }
   };
 
   return (
@@ -731,7 +1008,7 @@ function App() {
         hidden
         onChange={(event) => {
           const file = event.target.files?.[0];
-          if (file) loadImageFile(file);
+          if (file) void loadImageFile(file);
           event.target.value = "";
         }}
       />
@@ -773,10 +1050,16 @@ function App() {
           <button type="button" onClick={() => roiInputRef.current?.click()}>
             读取 ROI
           </button>
-          <button type="button" onClick={() => downloadText("robot-roi.json", JSON.stringify(regions, null, 2))}>
+          <button type="button" onClick={() => void saveRoi()}>
             保存 ROI
           </button>
-          <button type="button" onClick={() => setRegions(defaultRegions())}>
+          <button
+            type="button"
+            onClick={() => {
+              setRegions(createDefaultRoiRegions());
+              setCurrentRegionId(firstRoiRegionId);
+            }}
+          >
             清空 ROI
           </button>
         </div>
@@ -785,7 +1068,12 @@ function App() {
       <section className="workspace">
         <section className="image-panel">
           <div className="panel-title">
-            <h2>图像与 ROI</h2>
+            <div className="panel-heading">
+              <h2>图像与 ROI</h2>
+              <button type="button" onClick={() => setAnnotationMode((mode) => !mode)}>
+                {annotationMode ? "退出标注" : "标注 ROI"}
+              </button>
+            </div>
             <div className="image-meta">
               <span>{imageName}</span>
               <span>{imageAspectLabel}</span>
@@ -797,32 +1085,51 @@ function App() {
           <div
             ref={stageRef}
             className={`image-stage ${annotationMode ? "is-annotating" : ""}`}
-            onPointerDown={beginAnnotation}
-            onPointerMove={updateAnnotation}
-            onPointerUp={finishAnnotation}
-            onPointerCancel={finishAnnotation}
+            onPointerDown={placeFixedRoi}
           >
             {imageSrc ? (
               <>
-                <img
-                  alt="cube camera frame"
-                  className="stitched-image"
-                  src={imageSrc}
-                  style={{
-                    left: imageBox.left,
-                    top: imageBox.top,
-                    width: imageBox.width,
-                    height: imageBox.height,
-                  }}
-                  onLoad={(event) =>
-                    setNaturalSize((size) => {
-                      const width = event.currentTarget.naturalWidth;
-                      const height = event.currentTarget.naturalHeight;
-                      return size.width === width && size.height === height ? size : { width, height };
-                    })
-                  }
-                  onError={handleStreamImageError}
-                />
+                {showCanvasPreview ? (
+                  <canvas
+                    ref={canvasRef}
+                    className="stitched-image"
+                    style={{
+                      left: imageBox.left,
+                      top: imageBox.top,
+                      width: imageBox.width,
+                      height: imageBox.height,
+                    }}
+                  />
+                ) : (
+                  <img
+                    alt="cube camera frame"
+                    className="stitched-image"
+                    src={imageSrc}
+                    style={{
+                      left: imageBox.left,
+                      top: imageBox.top,
+                      width: imageBox.width,
+                      height: imageBox.height,
+                    }}
+                    onLoad={(event) => {
+                      const nextSize = getLoadedImageSize(event.currentTarget);
+                      setNaturalSize((size) => updateImageSize(size, nextSize));
+                      const timing = imageLoadTimingRef.current;
+                      const loadedAtMs = performance.now();
+                      const durationMs = timing && timing.src === imageSrc ? loadedAtMs - timing.startedAtMs : 0;
+                      addDiagnosticLog(
+                        createImageLoadDiagnostic({
+                          source: imageSource,
+                          name: imageName,
+                          durationMs,
+                          width: nextSize.width,
+                          height: nextSize.height,
+                        }),
+                      );
+                    }}
+                    onError={handleStreamImageError}
+                  />
+                )}
                 {showRoi && (
                   <svg
                     className="roi-layer"
@@ -835,8 +1142,10 @@ function App() {
                     viewBox="0 0 1 1"
                     preserveAspectRatio="none"
                   >
-                    {visibleRegions.map((region) =>
-                      region.rect ? (
+                    {visibleRegions.map((region) => {
+                      if (!region.rect) return null;
+                      const labelPosition = getRoiLabelPosition(region.rect);
+                      return (
                         <g key={region.id} onClick={() => setCurrentRegionId(region.id)}>
                           <rect
                             className={region.id === currentRegionId ? "roi-rect is-active" : "roi-rect"}
@@ -846,22 +1155,18 @@ function App() {
                             height={region.rect.h}
                             vectorEffect="non-scaling-stroke"
                           />
-                          <text className="roi-label" x={region.rect.x + 0.006} y={region.rect.y + 0.022}>
+                          <text
+                            className="roi-label"
+                            x={labelPosition.x}
+                            y={labelPosition.y}
+                            textAnchor="middle"
+                            dominantBaseline="hanging"
+                          >
                             {region.id}
                           </text>
                         </g>
-                      ) : null,
-                    )}
-                    {draftRect && (
-                      <rect
-                        className="roi-rect is-draft"
-                        x={draftRect.x}
-                        y={draftRect.y}
-                        width={draftRect.w}
-                        height={draftRect.h}
-                        vectorEffect="non-scaling-stroke"
-                      />
-                    )}
+                      );
+                    })}
                   </svg>
                 )}
               </>
@@ -877,14 +1182,11 @@ function App() {
             <button type="button" onClick={cameraOpen ? closeCamera : openCamera}>
               {cameraOpen ? "关闭相机" : "打开相机"}
             </button>
-            <button type="button" onClick={() => setAnnotationMode((mode) => !mode)}>
-              {annotationMode ? "退出标注" : "标注 ROI"}
-            </button>
             <button type="button" onClick={solveFromFrame}>
               识别并解算
             </button>
-            <button type="button" onClick={sendToRobot}>
-              发送步骤
+            <button type="button" onClick={runDirectly}>
+              直接运行
             </button>
           </div>
         </section>
@@ -1127,7 +1429,7 @@ function App() {
             </label>
             <div className="roi-status">
               <strong>{currentRegion?.id}</strong>
-              <span>{currentRegion?.rect ? "已标注，可拖拽重标覆盖" : "未标注，进入标注后拖拽框选"}</span>
+              <span>{currentRegion?.rect ? "已标注，点击图像可重标覆盖" : "未标注，进入标注后点击图像放置 10 x 10 ROI"}</span>
             </div>
             <div className="button-row roi-actions">
               <button type="button" onClick={() => selectRegionByOffset(-1)}>

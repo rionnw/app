@@ -4121,6 +4121,8 @@ dependencies = [
  "image",
  "imageproc",
  "robo-core",
+ "robo-solver",
+ "serde_json",
 ]
 
 [[package]]
