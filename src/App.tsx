@@ -2,6 +2,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
+import {
+  applyViewPreset,
+  createInitialPanelVisibility,
+  createSavedPanelVisibility,
+  getCameraProfileKey,
+  panelIds,
+  panelLabels,
+  togglePanelVisibility,
+  viewPresetLabels,
+  type PanelVisibility,
+  type ViewPreset,
+} from "./panelView";
 
 type Face = "U" | "R" | "F" | "D" | "L" | "B";
 type RoiRect = { x: number; y: number; w: number; h: number };
@@ -55,6 +67,7 @@ type CameraPreset = { label: string; width: number; height: number; fps: number;
 
 const faces: Face[] = ["U", "R", "F", "D", "L", "B"];
 const solvedFacelets = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB";
+const panelVisibilityStorageKey = "robo-ui.panel-visibility";
 
 const defaultRegions = (): StickerRegion[] =>
   faces.flatMap((face) =>
@@ -145,7 +158,16 @@ function App() {
   const [currentRegionId, setCurrentRegionId] = useState("U1");
   const [annotationMode, setAnnotationMode] = useState(false);
   const [showRoi, setShowRoi] = useState(true);
+  const [focusCurrentRoi, setFocusCurrentRoi] = useState(false);
   const [draftRect, setDraftRect] = useState<RoiRect | null>(null);
+  const [viewMenuOpen, setViewMenuOpen] = useState(false);
+  const [panelVisibility, setPanelVisibility] = useState<PanelVisibility>(() => {
+    try {
+      return createSavedPanelVisibility(JSON.parse(localStorage.getItem(panelVisibilityStorageKey) || "null"));
+    } catch {
+      return createInitialPanelVisibility();
+    }
+  });
 
   const [ports, setPorts] = useState<SerialPort[]>([]);
   const [selectedPort, setSelectedPort] = useState("");
@@ -179,6 +201,18 @@ function App() {
   const activeCameraConfig = cameraConfigs[controlSlot] ?? cameraConfigs[0];
   const slotParamsVisible = loadedControlSlot === controlSlot;
   const cameraPositionLocked = slotParamsVisible;
+  const activeCameraDevice = devices.find((device) => device.index === String(activeCameraConfig?.index ?? ""));
+  const cameraProfileKey = useMemo(() => {
+    if (!activeCameraDevice || !cameraFormats.length) return "";
+    return getCameraProfileKey({
+      name: activeCameraDevice.name,
+      description: activeCameraDevice.description,
+      formats: cameraFormats,
+    });
+  }, [activeCameraDevice, cameraFormats]);
+  const currentRegionIndex = regions.findIndex((region) => region.id === currentRegionId);
+  const currentRegion = regions[currentRegionIndex] ?? regions[0];
+  const visibleRegions = focusCurrentRoi ? regions.filter((region) => region.id === currentRegionId) : regions;
 
   const addLog = (text: string, kind: LogItem["kind"] = "info") => {
     setLogs((items) => [{ time: nowTime(), text, kind }, ...items].slice(0, 120));
@@ -197,6 +231,7 @@ function App() {
     const values = cameraControls.map((control) => ({ id: control.id, value: control.value }));
     localStorage.setItem(cameraControlStorageKey(), JSON.stringify(values));
     addLog(`已保存槽 ${controlSlot + 1} 的相机参数。`);
+    closeCameraControlsPanel();
   };
 
   const restoreDefaultCameraControls = async () => {
@@ -260,6 +295,10 @@ function App() {
     refreshCameras();
     refreshPorts();
   }, []);
+
+  useEffect(() => {
+    localStorage.setItem(panelVisibilityStorageKey, JSON.stringify(panelVisibility));
+  }, [panelVisibility]);
 
   useEffect(() => {
     if (!timerRunning) return;
@@ -485,6 +524,15 @@ function App() {
     setSwapSlot(null);
   };
 
+  const applyPanelPreset = (preset: ViewPreset) => {
+    setPanelVisibility(applyViewPreset(preset));
+    setViewMenuOpen(false);
+  };
+
+  const togglePanel = (panel: keyof PanelVisibility) => {
+    setPanelVisibility((visibility) => togglePanelVisibility(visibility, panel));
+  };
+
   const normalizedPointFromEvent = (event: React.PointerEvent<HTMLDivElement>) => {
     if (!imageBox.width || !imageBox.height) return null;
     const stageRect = event.currentTarget.getBoundingClientRect();
@@ -519,6 +567,18 @@ function App() {
     const ordered = [...regions.slice(startIndex + 1), ...regions.slice(0, startIndex + 1)];
     const next = ordered.find((region) => !region.rect);
     if (next) setCurrentRegionId(next.id);
+  };
+
+  const selectRegionByOffset = (offset: number) => {
+    const nextIndex = (currentRegionIndex + offset + regions.length) % regions.length;
+    setCurrentRegionId(regions[nextIndex].id);
+  };
+
+  const clearCurrentRegion = () => {
+    setRegions((items) =>
+      items.map((region) => (region.id === currentRegionId ? { ...region, rect: null } : region)),
+    );
+    addLog(`已清除 ${currentRegionId}。`);
   };
 
   const finishAnnotation = () => {
@@ -683,6 +743,30 @@ function App() {
           <span>{status}</span>
         </div>
         <div className="top-actions">
+          <div className="view-menu">
+            <button type="button" onClick={() => setViewMenuOpen((open) => !open)} aria-expanded={viewMenuOpen}>
+              View
+            </button>
+            {viewMenuOpen && (
+              <div className="view-popover">
+                <div className="view-presets">
+                  {(Object.keys(viewPresetLabels) as ViewPreset[]).map((preset) => (
+                    <button type="button" key={preset} onClick={() => applyPanelPreset(preset)}>
+                      {viewPresetLabels[preset]}
+                    </button>
+                  ))}
+                </div>
+                <div className="view-toggles">
+                  {panelIds.map((panel) => (
+                    <label key={panel}>
+                      <input type="checkbox" checked={panelVisibility[panel]} onChange={() => togglePanel(panel)} />
+                      <span>{panelLabels[panel]}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
           <button type="button" onClick={() => imageInputRef.current?.click()}>
             读取图片
           </button>
@@ -751,7 +835,7 @@ function App() {
                     viewBox="0 0 1 1"
                     preserveAspectRatio="none"
                   >
-                    {regions.map((region) =>
+                    {visibleRegions.map((region) =>
                       region.rect ? (
                         <g key={region.id} onClick={() => setCurrentRegionId(region.id)}>
                           <rect
@@ -806,6 +890,7 @@ function App() {
         </section>
 
         <aside className="side-panel">
+          {panelVisibility.timer && (
           <section className="panel-card timer-card">
             <div className="card-title">
               <h2>计时器</h2>
@@ -830,7 +915,43 @@ function App() {
             </div>
             <p className="hint-line">{timerRunning ? "运行中，等待下位机 ND 结束信号。" : "发送步骤后自动开始计时。"}</p>
           </section>
+          )}
 
+          {panelVisibility.solve && (
+          <section className="panel-card solve-card">
+            <div className="card-title">
+              <h2>解算结果</h2>
+              <button type="button" onClick={solveFromFacelets}>
+                字符串解算
+              </button>
+            </div>
+            <textarea value={facelets} onChange={(event) => setFacelets(event.target.value)} spellCheck={false} />
+            <div className="solve-summary">
+              <div className="result-box">
+                <label>Moves</label>
+                <pre className="moves-output">{moves.join(" ") || "未生成"}</pre>
+              </div>
+              <div className="result-box">
+                <label>Encoded</label>
+                <pre className="encoded-output">{encodedSteps || "未生成"}</pre>
+              </div>
+            </div>
+            <div className="result-box steps-box">
+              <label>Steps</label>
+              {steps.length ? (
+                <ol className="steps-list">
+                  {steps.map((step, index) => (
+                    <li key={`${step}-${index}`}>{step}</li>
+                  ))}
+                </ol>
+              ) : (
+                <div className="empty-steps">未生成</div>
+              )}
+            </div>
+          </section>
+          )}
+
+          {panelVisibility.camera && (
           <section className="panel-card">
             <div className="card-title">
               <h2>相机</h2>
@@ -902,6 +1023,12 @@ function App() {
                 ? `参数调节界面已打开，相机位置交换已锁定；当前最高配置 ${maxConfiguredFps} FPS。`
                 : "点击读取后展开该槽位的 Index、分辨率、FPS 和可调参数；格式列表只显示 30 FPS 及以上的常用分辨率。"}
             </p>
+            <div className="camera-profile">
+              <span>类型标识</span>
+              <code title={cameraProfileKey || "读取槽位格式后生成"}>
+                {cameraProfileKey || "读取格式后生成；不使用易变的 index"}
+              </code>
+            </div>
             {slotParamsVisible && activeCameraConfig && (
               <div className="slot-param-panel">
                 <div className="camera-grid">
@@ -973,13 +1100,20 @@ function App() {
               </div>
             )}
           </section>
+          )}
 
+          {panelVisibility.roi && (
           <section className="panel-card">
             <div className="card-title">
               <h2>ROI</h2>
-              <button type="button" onClick={() => setShowRoi((visible) => !visible)}>
-                {showRoi ? "隐藏" : "显示"}
-              </button>
+              <div className="card-actions">
+                <button type="button" onClick={() => setFocusCurrentRoi((focused) => !focused)}>
+                  {focusCurrentRoi ? "显示全部" : "只看当前"}
+                </button>
+                <button type="button" onClick={() => setShowRoi((visible) => !visible)}>
+                  {showRoi ? "隐藏" : "显示"}
+                </button>
+              </div>
             </div>
             <label className="field">
               <span>当前格</span>
@@ -991,8 +1125,34 @@ function App() {
                 ))}
               </select>
             </label>
+            <div className="roi-status">
+              <strong>{currentRegion?.id}</strong>
+              <span>{currentRegion?.rect ? "已标注，可拖拽重标覆盖" : "未标注，进入标注后拖拽框选"}</span>
+            </div>
+            <div className="button-row roi-actions">
+              <button type="button" onClick={() => selectRegionByOffset(-1)}>
+                上一格
+              </button>
+              <button type="button" onClick={() => selectRegionByOffset(1)}>
+                下一格
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAnnotationMode(true);
+                  setShowRoi(true);
+                }}
+              >
+                标当前
+              </button>
+              <button type="button" onClick={clearCurrentRegion} disabled={!currentRegion?.rect}>
+                清当前
+              </button>
+            </div>
           </section>
+          )}
 
+          {panelVisibility.serial && (
           <section className="panel-card">
             <div className="card-title">
               <h2>串口</h2>
@@ -1023,29 +1183,9 @@ function App() {
               </button>
             </div>
           </section>
+          )}
 
-          <section className="panel-card solve-card">
-            <div className="card-title">
-              <h2>解算结果</h2>
-              <button type="button" onClick={solveFromFacelets}>
-                字符串解算
-              </button>
-            </div>
-            <textarea value={facelets} onChange={(event) => setFacelets(event.target.value)} spellCheck={false} />
-            <div className="result-box">
-              <label>Moves</label>
-              <pre>{moves.join(" ") || "未生成"}</pre>
-            </div>
-            <div className="result-box">
-              <label>Steps</label>
-              <pre>{steps.join("\n") || "未生成"}</pre>
-            </div>
-            <div className="result-box">
-              <label>Encoded</label>
-              <pre>{encodedSteps || "未生成"}</pre>
-            </div>
-          </section>
-
+          {panelVisibility.logs && (
           <section className="panel-card log-card">
             <h2>日志</h2>
             <div className="log-output">
@@ -1057,6 +1197,7 @@ function App() {
               ))}
             </div>
           </section>
+          )}
         </aside>
       </section>
     </main>
