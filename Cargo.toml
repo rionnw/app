@@ -11,6 +11,7 @@ members = [
     "tools/recognize-cli",
     "tools/solve-cli",
     "tools/translate-cli",
+    "tools/solve-server",
 ]
 resolver = "2"
 
