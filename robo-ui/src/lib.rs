@@ -1578,7 +1578,6 @@ fn diagnostic_log(message: String) -> Result<(), String> {
 
 #[tauri::command]
 fn save_text_file(
-    app: tauri::AppHandle,
     filename: String,
     contents: String,
 ) -> Result<String, String> {
@@ -1587,13 +1586,10 @@ fn save_text_file(
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "文件名无效。".to_string())?;
-    let path = app
-        .path()
-        .download_dir()
-        .map_err(|err| err.to_string())?
-        .join(safe_filename);
+    let path = Path::new(safe_filename);
 
-    std::fs::write(&path, contents).map_err(|err| err.to_string())?;
+    std::fs::write(path, contents).map_err(|err| err.to_string())?;
+    log::info!("文件已保存: {}", path.display());
     Ok(path.display().to_string())
 }
 
@@ -2390,11 +2386,93 @@ fn respond_latest_frame(
     let _ = request.respond(response);
 }
 
+/// 初始化日志：控制台输出 info+，文件输出 debug+（按日期分文件）。
+fn setup_logging() {
+    use std::fs;
+
+    let logs_dir = Path::new("logs");
+    let _ = fs::create_dir_all(logs_dir);
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let log_file = fern::log_file(logs_dir.join(format!("{today}.log")))
+        .expect("failed to open log file");
+
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{} {} {}] {}",
+                chrono::Local::now().format("%H:%M:%S%.3f"),
+                record.level(),
+                record.target(),
+                message
+            ))
+        })
+        // 文件输出：debug 及以上
+        .chain(
+            fern::Dispatch::new()
+                .level(log::LevelFilter::Debug)
+                .chain(log_file),
+        )
+        // 控制台输出：info 及以上（可通过 RUST_LOG 覆盖）
+        .chain(
+            fern::Dispatch::new()
+                .level(
+                    std::env::var("RUST_LOG")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(log::LevelFilter::Info),
+                )
+                .chain(std::io::stderr()),
+        )
+        .apply()
+        .expect("failed to initialize logging");
+}
+
+/// 保存解算时的图片帧到 imgs/ 目录。
+#[tauri::command]
+fn save_solve_image(image_data_url: String) -> Result<String, String> {
+    let imgs_dir = Path::new("imgs");
+    std::fs::create_dir_all(imgs_dir).map_err(|e| e.to_string())?;
+
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S%.3f");
+    let filename = format!("solve_{timestamp}.jpg");
+    let path = imgs_dir.join(&filename);
+
+    let encoded = image_data_url
+        .split_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(&image_data_url);
+    let bytes = STANDARD.decode(encoded).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+
+    log::info!("解算图片已保存: {}", path.display());
+    Ok(path.display().to_string())
+}
+
+/// 启动时尝试读取默认 ROI 文件 (robot-roi.json)，不存在则返回 null。
+#[tauri::command]
+fn load_default_roi() -> Option<String> {
+    let roi_path = Path::new("robot-roi.json");
+    if roi_path.is_file() {
+        match std::fs::read_to_string(roi_path) {
+            Ok(content) => {
+                log::info!("已加载默认 ROI: {}", roi_path.display());
+                Some(content)
+            }
+            Err(e) => {
+                log::warn!("读取默认 ROI 失败: {}", e);
+                None
+            }
+        }
+    } else {
+        log::debug!("默认 ROI 文件不存在: {}", roi_path.display());
+        None
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
+    setup_logging();
 
     log::info!("robo-ui starting");
 
@@ -2434,6 +2512,8 @@ pub fn run() {
             solve_latest_frame,
             solve_image_file,
             solve_facelets,
+            save_solve_image,
+            load_default_roi,
             list_serial_ports,
             open_serial,
             close_serial,

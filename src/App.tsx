@@ -356,6 +356,19 @@ function App() {
     const unlisten = listen("solver-ready", () => {
       setSolverReady(true);
     });
+    // 尝试加载默认 ROI 文件
+    invoke<string | null>("load_default_roi").then((content) => {
+      if (content) {
+        try {
+          const data = normalizeLoadedRoiRegions(JSON.parse(content), naturalSize);
+          setRegions(data);
+          setCurrentRegionId(data.find((region) => !region.rect)?.id ?? data[0].id);
+          addLog("已自动加载默认 ROI: robot-roi.json");
+        } catch (e) {
+          addLog(`默认 ROI 解析失败: ${String(e)}`, "warn");
+        }
+      }
+    }).catch(() => {});
     return () => { unlisten.then((f) => f()); };
   }, []);
 
@@ -828,6 +841,20 @@ function App() {
     const result = await invoke<SolveResponse>(request.command, request.args);
     applySolveResult(result);
     addLog(request.successLog);
+
+    // 自动保存解算图片
+    try {
+      let dataUrl = imageSrc;
+      if (!dataUrl && cameraOpen) {
+        dataUrl = await invoke<string>("latest_frame_data_url");
+      }
+      if (dataUrl) {
+        await invoke("save_solve_image", { imageDataUrl: dataUrl });
+      }
+    } catch (e) {
+      addLog(`图片保存失败: ${String(e)}`, "warn");
+    }
+
     return result;
   };
 

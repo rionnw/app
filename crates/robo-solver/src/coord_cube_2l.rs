@@ -12,7 +12,7 @@ use crate::cubie_cube_2l::CubieCube2L;
 use crate::util;
 
 /// Data directory for 2L pruning tables.
-/// Priority: `MIN2PHASE_2L_DATA_DIR` env var > `<exe_dir>/2l_data` > `./2l_data`.
+/// Priority: `MIN2PHASE_2L_DATA_DIR` env var > `<exe_dir>/data` > `./data`.
 /// Re-settable at runtime via [`set_data_dir`].
 static DATA_DIR: LazyLock<Mutex<PathBuf>> = LazyLock::new(|| {
     let dir = std::env::var("MIN2PHASE_2L_DATA_DIR")
@@ -20,12 +20,12 @@ static DATA_DIR: LazyLock<Mutex<PathBuf>> = LazyLock::new(|| {
         .unwrap_or_else(|_| {
             // Try next to the executable first
             if let Ok(exe) = std::env::current_exe() {
-                let candidate = exe.parent().unwrap_or(Path::new(".")).join("2l_data");
+                let candidate = exe.parent().unwrap_or(Path::new(".")).join("data");
                 if candidate.is_dir() {
                     return candidate;
                 }
             }
-            PathBuf::from("2l_data")
+            PathBuf::from("data")
         });
     Mutex::new(dir)
 });
