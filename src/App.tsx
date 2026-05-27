@@ -357,6 +357,15 @@ function App() {
     const unlisten = listen("solver-ready", () => {
       setSolverReady(true);
     });
+    // 主动查询 solver 状态（防止事件在前端渲染前已发出）
+    const pollReady = setInterval(() => {
+      invoke<boolean>("check_solver_ready").then((ready) => {
+        if (ready) {
+          setSolverReady(true);
+          clearInterval(pollReady);
+        }
+      }).catch(() => {});
+    }, 500);
     // 尝试加载默认 ROI 文件
     invoke<string | null>("load_default_roi").then((content) => {
       if (content) {
@@ -370,7 +379,10 @@ function App() {
         }
       }
     }).catch(() => {});
-    return () => { unlisten.then((f) => f()); };
+    return () => {
+      unlisten.then((f) => f());
+      clearInterval(pollReady);
+    };
   }, []);
 
   useEffect(() => {

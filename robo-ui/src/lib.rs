@@ -2456,6 +2456,12 @@ fn save_solve_image(image_data_url: String, solve_result: Option<String>) -> Res
     Ok(img_path.display().to_string())
 }
 
+/// 前端主动查询 solver 是否就绪（防止错过 solver-ready 事件）。
+#[tauri::command]
+fn check_solver_ready(state: tauri::State<'_, AppState>) -> bool {
+    state.solver.get().is_some()
+}
+
 /// 启动时尝试读取默认 ROI 文件 (robot-roi.json)，不存在则返回 null。
 #[tauri::command]
 fn load_default_roi() -> Option<String> {
@@ -2520,6 +2526,7 @@ pub fn run() {
             solve_image_file,
             solve_facelets,
             save_solve_image,
+            check_solver_ready,
             load_default_roi,
             list_serial_ports,
             open_serial,
