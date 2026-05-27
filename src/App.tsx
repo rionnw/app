@@ -227,6 +227,7 @@ function App() {
 
   const [status, setStatus] = useState("空闲");
   const [solverReady, setSolverReady] = useState(false);
+  const [autoSaveImage, setAutoSaveImage] = useState(false);
   const [facelets, setFacelets] = useState(solvedFacelets);
   const [moves, setMoves] = useState<string[]>([]);
   const [steps, setSteps] = useState<string[]>([]);
@@ -842,17 +843,22 @@ function App() {
     applySolveResult(result);
     addLog(request.successLog);
 
-    // 自动保存解算图片
-    try {
-      let dataUrl = imageSrc;
-      if (!dataUrl && cameraOpen) {
-        dataUrl = await invoke<string>("latest_frame_data_url");
-      }
-      if (dataUrl) {
-        await invoke("save_solve_image", { imageDataUrl: dataUrl });
-      }
-    } catch (e) {
-      addLog(`图片保存失败: ${String(e)}`, "warn");
+    // 异步保存解算图片和结果（不阻塞主流程）
+    if (autoSaveImage) {
+      const solveResultJson = JSON.stringify(result, null, 2);
+      void (async () => {
+        try {
+          let dataUrl = imageSrc;
+          if (!dataUrl && cameraOpen) {
+            dataUrl = await invoke<string>("latest_frame_data_url");
+          }
+          if (dataUrl) {
+            await invoke("save_solve_image", { imageDataUrl: dataUrl, solveResult: solveResultJson });
+          }
+        } catch (e) {
+          addLog(`图片保存失败: ${String(e)}`, "warn");
+        }
+      })();
     }
 
     return result;
@@ -1065,15 +1071,17 @@ function App() {
 
       <header className="top-bar">
         <div>
-          <h1>robo-ui</h1>
+          <h1>CubeSolver</h1>
           <span>{status}</span>
         </div>
         <div className="top-actions">
           <div className="view-menu">
             <button type="button" onClick={() => setViewMenuOpen((open) => !open)} aria-expanded={viewMenuOpen}>
-              View
+              视图
             </button>
             {viewMenuOpen && (
+              <>
+              <div className="view-backdrop" onClick={() => setViewMenuOpen(false)} />
               <div className="view-popover">
                 <div className="view-presets">
                   {(Object.keys(viewPresetLabels) as ViewPreset[]).map((preset) => (
@@ -1091,16 +1099,23 @@ function App() {
                   ))}
                 </div>
               </div>
+              </>
             )}
           </div>
           <button type="button" onClick={() => imageInputRef.current?.click()}>
             读取图片
+          </button>
+          <button type="button" onClick={saveImage} disabled={!imageSrc && !cameraOpen}>
+            保存图片
           </button>
           <button type="button" onClick={() => roiInputRef.current?.click()}>
             读取 ROI
           </button>
           <button type="button" onClick={() => void saveRoi()}>
             保存 ROI
+          </button>
+          <button type="button" onClick={() => setAnnotationMode((mode) => !mode)}>
+            {annotationMode ? "退出标注" : "标注 ROI"}
           </button>
           <button
             type="button"
@@ -1119,9 +1134,6 @@ function App() {
           <div className="panel-title">
             <div className="panel-heading">
               <h2>图像与 ROI</h2>
-              <button type="button" onClick={() => setAnnotationMode((mode) => !mode)}>
-                {annotationMode ? "退出标注" : "标注 ROI"}
-              </button>
             </div>
             <div className="image-meta">
               <span>{imageName}</span>
@@ -1231,9 +1243,6 @@ function App() {
             <button type="button" onClick={cameraOpen ? closeCamera : openCamera}>
               {cameraOpen ? "关闭相机" : "打开相机"}
             </button>
-            <button type="button" onClick={saveImage} disabled={!imageSrc && !cameraOpen}>
-              保存图片
-            </button>
             <button type="button" onClick={solveFromFrame} disabled={!solverReady}>
               {solverReady ? "识别并解算" : "解算器初始化中…"}
             </button>
@@ -1313,6 +1322,10 @@ function App() {
                 扫描
               </button>
             </div>
+            <label className="auto-save-label">
+              解算后自动保存图片和结果
+              <input type="checkbox" checked={autoSaveImage} onChange={(e) => setAutoSaveImage(e.target.checked)} />
+            </label>
             <div className="device-list">
               {devices.length ? (
                 devices.map((device) => (

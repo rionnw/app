@@ -6,7 +6,6 @@
 //! Usage:
 //!   solve-server [--host 127.0.0.1] [--port 8080]
 
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;

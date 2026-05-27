@@ -108,40 +108,47 @@ textarea:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 0 var(--space);
+  gap: 12px;
+  padding: 4px var(--space);
   border-bottom: 1px solid var(--line);
   background: var(--surface);
 }
 
 .top-bar h1 {
   margin: 0;
-  font-size: 1rem;
-  line-height: 1.1;
+  font-size: 0.9rem;
+  line-height: 1;
 }
 
 .top-bar span {
   display: block;
-  margin-top: 3px;
+  margin-top: 2px;
   color: var(--muted);
-  font-size: 0.78rem;
+  font-size: 0.72rem;
   font-weight: 650;
 }
 
 .top-actions {
   display: flex;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
 }
 
 .view-menu {
   position: relative;
 }
 
+.view-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 99;
+}
+
 .view-popover {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  z-index: 20;
+  z-index: 100;
   display: grid;
   gap: 10px;
   width: 260px;
@@ -370,6 +377,22 @@ textarea:focus {
   color: #ffffff;
   border-color: var(--primary-dark);
   background: var(--primary-dark);
+}
+
+.auto-save-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.auto-save-label input[type="checkbox"] {
+  width: 1.5em;
+  height: 1.5em;
+  margin: 0;
 }
 
 .side-panel {

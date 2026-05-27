@@ -2428,25 +2428,32 @@ fn setup_logging() {
         .expect("failed to initialize logging");
 }
 
-/// 保存解算时的图片帧到 imgs/ 目录。
+/// 保存解算时的图片帧到 imgs/ 目录，同时保存解算结果为同名 .json。
 #[tauri::command]
-fn save_solve_image(image_data_url: String) -> Result<String, String> {
+fn save_solve_image(image_data_url: String, solve_result: Option<String>) -> Result<String, String> {
     let imgs_dir = Path::new("imgs");
     std::fs::create_dir_all(imgs_dir).map_err(|e| e.to_string())?;
 
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S%.3f");
-    let filename = format!("solve_{timestamp}.jpg");
-    let path = imgs_dir.join(&filename);
+    let stem = format!("solve_{timestamp}");
+    let img_path = imgs_dir.join(format!("{stem}.jpg"));
 
     let encoded = image_data_url
         .split_once(',')
         .map(|(_, data)| data)
         .unwrap_or(&image_data_url);
     let bytes = STANDARD.decode(encoded).map_err(|e| e.to_string())?;
-    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    std::fs::write(&img_path, &bytes).map_err(|e| e.to_string())?;
 
-    log::info!("解算图片已保存: {}", path.display());
-    Ok(path.display().to_string())
+    if let Some(json) = solve_result {
+        let json_path = imgs_dir.join(format!("{stem}.json"));
+        if let Err(e) = std::fs::write(&json_path, &json) {
+            log::warn!("解算结果 JSON 保存失败: {}", e);
+        }
+    }
+
+    log::info!("解算图片已保存: {}", img_path.display());
+    Ok(img_path.display().to_string())
 }
 
 /// 启动时尝试读取默认 ROI 文件 (robot-roi.json)，不存在则返回 null。
