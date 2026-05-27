@@ -38,6 +38,7 @@ struct AppState {
     discovery_cache: Mutex<DiscoveryCache>,
     frame_server_port: u16,
     mode: RuntimeMode,
+    solver: Arc<std::sync::OnceLock<Min2PhaseSolver>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +157,7 @@ impl Default for AppState {
             discovery_cache: Mutex::default(),
             frame_server_port,
             mode: RuntimeMode::from_env(),
+            solver: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -1903,13 +1905,14 @@ fn solve_current_frame(
     state: tauri::State<'_, AppState>,
     rois: Vec<RoiDto>,
 ) -> Result<SolveFaceletsResponse, String> {
+    let solver = state.solver.get().ok_or("solver 尚未初始化完成")?;
     let capture = capture_from_state(&state).map_err(|err| err.to_string())?;
     let rois = rois.into_iter().map(Roi::from).collect::<Vec<_>>();
     let recognizer = ColorClusterRecognizer;
     let face = recognizer
         .recognize(&capture.frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face)
+    solve_face(face, solver)
 }
 
 #[tauri::command]
@@ -1917,6 +1920,7 @@ fn solve_latest_frame(
     state: tauri::State<'_, AppState>,
     rois: Vec<RoiDto>,
 ) -> Result<SolveFaceletsResponse, String> {
+    let solver = state.solver.get().ok_or("solver 尚未初始化完成")?;
     let frame = state
         .stream_hub
         .latest_grid_rgb()
@@ -1926,27 +1930,30 @@ fn solve_latest_frame(
     let face = recognizer
         .recognize(&frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face)
+    solve_face(face, solver)
 }
 
 #[tauri::command]
 fn solve_image_file(
+    state: tauri::State<'_, AppState>,
     image_data_url: String,
     rois: Vec<RoiDto>,
 ) -> Result<SolveFaceletsResponse, String> {
+    let solver = state.solver.get().ok_or("solver 尚未初始化完成")?;
     let frame = decode_image_data_url(&image_data_url).map_err(|err| err.to_string())?;
     let rois = rois.into_iter().map(Roi::from).collect::<Vec<_>>();
     let recognizer = ColorClusterRecognizer;
     let face = recognizer
         .recognize(&frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face)
+    solve_face(face, solver)
 }
 
 #[tauri::command]
-fn solve_facelets(facelets: String) -> Result<SolveFaceletsResponse, String> {
+fn solve_facelets(state: tauri::State<'_, AppState>, facelets: String) -> Result<SolveFaceletsResponse, String> {
+    let solver = state.solver.get().ok_or("solver 尚未初始化完成")?;
     let face = CubeFace::new(facelets).map_err(|err| err.to_string())?;
-    solve_face(face)
+    solve_face(face, solver)
 }
 
 #[tauri::command]
@@ -2036,8 +2043,7 @@ fn read_serial(state: tauri::State<'_, AppState>) -> Result<SerialReadResponse, 
     })
 }
 
-fn solve_face(face: CubeFace) -> Result<SolveFaceletsResponse, String> {
-    let solver = Min2PhaseSolver::new();
+fn solve_face(face: CubeFace, solver: &Min2PhaseSolver) -> Result<SolveFaceletsResponse, String> {
     let translator = BasicTranslator::new();
     let moves = solver.solve(&face).map_err(|err| err.to_string())?;
     let steps = translator
@@ -2389,6 +2395,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
+        .setup(|app| {
+            let solver_lock = {
+                let state: tauri::State<'_, AppState> = app.state();
+                Arc::clone(&state.solver)
+            };
+            let handle = app.handle().clone();
+            thread::spawn(move || {
+                let solver = Min2PhaseSolver::new();
+                let _ = solver_lock.set(solver);
+                let _ = handle.emit("solver-ready", ());
+                eprintln!("[solver] 初始化完成");
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             diagnostic_log,
             save_text_file,

@@ -7,6 +7,4 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 robo-core = { path = "../robo-core" }
-
-[build-dependencies]
-cc = "1"
+rand = "0.8"

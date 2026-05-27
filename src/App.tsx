@@ -226,6 +226,7 @@ function App() {
   const [serialOpen, setSerialOpen] = useState(false);
 
   const [status, setStatus] = useState("空闲");
+  const [solverReady, setSolverReady] = useState(false);
   const [facelets, setFacelets] = useState(solvedFacelets);
   const [moves, setMoves] = useState<string[]>([]);
   const [steps, setSteps] = useState<string[]>([]);
@@ -352,6 +353,10 @@ function App() {
   useEffect(() => {
     refreshCameras();
     refreshPorts();
+    const unlisten = listen("solver-ready", () => {
+      setSolverReady(true);
+    });
+    return () => { unlisten.then((f) => f()); };
   }, []);
 
   useEffect(() => {
@@ -1182,11 +1187,11 @@ function App() {
             <button type="button" onClick={cameraOpen ? closeCamera : openCamera}>
               {cameraOpen ? "关闭相机" : "打开相机"}
             </button>
-            <button type="button" onClick={solveFromFrame}>
-              识别并解算
+            <button type="button" onClick={solveFromFrame} disabled={!solverReady}>
+              {solverReady ? "识别并解算" : "解算器初始化中…"}
             </button>
-            <button type="button" onClick={runDirectly}>
-              直接运行
+            <button type="button" onClick={runDirectly} disabled={!solverReady}>
+              {solverReady ? "直接运行" : "解算器初始化中…"}
             </button>
           </div>
         </section>
