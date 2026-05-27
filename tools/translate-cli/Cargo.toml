@@ -1,0 +1,14 @@
+[package]
+name = "translate-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool: translate 2L solver output to hardware motor commands"
+
+[[bin]]
+name = "translate-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+robo-core = { path = "../../crates/robo-core" }
+robo-translator = { path = "../../crates/robo-translator" }

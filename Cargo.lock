@@ -3968,6 +3968,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "recognize-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "robo-core",
+ "robo-vision",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4631,6 +4643,20 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "solve-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "robo-core",
+ "robo-solver",
+ "robo-translator",
+ "robo-vision",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5449,6 +5475,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "translate-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "robo-core",
+ "robo-translator",
 ]
 
 [[package]]

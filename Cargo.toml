@@ -8,6 +8,9 @@ members = [
     "crates/robo-translator",
     "crates/robo-transport",
     "crates/robo-pipeline",
+    "tools/recognize-cli",
+    "tools/solve-cli",
+    "tools/translate-cli",
 ]
 resolver = "2"
 

@@ -2474,7 +2474,7 @@ fn load_default_roi() -> Option<String> {
 pub fn run() {
     setup_logging();
 
-    log::info!("robo-ui starting");
+    log::info!("CubeSolver starting");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

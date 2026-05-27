@@ -1,0 +1,19 @@
+[package]
+name = "solve-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool: solve a Rubik's cube from facelets or image+ROI"
+
+[[bin]]
+name = "solve-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+image = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+robo-core = { path = "../../crates/robo-core" }
+robo-vision = { path = "../../crates/robo-vision" }
+robo-solver = { path = "../../crates/robo-solver" }
+robo-translator = { path = "../../crates/robo-translator" }

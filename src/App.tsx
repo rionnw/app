@@ -867,6 +867,23 @@ function App() {
     }
   };
 
+  const saveImage = async () => {
+    try {
+      let dataUrl = imageSrc;
+      if (!dataUrl && cameraOpen) {
+        dataUrl = await invoke<string>("latest_frame_data_url");
+      }
+      if (!dataUrl) {
+        addLog("没有可保存的图片。", "warn");
+        return;
+      }
+      const path = await invoke<string>("save_solve_image", { imageDataUrl: dataUrl });
+      addLog(`图片已保存: ${path}`);
+    } catch (error) {
+      addLog(`图片保存失败: ${String(error)}`, "error");
+    }
+  };
+
   const solveFromFacelets = async () => {
     try {
       setStatus("解算中");
@@ -1213,6 +1230,9 @@ function App() {
           <div className="bottom-actions">
             <button type="button" onClick={cameraOpen ? closeCamera : openCamera}>
               {cameraOpen ? "关闭相机" : "打开相机"}
+            </button>
+            <button type="button" onClick={saveImage} disabled={!imageSrc && !cameraOpen}>
+              保存图片
             </button>
             <button type="button" onClick={solveFromFrame} disabled={!solverReady}>
               {solverReady ? "识别并解算" : "解算器初始化中…"}
