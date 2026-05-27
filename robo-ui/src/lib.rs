@@ -1005,7 +1005,7 @@ impl FrameHub {
                 created_at,
                 slot_warning,
             ) {
-                println!(
+                log::info!(
                     "{BACKEND_DIAGNOSTIC_PREFIX} category=slot_frame level={} slot={} packet_seq={} capture_ms={} encode_ms={} interval_ms={}",
                     diagnostic_level(slot_warning),
                     slot,
@@ -1077,7 +1077,7 @@ impl FrameHub {
                     grid_created_at,
                     grid_warning,
                 ) {
-                    println!(
+                    log::info!(
                         "{BACKEND_DIAGNOSTIC_PREFIX} category=grid_frame level={} grid_seq={} compose_ms={} encode_ms={} interval_ms={}",
                         diagnostic_level(grid_warning),
                         grid_seq,
@@ -1572,7 +1572,7 @@ fn format_diagnostic_log(message: &str) -> String {
 
 #[tauri::command]
 fn diagnostic_log(message: String) -> Result<(), String> {
-    println!("{}", format_diagnostic_log(&message));
+    log::info!("{}", format_diagnostic_log(&message));
     Ok(())
 }
 
@@ -1805,7 +1805,7 @@ fn snapshot_frame(state: tauri::State<'_, AppState>) -> Result<tauri::ipc::Respo
     };
     if should_log {
         let warning = age > DIAGNOSTIC_WARN_THRESHOLD;
-        println!(
+        log::info!(
             "{BACKEND_DIAGNOSTIC_PREFIX} category=snapshot_frame level={} grid_seq={} age_ms={}",
             diagnostic_level(warning),
             grid_seq,
@@ -2392,6 +2392,12 @@ fn respond_latest_frame(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+
+    log::info!("robo-ui starting");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
@@ -2405,7 +2411,7 @@ pub fn run() {
                 let solver = Min2PhaseSolver::new();
                 let _ = solver_lock.set(solver);
                 let _ = handle.emit("solver-ready", ());
-                eprintln!("[solver] 初始化完成");
+                log::info!("solver 初始化完成");
             });
             Ok(())
         })

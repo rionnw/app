@@ -6,4 +6,5 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+log.workspace = true
 robo-core = { path = "../robo-core" }

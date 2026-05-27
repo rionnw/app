@@ -66,7 +66,7 @@ fn build_allowed_moves() -> AllowedMovesData {
         }
     }
 
-    eprintln!(
+    log::info!(
         "[2L] allowedMoves init: set={} nodes={} allowed_keys={}",
         set.len(),
         node_cnt,
@@ -393,7 +393,7 @@ impl Search2L {
 
                 if prun > length1 {
                     if self.trace {
-                        eprintln!(
+                        log::debug!(
                             "[trace] length1={} urf={} prun={} > length1 -> skip",
                             length1, urf_idx, prun
                         );
@@ -402,7 +402,7 @@ impl Search2L {
                 }
 
                 if self.trace {
-                    eprintln!(
+                    log::debug!(
                         "[trace] enter phase1: length1={} urf={} prun={} probe={} sol={}",
                         length1, urf_idx, prun, self.probe, self.sol
                     );
@@ -411,7 +411,7 @@ impl Search2L {
                 let node = self.node_ud[root_idx];
                 if self.phase1(&node, 0, length1, -1) == 0 {
                     if self.trace {
-                        eprintln!(
+                        log::debug!(
                             "[trace] search RETURN 0 at length1={} urf={} probe={} sol={}",
                             length1, urf_idx, self.probe, self.sol
                         );
@@ -650,7 +650,7 @@ impl Search2L {
                 use std::fmt::Write;
                 let _ = write!(path, "{},", self.mov[i]);
             }
-            eprintln!(
+            log::info!(
                 "[trace2]   p1-end length1={} urf={} depth1={} eperm={} cperm={} mperm={} ct={} leg={} (legSlot={}) path=[{}]",
                 self.length1, self.urf_idx, depth1, eperm, cperm, mperm, ct, leg, leg_slot, path
             );
@@ -685,7 +685,7 @@ impl Search2L {
         let mut length2 = self.max_len2 - 1;
         let mut found_any = false;
         if self.trace {
-            eprintln!(
+            log::debug!(
                 "[trace2]   init_phase2_pre: length1={} urf={} depth1={} max_len2={} prun={} (start length2={}) key_seen_before=false",
                 self.length1, self.urf_idx, depth1, self.max_len2, prun, length2
             );
@@ -694,12 +694,12 @@ impl Search2L {
             let ret = self.phase2(eperm, cperm, mperm, ct, leg, length2, depth1 as i32, 20);
             if ret < 0 {
                 if self.trace {
-                    eprintln!("[trace2]     phase2(length2={}) -> -1 (break)", length2);
+                    log::debug!("[trace2]     phase2(length2={}) -> -1 (break)", length2);
                 }
                 break;
             }
             if self.trace {
-                eprintln!("[trace2]     phase2(length2={}) -> ret={} (sol_cand={}+{}={})", length2, ret, self.length1, length2 - ret, self.length1 + length2 - ret);
+                log::debug!("[trace2]     phase2(length2={}) -> ret={} (sol_cand={}+{}={})", length2, ret, self.length1, length2 - ret, self.length1 + length2 - ret);
             }
             length2 -= ret;
             found_any = true;
@@ -718,7 +718,7 @@ impl Search2L {
             self.solution = Some(sb.trim_end().to_string());
 
             if self.trace {
-                eprintln!(
+                log::debug!(
                     "[trace]   FOUND sol at length1={} urf={} depth1={} length2={} sol={} probe={} estimated_cost={}",
                     self.length1, self.urf_idx, depth1, length2, self.sol, self.probe, self.estimated
                 );
@@ -734,7 +734,7 @@ impl Search2L {
             self.max_len2 = MAX_LENGTH2.min(self.sol - self.length1);
             if self.probe >= self.probe_min {
                 if self.trace {
-                    eprintln!(
+                    log::debug!(
                         "[trace]   init_phase2_pre RETURN 0 (probe={} >= probe_min={})",
                         self.probe, self.probe_min
                     );

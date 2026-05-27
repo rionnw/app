@@ -26,3 +26,8 @@ target
 
 # Data directories
 *.data
+
+# IDE
+.vscode
+.idea
+.cursor

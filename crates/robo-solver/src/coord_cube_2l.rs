@@ -217,7 +217,7 @@ fn init_coord_2l_tables() -> CoordCube2LTables {
     }
 
     // Load or generate pruning tables (stored separately in `2l_data/`).
-    eprintln!("[2L] data dir: {}", dir.display());
+    log::info!("[2L] data dir: {}", dir.display());
 
     // Fast path: if every required prun file is already on disk with the
     // expected size, load them all in parallel. Each load is bound by
@@ -243,7 +243,7 @@ fn init_coord_2l_tables() -> CoordCube2LTables {
                             let dt = t.elapsed();
                             let bytes = (cord1 as u64) * (cord2 as u64) * 9;
                             let mibs = (bytes as f64 / (1024.0 * 1024.0)) / dt.as_secs_f64().max(1e-9);
-                            eprintln!(
+                            log::info!(
                                 "[2L] loaded {} ({}x{}) in {:.3}s ({:.0} MiB/s) [par]",
                                 name, cord1, cord2 * 9, dt.as_secs_f64(), mibs
                             );
@@ -622,20 +622,20 @@ fn load_or_generate_prun(
         let dt = t_load.elapsed();
         let bytes = (cord1_size as u64) * (cord2_size as u64) * 9;
         let mibs = (bytes as f64 / (1024.0 * 1024.0)) / dt.as_secs_f64().max(1e-9);
-        eprintln!(
+        log::info!(
             "[2L] loaded {} ({}x{}) in {:.3}s ({:.0} MiB/s)",
             filename, cord1_size, cord2_size * 9, dt.as_secs_f64(), mibs
         );
         return Some(data);
     }
-    eprintln!("[2L] generating {} ({}x{}) ...", filename, cord1_size, cord2_size * 9);
+    log::info!("[2L] generating {} ({}x{}) ...", filename, cord1_size, cord2_size * 9);
     let t0 = std::time::Instant::now();
     let table = init_prun_table(
         cord1_move, cord2_move, cord1_conj, cord2_conj, tables, is_phase2,
     );
-    eprintln!("[2L] generated {} in {:.1}s", filename, t0.elapsed().as_secs_f64());
+    log::info!("[2L] generated {} in {:.1}s", filename, t0.elapsed().as_secs_f64());
     if let Err(e) = save_prun_to_file(&path, &table) {
-        eprintln!("[2L] warning: failed to save {}: {}", filename, e);
+        log::warn!("[2L] failed to save {}: {}", filename, e);
     }
     Some(table)
 }
@@ -656,13 +656,13 @@ fn load_or_generate_prun_single_empty(
         let dt = t_load.elapsed();
         let bytes = (cord1_size as u64) * (cord2_size as u64) * 9;
         let mibs = (bytes as f64 / (1024.0 * 1024.0)) / dt.as_secs_f64().max(1e-9);
-        eprintln!(
+        log::info!(
             "[2L] loaded {} ({}x{}) in {:.3}s ({:.0} MiB/s)",
             filename, cord1_size, cord2_size * 9, dt.as_secs_f64(), mibs
         );
         return Some(data);
     }
-    eprintln!("[2L] generating {} ({}x{}) ...", filename, cord1_size, cord2_size * 9);
+    log::info!("[2L] generating {} ({}x{}) ...", filename, cord1_size, cord2_size * 9);
     let t0 = std::time::Instant::now();
     // EmptyMove = [[0;20]], EmptyConj = [[0;16]]
     let empty_move: Vec<Vec<i32>> = vec![vec![0i32; 20]];
@@ -670,9 +670,9 @@ fn load_or_generate_prun_single_empty(
     let table = init_prun_table(
         &empty_move, cord2_move, &empty_conj, cord2_conj, tables, is_phase2,
     );
-    eprintln!("[2L] generated {} in {:.1}s", filename, t0.elapsed().as_secs_f64());
+    log::info!("[2L] generated {} in {:.1}s", filename, t0.elapsed().as_secs_f64());
     if let Err(e) = save_prun_to_file(&path, &table) {
-        eprintln!("[2L] warning: failed to save {}: {}", filename, e);
+        log::warn!("[2L] failed to save {}: {}", filename, e);
     }
     Some(table)
 }
@@ -687,7 +687,7 @@ fn load_prun_from_file(path: &Path, cord1_size: usize, cord2_size: usize) -> Opt
     let file = File::open(path).ok()?;
     let meta = file.metadata().ok()?;
     if meta.len() != total {
-        eprintln!(
+        log::info!(
             "[2L] {} has unexpected size {} (want {}), regenerating",
             path.display(), meta.len(), total
         );

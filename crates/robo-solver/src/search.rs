@@ -715,7 +715,7 @@ mod tests {
         // First cube from bench.cubes
         let cube = "UDFUURRLDBFLURRDRUUFLLFRFDBRBRLDBUDLRBBFLBBUDDFFDBUFLL";
         let sol = search.solution(cube, 21, 10000000, 100, 0);
-        println!("Solution: {}", sol);
+        log::info!("Solution: {}", sol);
         assert!(!sol.starts_with("Error"), "Failed to solve: {}", sol);
         // Solution should be non-empty and have reasonable length
         let moves: Vec<&str> = sol.trim().split_whitespace().collect();
