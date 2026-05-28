@@ -62,17 +62,17 @@ fn parse_solution(solution: &str) -> Vec<Action> {
 fn parse_action_token(s: &mut &str) -> Option<Action> {
     let candidates: &[(&str, Action)] = &[
         ("U2", Action::U(180)),
-        ("U'", Action::U(-90)),
-        ("U",  Action::U(90)),
+        ("U'", Action::U(90)),
+        ("U",  Action::U(-90)),
         ("R2", Action::R(180)),
-        ("R'", Action::R(-90)),
-        ("R",  Action::R(90)),
+        ("R'", Action::R(90)),
+        ("R",  Action::R(-90)),
         ("x2", Action::X(180)),
-        ("x'", Action::X(-90)),
-        ("x",  Action::X(90)),
+        ("x'", Action::X(90)),
+        ("x",  Action::X(-90)),
         ("y2", Action::Y(180)),
-        ("y'", Action::Y(-90)),
-        ("y",  Action::Y(90)),
+        ("y'", Action::Y(90)),
+        ("y",  Action::Y(-90)),
     ];
 
     for (token, action) in candidates {
@@ -260,7 +260,7 @@ mod tests {
     fn parse_actions() {
         let raw = "(z0s1)    (s0z1) x  (z1z0) U";
         let actions = parse_solution(raw);
-        assert_eq!(actions, vec![Action::RegrabR, Action::X(90), Action::U(90)]);
+        assert_eq!(actions, vec![Action::RegrabR, Action::X(-90), Action::U(-90)]);
     }
 
     #[test]
@@ -273,22 +273,21 @@ mod tests {
     fn single_u_move() {
         let moves = Moves::from_solution_string("(z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
-        assert_eq!(steps.commands, vec!["ROTATE_U(+90);"]);
+        assert_eq!(steps.commands, vec!["ROTATE_U(-90);"]);
     }
 
     #[test]
     fn whole_x_then_u() {
-        // x → 整体绕 R 轴：R 开，U 转，R 关，U 回正，然后单层 U
         let moves = Moves::from_solution_string("(s0z1) x  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_R(0);",        // x: R 松开
-            "ROTATE_U(+90);",    // x: U 带魔方转
-            "CLAW_R(1);",        // x: R 夹紧
-            "CLAW_U(0);",        // x: U 回正-松开
-            "ROTATE_U(-90);",    // x: U 回正
-            "CLAW_U(1);",        // x: U 回正-夹紧
-            "ROTATE_U(+90);",    // 单层 U
+            "CLAW_R(0);",
+            "ROTATE_U(-90);",
+            "CLAW_R(1);",
+            "CLAW_U(0);",
+            "ROTATE_U(+90);",
+            "CLAW_U(1);",
+            "ROTATE_U(-90);",
         ]);
     }
 
@@ -297,13 +296,13 @@ mod tests {
         let moves = Moves::from_solution_string("(z0s1)    (s0z1) x  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_R(0);",        // x: R 松开
-            "ROTATE_U(+90);",    // x: U 带魔方转
-            "CLAW_R(1);",        // x: R 夹紧
-            "CLAW_U(0);",        // x: U 回正-松开
-            "ROTATE_U(-90);",    // x: U 回正
-            "CLAW_U(1);",        // x: U 回正-夹紧
-            "ROTATE_U(+90);",    // 单层 U
+            "CLAW_R(0);",
+            "ROTATE_U(-90);",
+            "CLAW_R(1);",
+            "CLAW_U(0);",
+            "ROTATE_U(+90);",
+            "CLAW_U(1);",
+            "ROTATE_U(-90);",
         ]);
     }
 
@@ -312,9 +311,9 @@ mod tests {
         let moves = Moves::from_solution_string("(z2s0) y2");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_U(0);",        // y2: U 松开
-            "ROTATE_R(+180);",   // y2: R 转 180°
-            "CLAW_U(1);",        // y2: U 夹紧（180° 不回正）
+            "CLAW_U(0);",
+            "ROTATE_R(+180);",
+            "CLAW_U(1);",
         ]);
     }
 
@@ -323,13 +322,13 @@ mod tests {
         let moves = Moves::from_solution_string("(z1s0) y  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_U(0);",        // y: U 松开
-            "ROTATE_R(+90);",    // y: R 带魔方转
-            "CLAW_U(1);",        // y: U 夹紧
-            "CLAW_R(0);",        // y: R 回正-松开
-            "ROTATE_R(-90);",    // y: R 回正
-            "CLAW_R(1);",        // y: R 回正-夹紧
-            "ROTATE_U(+90);",    // 单层 U
+            "CLAW_U(0);",
+            "ROTATE_R(-90);",
+            "CLAW_U(1);",
+            "CLAW_R(0);",
+            "ROTATE_R(+90);",
+            "CLAW_R(1);",
+            "ROTATE_U(-90);",
         ]);
     }
 
