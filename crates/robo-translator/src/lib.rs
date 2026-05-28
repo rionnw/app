@@ -190,25 +190,25 @@ impl HardwareTranslator {
         self.rotate_r(degrees);
     }
 
-    /// 整体 y（U 轴带整个魔方）：R 开→U 转→R 关→U 竖则回正
+    /// 整体 y（绕 U 轴）：U 爪松开，R 臂带整个魔方转，U 夹紧，R 竖则回正
     fn whole_y(&mut self, degrees: i32) {
-        self.claw_r(false);   // R 松开
-        self.claw_u(true);    // U 夹紧带魔方
-        self.rotate_u(degrees);
-        self.claw_r(true);    // R 夹紧固定新位置
-        if !is_flat(self.u_angle) {
-            self.ensure_u_flat();
-        }
-    }
-
-    /// 整体 x（R 轴带整个魔方）：U 开→R 转→U 关→R 竖则回正
-    fn whole_x(&mut self, degrees: i32) {
         self.claw_u(false);   // U 松开
         self.claw_r(true);    // R 夹紧带魔方
         self.rotate_r(degrees);
         self.claw_u(true);    // U 夹紧固定新位置
         if !is_flat(self.r_angle) {
             self.ensure_r_flat();
+        }
+    }
+
+    /// 整体 x（绕 R 轴）：R 爪松开，U 臂带整个魔方转，R 夹紧，U 竖则回正
+    fn whole_x(&mut self, degrees: i32) {
+        self.claw_r(false);   // R 松开
+        self.claw_u(true);    // U 夹紧带魔方
+        self.rotate_u(degrees);
+        self.claw_r(true);    // R 夹紧固定新位置
+        if !is_flat(self.u_angle) {
+            self.ensure_u_flat();
         }
     }
 
@@ -278,32 +278,31 @@ mod tests {
 
     #[test]
     fn whole_x_then_u() {
-        // x → 整体 R 轴转 90°，R 竖着要回正，然后 U
+        // x → 整体绕 R 轴：R 开，U 转，R 关，U 回正，然后单层 U
         let moves = Moves::from_solution_string("(s0z1) x  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_U(0);",        // x: U 松开
-            "ROTATE_R(+90);",    // x: R 带魔方转
-            "CLAW_U(1);",        // x: U 夹紧
-            "CLAW_R(0);",        // x: R 松开回正
-            "ROTATE_R(-90);",    // x: R 回正
+            "CLAW_R(0);",        // x: R 松开
+            "ROTATE_U(+90);",    // x: U 带魔方转
             "CLAW_R(1);",        // x: R 夹紧
+            "CLAW_U(0);",        // x: U 回正-松开
+            "ROTATE_U(-90);",    // x: U 回正
+            "CLAW_U(1);",        // x: U 回正-夹紧
             "ROTATE_U(+90);",    // 单层 U
         ]);
     }
 
     #[test]
     fn regrab_r_then_x_then_u() {
-        // (z0s1) R regrab(忽略) → (s0z1) x 整体 → (z1z0) U 单层
         let moves = Moves::from_solution_string("(z0s1)    (s0z1) x  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_U(0);",        // x: U 松开
-            "ROTATE_R(+90);",    // x: R 带魔方转
-            "CLAW_U(1);",        // x: U 夹紧
-            "CLAW_R(0);",        // x: R 回正-松开
-            "ROTATE_R(-90);",    // x: R 回正
-            "CLAW_R(1);",        // x: R 回正-夹紧
+            "CLAW_R(0);",        // x: R 松开
+            "ROTATE_U(+90);",    // x: U 带魔方转
+            "CLAW_R(1);",        // x: R 夹紧
+            "CLAW_U(0);",        // x: U 回正-松开
+            "ROTATE_U(-90);",    // x: U 回正
+            "CLAW_U(1);",        // x: U 回正-夹紧
             "ROTATE_U(+90);",    // 单层 U
         ]);
     }
@@ -313,9 +312,9 @@ mod tests {
         let moves = Moves::from_solution_string("(z2s0) y2");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_R(0);",        // y2: R 松开
-            "ROTATE_U(+180);",   // y2: U 转 180°
-            "CLAW_R(1);",        // y2: R 夹紧（180° 不回正）
+            "CLAW_U(0);",        // y2: U 松开
+            "ROTATE_R(+180);",   // y2: R 转 180°
+            "CLAW_U(1);",        // y2: U 夹紧（180° 不回正）
         ]);
     }
 
@@ -324,12 +323,12 @@ mod tests {
         let moves = Moves::from_solution_string("(z1s0) y  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_R(0);",        // y: R 松开
-            "ROTATE_U(+90);",    // y: U 带魔方转
-            "CLAW_R(1);",        // y: R 夹紧
-            "CLAW_U(0);",        // y: U 回正-松开
-            "ROTATE_U(-90);",    // y: U 回正
-            "CLAW_U(1);",        // y: U 回正-夹紧
+            "CLAW_U(0);",        // y: U 松开
+            "ROTATE_R(+90);",    // y: R 带魔方转
+            "CLAW_U(1);",        // y: U 夹紧
+            "CLAW_R(0);",        // y: R 回正-松开
+            "ROTATE_R(-90);",    // y: R 回正
+            "CLAW_R(1);",        // y: R 回正-夹紧
             "ROTATE_U(+90);",    // 单层 U
         ]);
     }
