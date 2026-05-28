@@ -1,0 +1,6 @@
+*.json
+*.data
+imgs/
+logs/
+data/
+robot-roi.json
