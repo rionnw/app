@@ -358,14 +358,13 @@ function App() {
       setSolverReady(true);
     });
     // 主动查询 solver 状态（防止事件在前端渲染前已发出）
-    const pollReady = setInterval(() => {
+    const checkReady = () => {
       invoke<boolean>("check_solver_ready").then((ready) => {
-        if (ready) {
-          setSolverReady(true);
-          clearInterval(pollReady);
-        }
+        if (ready) setSolverReady(true);
       }).catch(() => {});
-    }, 500);
+    };
+    checkReady();
+    const pollReady = setInterval(checkReady, 500);
     // 尝试加载默认 ROI 文件
     invoke<string | null>("load_default_roi").then((content) => {
       if (content) {
@@ -1296,7 +1295,7 @@ function App() {
           <section className="panel-card solve-card">
             <div className="card-title">
               <h2>解算结果</h2>
-              <button type="button" onClick={solveFromFacelets}>
+              <button type="button" onClick={solveFromFacelets} disabled={!solverReady}>
                 字符串解算
               </button>
             </div>

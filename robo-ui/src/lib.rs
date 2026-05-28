@@ -2458,8 +2458,8 @@ fn save_solve_image(image_data_url: String, solve_result: Option<String>) -> Res
 
 /// 前端主动查询 solver 是否就绪（防止错过 solver-ready 事件）。
 #[tauri::command]
-fn check_solver_ready(state: tauri::State<'_, AppState>) -> bool {
-    state.solver.get().is_some()
+fn check_solver_ready(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.solver.get().is_some())
 }
 
 /// 启动时尝试读取默认 ROI 文件 (robot-roi.json)，不存在则返回 null。
