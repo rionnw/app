@@ -212,24 +212,13 @@ impl HardwareTranslator {
         }
     }
 
-    fn regrab_u(&mut self) {
-        self.claw_u(false);
-        self.claw_u(true);
-    }
-
-    fn regrab_r(&mut self) {
-        self.claw_r(false);
-        self.claw_r(true);
-    }
-
     fn execute(&mut self, action: &Action) {
         match action {
             Action::U(d) => self.single_u(*d),
             Action::R(d) => self.single_r(*d),
             Action::Y(d) => self.whole_y(*d),
             Action::X(d) => self.whole_x(*d),
-            Action::RegrabU => self.regrab_u(),
-            Action::RegrabR => self.regrab_r(),
+            Action::RegrabU | Action::RegrabR => {} // regrab 是 solver 内部状态，不生成硬件指令
         }
     }
 }
@@ -305,12 +294,10 @@ mod tests {
 
     #[test]
     fn regrab_r_then_x_then_u() {
-        // (z0s1) R regrab → (s0z1) x 整体 → (z1z0) U 单层
+        // (z0s1) R regrab(忽略) → (s0z1) x 整体 → (z1z0) U 单层
         let moves = Moves::from_solution_string("(z0s1)    (s0z1) x  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_R(0);",        // regrab R: 开
-            "CLAW_R(1);",        // regrab R: 关
             "CLAW_U(0);",        // x: U 松开
             "ROTATE_R(+90);",    // x: R 带魔方转
             "CLAW_U(1);",        // x: U 夹紧
