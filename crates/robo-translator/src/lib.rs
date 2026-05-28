@@ -190,25 +190,25 @@ impl HardwareTranslator {
         self.rotate_r(degrees);
     }
 
-    /// 整体 y（绕 U 轴）：U 爪松开，R 臂带整个魔方转，U 夹紧，R 竖则回正
+    /// 整体 y（绕 U 轴）：R 松开，U 臂带整个魔方转，R 夹紧，U 竖则回正
     fn whole_y(&mut self, degrees: i32) {
-        self.claw_u(false);   // U 松开
-        self.claw_r(true);    // R 夹紧带魔方
-        self.rotate_r(degrees);
-        self.claw_u(true);    // U 夹紧固定新位置
-        if !is_flat(self.r_angle) {
-            self.ensure_r_flat();
-        }
-    }
-
-    /// 整体 x（绕 R 轴）：R 爪松开，U 臂带整个魔方转，R 夹紧，U 竖则回正
-    fn whole_x(&mut self, degrees: i32) {
         self.claw_r(false);   // R 松开
         self.claw_u(true);    // U 夹紧带魔方
         self.rotate_u(degrees);
         self.claw_r(true);    // R 夹紧固定新位置
         if !is_flat(self.u_angle) {
             self.ensure_u_flat();
+        }
+    }
+
+    /// 整体 x（绕 R 轴）：U 松开，R 臂带整个魔方转，U 夹紧，R 竖则回正
+    fn whole_x(&mut self, degrees: i32) {
+        self.claw_u(false);   // U 松开
+        self.claw_r(true);    // R 夹紧带魔方
+        self.rotate_r(degrees);
+        self.claw_u(true);    // U 夹紧固定新位置
+        if !is_flat(self.r_angle) {
+            self.ensure_r_flat();
         }
     }
 
@@ -278,48 +278,23 @@ mod tests {
 
     #[test]
     fn whole_x_then_u() {
+        // x = 绕 R 轴：U 松开，R 带转，U 夹紧，R 回正
         let moves = Moves::from_solution_string("(s0z1) x  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_R(0);",
-            "ROTATE_U(-90);",
-            "CLAW_R(1);",
-            "CLAW_U(0);",
-            "ROTATE_U(+90);",
-            "CLAW_U(1);",
-            "ROTATE_U(-90);",
+            "CLAW_U(0);",        // x: U 松开
+            "ROTATE_R(-90);",    // x: R 带魔方转
+            "CLAW_U(1);",        // x: U 夹紧
+            "CLAW_R(0);",        // x: R 回正-松开
+            "ROTATE_R(+90);",    // x: R 回正
+            "CLAW_R(1);",        // x: R 回正-夹紧
+            "ROTATE_U(-90);",    // 单层 U
         ]);
     }
 
     #[test]
     fn regrab_r_then_x_then_u() {
         let moves = Moves::from_solution_string("(z0s1)    (s0z1) x  (z1z0) U");
-        let steps = BasicTranslator::new().translate(&moves).unwrap();
-        assert_eq!(steps.commands, vec![
-            "CLAW_R(0);",
-            "ROTATE_U(-90);",
-            "CLAW_R(1);",
-            "CLAW_U(0);",
-            "ROTATE_U(+90);",
-            "CLAW_U(1);",
-            "ROTATE_U(-90);",
-        ]);
-    }
-
-    #[test]
-    fn whole_y2_no_reset() {
-        let moves = Moves::from_solution_string("(z2s0) y2");
-        let steps = BasicTranslator::new().translate(&moves).unwrap();
-        assert_eq!(steps.commands, vec![
-            "CLAW_U(0);",
-            "ROTATE_R(+180);",
-            "CLAW_U(1);",
-        ]);
-    }
-
-    #[test]
-    fn whole_y_then_u() {
-        let moves = Moves::from_solution_string("(z1s0) y  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
             "CLAW_U(0);",
@@ -329,6 +304,34 @@ mod tests {
             "ROTATE_R(+90);",
             "CLAW_R(1);",
             "ROTATE_U(-90);",
+        ]);
+    }
+
+    #[test]
+    fn whole_y2_no_reset() {
+        // y2 = 绕 U 轴 180°：R 松开，U 带转 180°（不回正）
+        let moves = Moves::from_solution_string("(z2s0) y2");
+        let steps = BasicTranslator::new().translate(&moves).unwrap();
+        assert_eq!(steps.commands, vec![
+            "CLAW_R(0);",        // y2: R 松开
+            "ROTATE_U(+180);",   // y2: U 带转 180°
+            "CLAW_R(1);",        // y2: R 夹紧
+        ]);
+    }
+
+    #[test]
+    fn whole_y_then_u() {
+        // y = 绕 U 轴：R 松开，U 带转，R 夹紧，U 回正
+        let moves = Moves::from_solution_string("(z1s0) y  (z1z0) U");
+        let steps = BasicTranslator::new().translate(&moves).unwrap();
+        assert_eq!(steps.commands, vec![
+            "CLAW_R(0);",        // y: R 松开
+            "ROTATE_U(-90);",    // y: U 带魔方转
+            "CLAW_R(1);",        // y: R 夹紧
+            "CLAW_U(0);",        // y: U 回正-松开
+            "ROTATE_U(+90);",    // y: U 回正
+            "CLAW_U(1);",        // y: U 回正-夹紧
+            "ROTATE_U(-90);",    // 单层 U
         ]);
     }
 
