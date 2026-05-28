@@ -152,6 +152,16 @@ fn handle_request(request: Request, state: &AppState) {
     let method = request.method().clone();
     let url = request.url().to_string();
 
+    // CORS preflight
+    if matches!(method, Method::Options) {
+        let response = Response::empty(204)
+            .with_header(Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap())
+            .with_header(Header::from_bytes("Access-Control-Allow-Methods", "GET, POST, OPTIONS").unwrap())
+            .with_header(Header::from_bytes("Access-Control-Allow-Headers", "Content-Type").unwrap());
+        let _ = request.respond(response);
+        return;
+    }
+
     match (method, url.as_str()) {
         (Method::Get, "/v1/health") => handle_health(request, state),
         (Method::Post, "/v1/verify") => handle_verify(request, state),
@@ -370,7 +380,10 @@ fn respond_json<T: Serialize>(request: Request, status: u16, body: &T) {
         .with_status_code(status)
         .with_header(
             Header::from_bytes("Content-Type", "application/json; charset=utf-8").unwrap(),
-        );
+        )
+        .with_header(Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap())
+        .with_header(Header::from_bytes("Access-Control-Allow-Methods", "GET, POST, OPTIONS").unwrap())
+        .with_header(Header::from_bytes("Access-Control-Allow-Headers", "Content-Type").unwrap());
     let _ = request.respond(response);
 }
 

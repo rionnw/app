@@ -64,7 +64,7 @@ impl Solver for Min2PhaseSolver {
         let facelets = face.as_str();
 
         let mut search = self.inner.lock().unwrap();
-        let solution = search.solution(facelets, 70, 10_000_000, 500, 0);
+        let solution = search.solution(facelets, 70, 10_000_000, 1500, 0);
 
         if solution.starts_with("Error") {
             anyhow::bail!("min2phase Search2L failed: {solution}");

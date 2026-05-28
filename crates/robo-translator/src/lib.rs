@@ -300,29 +300,59 @@ impl HardwareTranslator {
         self.commands.push(format!("ROTATE_R({:+});", d));
     }
 
+    // ===== 安全包装 =====
+    // 不变量：任何时候至少一只爪闭合（否则魔方掉落）
+
+    /// 松开 U 爪：必须先确保 R 闭合
+    fn open_u(&mut self) {
+        if !self.u_claw { return; }
+        self.claw_r(true);
+        self.claw_u(false);
+    }
+
+    /// 松开 R 爪：必须先确保 U 闭合
+    fn open_r(&mut self) {
+        if !self.r_claw { return; }
+        self.claw_u(true);
+        self.claw_r(false);
+    }
+
     // ===== 回正（爪子竖着时需要回正）=====
+    // 回正时该爪松开（另一爪夹住魔方固定），然后空臂转回平放位置（0 或 ±180 任一）
 
     fn ensure_u_flat(&mut self) {
         if is_flat(self.u_angle) { return; }
-        self.claw_r(true);    // R 夹紧固定魔方
-        self.claw_u(false);   // U 松开
+        self.open_u();        // 安全松 U（含先夹紧 R）
         let back = pick_back_rotation(self.u_angle, self.u_accum);
-        self.rotate_u(back);  // U 回正
-        self.claw_u(true);    // U 夹紧
+        self.rotate_u(back);
+        self.claw_u(true);    // 回正后夹紧 U
     }
 
     fn ensure_r_flat(&mut self) {
         if is_flat(self.r_angle) { return; }
-        self.claw_u(true);    // U 夹紧固定魔方
-        self.claw_r(false);   // R 松开
+        self.open_r();
         let back = pick_back_rotation(self.r_angle, self.r_accum);
-        self.rotate_r(back);  // R 回正
-        self.claw_r(true);    // R 夹紧
+        self.rotate_r(back);
+        self.claw_r(true);
     }
 
     // ===== 动作执行 =====
+    //
+    // 约束（运行时不变量）：
+    //   约束1：两爪不能同时松开（由 open_u/open_r 包装保证）
+    //   约束2：两爪不能同时竖起 —— 等价于「任何转动开始前，对侧爪必须平放」
+    //
+    // 优化策略（懒惰回正）：
+    //   每个动作只保证「入口约束」满足——即在自己要转之前，对侧爪平放。
+    //   动作出口**不主动回正自己**，让下一个动作按需补：
+    //     - 下一个动作如果也转同一爪 → 完全不需要回正（可累积到 ±180 自然平放）
+    //     - 下一个动作转对侧爪 → 由对侧动作入口的 ensure_*_flat 触发回正
+    //   这把多次相同方向单层动作之间的"回正→再转"指令对消除。
+    //
+    // 对于 180° 转动，落点本身是平放，ensure_*_flat 自动 no-op。
 
-    /// 单层 U：对面(R)必须平放，两爪闭合，U 转
+    /// 单层 U：R 必须平放（入口），两爪闭合，U 带顶层转 d。
+    /// 不在出口主动回正 U——由下一动作（若需 R 转动）按需触发。
     fn single_u(&mut self, degrees: i32) {
         self.ensure_r_flat();
         self.claw_u(true);
@@ -330,7 +360,7 @@ impl HardwareTranslator {
         self.rotate_u(degrees);
     }
 
-    /// 单层 R：对面(U)必须平放，两爪闭合，R 转
+    /// 单层 R：U 必须平放（入口），两爪闭合，R 带右层转 d。
     fn single_r(&mut self, degrees: i32) {
         self.ensure_u_flat();
         self.claw_u(true);
@@ -338,26 +368,30 @@ impl HardwareTranslator {
         self.rotate_r(degrees);
     }
 
-    /// 整体 y（绕 U 轴）：R 松开，U 臂带整个魔方转，R 夹紧，U 竖则回正
+    /// 整体 y（绕 U 轴）：U 夹紧带转 d，R 松开。
+    /// 入口要求 R 平放（约束2，R 即将停在松开但角度不变状态）；
+    /// 但事实上后续动作若需要 R 转动，会先 ensure_r_flat（其内部 open_r 已含夹 U 保护）；
+    /// 出口 R 保持松开状态（懒惰），由下一动作前置 claw_r 闭合即可。
     fn whole_y(&mut self, degrees: i32) {
-        self.claw_r(false);   // R 松开
-        self.claw_u(true);    // U 夹紧带魔方
-        self.rotate_u(degrees);
-        self.claw_r(true);    // R 夹紧固定新位置
-        if !is_flat(self.u_angle) {
-            self.ensure_u_flat();
-        }
+        self.ensure_r_flat();
+        self.open_r();                  // 内含 claw_u(true) 保护（约束1）
+        self.rotate_u(degrees);         // U 带整魔方转
+        // 出口：U 可能竖起、R 松开。下一动作按需补 ensure_*_flat / claw_*(true)。
     }
 
-    /// 整体 x（绕 R 轴）：U 松开，R 臂带整个魔方转，U 夹紧，R 竖则回正
+    /// 整体 x（绕 R 轴）：R 夹紧带转 d，U 松开。
     fn whole_x(&mut self, degrees: i32) {
-        self.claw_u(false);   // U 松开
-        self.claw_r(true);    // R 夹紧带魔方
+        self.ensure_u_flat();
+        self.open_u();
         self.rotate_r(degrees);
-        self.claw_u(true);    // U 夹紧固定新位置
-        if !is_flat(self.r_angle) {
-            self.ensure_r_flat();
-        }
+    }
+
+    /// 在序列末尾收尾：确保两爪都平放且都闭合（机器停在安全姿态）。
+    fn finalize(&mut self) {
+        self.ensure_u_flat();
+        self.ensure_r_flat();
+        self.claw_u(true);
+        self.claw_r(true);
     }
 
     fn execute(&mut self, action: &Action) {
@@ -401,6 +435,7 @@ impl Translator for BasicTranslator {
         for action in &actions {
             hw.execute(action);
         }
+        hw.finalize();  // 收尾：确保机器停在两爪闭合+平放的安全姿态
 
         let commands = hw.commands;
         let encoded = commands.join(" ");
@@ -427,24 +462,33 @@ mod tests {
 
     #[test]
     fn single_u_move() {
+        // 单层 U(-90)：转 U → 出口懒惰不回正 → finalize 收尾回正。
         let moves = Moves::from_solution_string("(z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
-        assert_eq!(steps.commands, vec!["ROTATE_U(-90);"]);
+        assert_eq!(steps.commands, vec![
+            "ROTATE_U(-90);",   // 带魔方
+            "CLAW_U(0);",       // finalize: 松 U
+            "ROTATE_U(+90);",   // finalize: 空臂回正
+            "CLAW_U(1);",       // finalize: 夹回
+        ]);
     }
 
     #[test]
     fn whole_x_then_u() {
-        // x = 绕 R 轴：U 松开，R 带转，U 夹紧，R 回正
+        // 懒惰策略：whole_x 末尾不回 R，single_u 入口 ensure_r_flat 触发回正
         let moves = Moves::from_solution_string("(s0z1) x  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_U(0);",        // x: U 松开
-            "ROTATE_R(-90);",    // x: R 带魔方转
-            "CLAW_U(1);",        // x: U 夹紧
-            "CLAW_R(0);",        // x: R 回正-松开
-            "ROTATE_R(+90);",    // x: R 回正
-            "CLAW_R(1);",        // x: R 回正-夹紧
-            "ROTATE_U(-90);",    // 单层 U
+            "CLAW_U(0);",        // whole_x: U 松
+            "ROTATE_R(-90);",    // R 带魔方转
+            "CLAW_U(1);",        // single_u 入口 ensure_r_flat→open_r 内 claw_u(1)
+            "CLAW_R(0);",        // open_r 内 claw_r(0)
+            "ROTATE_R(+90);",    // 空臂回正 R
+            "CLAW_R(1);",        // 夹回 R
+            "ROTATE_U(-90);",    // single_u 转
+            "CLAW_U(0);",        // finalize: 回正 U
+            "ROTATE_U(+90);",
+            "CLAW_U(1);",
         ]);
     }
 
@@ -460,34 +504,36 @@ mod tests {
             "ROTATE_R(+90);",
             "CLAW_R(1);",
             "ROTATE_U(-90);",
+            "CLAW_U(0);",
+            "ROTATE_U(+90);",
+            "CLAW_U(1);",
         ]);
     }
 
     #[test]
     fn whole_y2_no_reset() {
-        // y2 = 绕 U 轴 180°：R 松开，U 带转 180°（不回正）
+        // y2：R 松 → U 带转 180°（落到 ±180 平放）→ finalize 把 R 夹回
         let moves = Moves::from_solution_string("(z2s0) y2");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_R(0);",        // y2: R 松开
-            "ROTATE_U(+180);",   // y2: U 带转 180°
-            "CLAW_R(1);",        // y2: R 夹紧
+            "CLAW_R(0);",
+            "ROTATE_U(+180);",
+            "CLAW_R(1);",        // finalize: R 夹回（不变量）
         ]);
     }
 
     #[test]
     fn whole_y_then_u() {
-        // y = 绕 U 轴：R 松开，U 带转，R 夹紧，U 回正
+        // 关键优化：y(-90) 带 U 转 -90（U=-90 竖起），
+        // 然后 single_u(-90) 又带 U 转 -90 → U 累积 -180 = 自然平放！
+        // finalize 时 U 已平放、R 已闭合，无需任何额外指令。
         let moves = Moves::from_solution_string("(z1s0) y  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert_eq!(steps.commands, vec![
-            "CLAW_R(0);",        // y: R 松开
-            "ROTATE_U(-90);",    // y: U 带魔方转
-            "CLAW_R(1);",        // y: R 夹紧
-            "CLAW_U(0);",        // y: U 回正-松开
-            "ROTATE_U(+90);",    // y: U 回正
-            "CLAW_U(1);",        // y: U 回正-夹紧
-            "ROTATE_U(-90);",    // 单层 U
+            "CLAW_R(0);",        // whole_y: R 松
+            "ROTATE_U(-90);",    // U 带魔方转 (U=-90)
+            "CLAW_R(1);",        // single_u 入口 claw_r(1)
+            "ROTATE_U(-90);",    // single_u 带魔方转 (U=-180=平放)
         ]);
     }
 
@@ -561,10 +607,100 @@ mod tests {
     }
 
     #[test]
+    fn invariant_after_single_u_is_flat() {
+        // 懒惰策略下 single_u 出口不保证 U 平放，但 R 必须平放（约束2 入口前置）。
+        let mut hw = HardwareTranslator::new();
+        hw.single_u(-90);
+        assert!(is_flat(hw.r_angle), "single_u 出口 R 非平放: {}", hw.r_angle);
+        // finalize 后两爪都平放
+        hw.finalize();
+        assert!(is_flat(hw.u_angle));
+        assert!(is_flat(hw.r_angle));
+        assert!(hw.u_claw && hw.r_claw);
+    }
+
+    #[test]
+    fn invariant_after_whole_y_both_flat_and_closed() {
+        // whole_y 出口：R 平放（入口已保证），U 可能竖起；finalize 后两爪闭合+平放。
+        let mut hw = HardwareTranslator::new();
+        hw.whole_y(-90);
+        assert!(is_flat(hw.r_angle));
+        hw.finalize();
+        assert!(is_flat(hw.u_angle));
+        assert!(is_flat(hw.r_angle));
+        assert!(hw.u_claw);
+        assert!(hw.r_claw);
+    }
+
+    #[test]
+    fn invariant_after_whole_x_both_flat_and_closed() {
+        let mut hw = HardwareTranslator::new();
+        hw.whole_x(90);
+        assert!(is_flat(hw.u_angle));
+        hw.finalize();
+        assert!(is_flat(hw.u_angle));
+        assert!(is_flat(hw.r_angle));
+        assert!(hw.u_claw);
+        assert!(hw.r_claw);
+    }
+
+    #[test]
     fn full_solve_does_not_panic() {
         let raw = "(z1s0) y  (z1z0) U  (s1z2) x2 (z3z0) U' (z0z3) R' (z2s1) y2 (z0z2) R2 (z1z0) U  (z1s1) y  (z0z1) R  (z3z0) U' (s1z3) x' (z0z1) R  (z2z0) U2 (z0z1) R  (z2s0) y2 (z0z3) R' (z3z0) U' (s1z3) x' (z0z2) R2 (z2s0) y2 (z0z2) R2 (z1s1) y  (z1z0) U  (z0z2) R2 (s1z2) x2 (z1z0) U  (z0z2) R2 (s1z0)    (z1s0) y  (z0z2) R2";
         let moves = Moves::from_solution_string(raw);
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert!(!steps.commands.is_empty());
+    }
+
+    /// 模拟硬件，逐条执行指令并断言两个约束永远成立：
+    ///   约束1：两爪不能同时松开
+    ///   约束2：两爪不能同时竖起
+    fn simulate_and_check(commands: &[String]) {
+        let mut u_angle = 0i32;
+        let mut r_angle = 0i32;
+        let mut u_close = true;
+        let mut r_close = true;
+        for (i, c) in commands.iter().enumerate() {
+            if let Some((k, v)) = HardwareTranslator::claw_kind(c) {
+                let close = v != 0;
+                if k == "CLAW_U" { u_close = close; } else { r_close = close; }
+            } else if let Some((k, v)) = HardwareTranslator::rotate_kind(c) {
+                if k == "ROTATE_U" {
+                    u_angle = normalize_angle(u_angle + v);
+                } else {
+                    r_angle = normalize_angle(r_angle + v);
+                }
+            }
+            // 约束1
+            assert!(u_close || r_close,
+                "约束1违反 @第{}步({}): 两爪同时松开", i, c);
+            // 约束2
+            assert!(is_flat(u_angle) || is_flat(r_angle),
+                "约束2违反 @第{}步({}): U={} R={} 两爪同时竖起", i, c, u_angle, r_angle);
+        }
+    }
+
+    #[test]
+    fn full_solve_respects_both_constraints() {
+        let raw = "(z1s0) y  (z1z0) U  (s1z2) x2 (z3z0) U' (z0z3) R' (z2s1) y2 (z0z2) R2 (z1z0) U  (z1s1) y  (z0z1) R  (z3z0) U' (s1z3) x' (z0z1) R  (z2z0) U2 (z0z1) R  (z2s0) y2 (z0z3) R' (z3z0) U' (s1z3) x' (z0z2) R2 (z2s0) y2 (z0z2) R2 (z1s1) y  (z1z0) U  (z0z2) R2 (s1z2) x2 (z1z0) U  (z0z2) R2 (s1z0)    (z1s0) y  (z0z2) R2";
+        let moves = Moves::from_solution_string(raw);
+        let steps = BasicTranslator::new().translate(&moves).unwrap();
+        simulate_and_check(&steps.commands);
+        eprintln!("总指令数: {}", steps.commands.len());
+    }
+
+    #[test]
+    fn single_combos_respect_constraints() {
+        // 各种动作组合检查
+        let cases = [
+            "(z1z0) U (z1z0) R (z1z0) U' (z1z0) R'",
+            "(z1s0) y (z1z0) U (s0z1) x (z1z0) R",
+            "(z2s0) y2 (s1z2) x2 (z1z0) U2 (z1z0) R2",
+        ];
+        for raw in cases {
+            let moves = Moves::from_solution_string(raw);
+            let steps = BasicTranslator::new().translate(&moves).unwrap();
+            simulate_and_check(&steps.commands);
+        }
     }
 }
