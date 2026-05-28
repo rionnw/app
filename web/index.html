@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CubeSolver - Robot Simulator</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+          "gsap": "https://cdn.jsdelivr.net/npm/gsap@3.12.5/index.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main id="app-shell">
+      <canvas id="scene"></canvas>
+
+      <section class="hud" aria-label="Robot controls">
+        <header class="hud__header">
+          <div>
+            <p class="eyebrow">2-Axis Robot</p>
+            <h1>CubeSolver</h1>
+          </div>
+          <div class="status-pill" id="motion-status">Idle</div>
+        </header>
+
+        <div class="section">
+          <div class="section__title">Facelets (54)</div>
+          <textarea id="facelets-input" rows="2" spellcheck="false"
+            placeholder="UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB">UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB</textarea>
+          <div class="control-strip">
+            <button id="apply-facelets" type="button">Apply to Cube</button>
+            <button id="reset-cube" type="button">Reset</button>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section__title">Moves (2L or Hardware)</div>
+          <textarea id="moves-input" rows="3" spellcheck="false"
+            placeholder="2L:  R U R' U' x y2 R2&#10;Hardware:  CLAW_U(0); ROTATE_U(-90); CLAW_U(1);"></textarea>
+          <div class="control-strip">
+            <button id="run-solution" type="button">▶ Run</button>
+            <button id="step-solution" type="button">Step</button>
+            <button id="stop-solution" type="button">Stop</button>
+          </div>
+          <div class="progress-row">
+            <div class="progress-bar"><div id="progress-fill"></div></div>
+            <span id="progress-text">0/0</span>
+          </div>
+        </div>
+
+        <details class="section">
+          <summary class="section__title">Manual Control</summary>
+          <div class="control-strip">
+            <button id="toggle-claw-a" type="button">Toggle Claw U</button>
+            <button id="toggle-claw-b" type="button">Toggle Claw R</button>
+          </div>
+          <div class="control-grid" aria-label="Rotation commands">
+            <button id="claw-a-cw" type="button">U arm CW</button>
+            <button id="claw-a-ccw" type="button">U arm CCW</button>
+            <button id="claw-b-cw" type="button">R arm CW</button>
+            <button id="claw-b-ccw" type="button">R arm CCW</button>
+          </div>
+          <dl class="readout">
+            <div>
+              <dt>Claw U</dt>
+              <dd id="claw-a-state">CLOSED</dd>
+            </div>
+            <div>
+              <dt>Claw R</dt>
+              <dd id="claw-b-state">CLOSED</dd>
+            </div>
+            <div>
+              <dt>Mode</dt>
+              <dd id="kinematic-mode">Layer turn</dd>
+            </div>
+          </dl>
+        </details>
+
+        <p class="warning" id="warning" role="status" aria-live="polite"></p>
+      </section>
+    </main>
+
+    <script type="module" src="./main.js?v=13"></script>
+  </body>
+</html>
