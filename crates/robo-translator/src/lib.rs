@@ -84,9 +84,56 @@ fn parse_action_token(s: &mut &str) -> Option<Action> {
     None
 }
 
+// ===== Action 序列预处理：同轴相邻动作合并 / 抵消 =====
+
+fn deg_mod360(d: i32) -> i32 {
+    let mut v = d % 360;
+    if v < 0 { v += 360; }
+    v
+}
+
+/// 把同种 kind 的相邻动作角度合并。
+/// 注意：X / Y 整体旋转会改变魔方朝向，因此不跨它们合并 U/R。
+/// 但相邻 U+U / R+R / X+X / Y+Y 是同一物理动作可以累加。
+fn simplify_actions(actions: Vec<Action>) -> Vec<Action> {
+    let mut out: Vec<Action> = Vec::with_capacity(actions.len());
+    for a in actions {
+        let merged = match (out.last(), &a) {
+            (Some(Action::U(prev)), Action::U(cur)) => Some(Action::U(*prev + cur)),
+            (Some(Action::R(prev)), Action::R(cur)) => Some(Action::R(*prev + cur)),
+            (Some(Action::X(prev)), Action::X(cur)) => Some(Action::X(*prev + cur)),
+            (Some(Action::Y(prev)), Action::Y(cur)) => Some(Action::Y(*prev + cur)),
+            _ => None,
+        };
+        match merged {
+            Some(new_act) => {
+                out.pop();
+                // 归一化到 (-180, 180]
+                let normalize = |d: i32| -> Option<i32> {
+                    let mut v = deg_mod360(d);
+                    if v > 180 { v -= 360; }
+                    if v == 0 { None } else { Some(v) }
+                };
+                let normalized = match new_act {
+                    Action::U(d) => normalize(d).map(Action::U),
+                    Action::R(d) => normalize(d).map(Action::R),
+                    Action::X(d) => normalize(d).map(Action::X),
+                    Action::Y(d) => normalize(d).map(Action::Y),
+                    _ => unreachable!(),
+                };
+                if let Some(act) = normalized {
+                    out.push(act);
+                }
+            }
+            None => out.push(a),
+        }
+    }
+    out
+}
+
 // ===== Hardware State Machine =====
 
-/// 臂角度归一化到 [-180, 180]
+/// 臂角度归一化到 (-180, 180]
 fn normalize_angle(a: i32) -> i32 {
     let mut v = a % 360;
     if v > 180 { v -= 360; }
@@ -99,9 +146,34 @@ fn is_flat(angle: i32) -> bool {
     angle == 0 || angle.abs() == 180
 }
 
+/// 选择回正旋转量：限定单次旋转 |delta| <= 180，
+/// 在符合的候选中挑能让累计 accum 朝 0 收敛的方向。
+fn pick_back_rotation(angle: i32, accum: i32) -> i32 {
+    // 当前 angle 已是非平放（normalize 在 ±90），目标平放位置是 0 或 ±180。
+    // 单次 |delta| ≤ 180 的候选：
+    //   到 0:    -angle  (|delta| = 90)
+    //   到 +180: 180 - angle  (angle= -90 → +270 ❌; angle= +90 → +90 ✓)
+    //   到 -180: -180 - angle (angle= +90 → -270 ❌; angle= -90 → -90 ✓)
+    // 即：要么走 -angle 到 0，要么走 -angle 的反向到 ±180（绝对值同为 90）。
+    let to_zero = -angle;
+    // 反方向同样 90°：angle=+90 → +90 到 180；angle=-90 → -90 到 -180
+    let to_flip = if angle > 0 { 180 - angle } else { -180 - angle };
+    debug_assert_eq!(to_zero.abs(), 90);
+    debug_assert_eq!(to_flip.abs(), 90);
+    // 两者 |delta| 相同，挑让 accum 更接近 0 的
+    if (accum + to_zero).abs() <= (accum + to_flip).abs() {
+        to_zero
+    } else {
+        to_flip
+    }
+}
+
 struct HardwareTranslator {
     u_angle: i32,
     r_angle: i32,
+    /// 累计转动度数（不归一化），用于回正时挑选让累计绝对值更小的方向
+    u_accum: i32,
+    r_accum: i32,
     u_claw: bool,  // true = 闭合
     r_claw: bool,
     commands: Vec<String>,
@@ -112,44 +184,120 @@ impl HardwareTranslator {
         Self {
             u_angle: 0,
             r_angle: 0,
+            u_accum: 0,
+            r_accum: 0,
             u_claw: true,
             r_claw: true,
             commands: Vec::new(),
         }
     }
 
-    fn emit(&mut self, cmd: &str) {
-        self.commands.push(cmd.to_string());
+    /// 规范化单次旋转量到允许集合 {-90, +90, +180}（180° 统一为正）。
+    /// 输入应是 90 的倍数；其他值会被取模到 [-180, 180]。
+    fn canonical_degrees(d: i32) -> i32 {
+        let mut v = d % 360;
+        if v > 180 { v -= 360; }
+        if v < -180 { v += 360; }
+        if v == -180 { v = 180; }
+        v
     }
 
-    // ===== 基础操作（只在状态变化时发指令）=====
+    fn rotate_kind(s: &str) -> Option<(&'static str, i32)> {
+        for k in ["ROTATE_U", "ROTATE_R"] {
+            if let Some(rest) = s.strip_prefix(k) {
+                let inner = rest.trim_start_matches('(').trim_end_matches(';').trim_end_matches(')');
+                if let Ok(v) = inner.trim().parse::<i32>() {
+                    return Some((k, v));
+                }
+            }
+        }
+        None
+    }
+
+    fn claw_kind(s: &str) -> Option<(&'static str, i32)> {
+        for k in ["CLAW_U", "CLAW_R"] {
+            if let Some(rest) = s.strip_prefix(k) {
+                let inner = rest.trim_start_matches('(').trim_end_matches(';').trim_end_matches(')');
+                if let Ok(v) = inner.trim().parse::<i32>() {
+                    return Some((k, v));
+                }
+            }
+        }
+        None
+    }
+
+    // ===== 基础操作（在 emit 时即与上一条同类指令合并）=====
 
     fn claw_u(&mut self, close: bool) {
-        if self.u_claw != close {
-            self.emit(if close { "CLAW_U(1);" } else { "CLAW_U(0);" });
-            self.u_claw = close;
+        if self.u_claw == close { return; }
+        self.u_claw = close;
+        let want = if close { 1 } else { 0 };
+        // 检查上一条 CLAW_U：与本次相反则抵消（且物理状态变化也已抵消）
+        if let Some(last) = self.commands.last() {
+            if let Some((k, v)) = Self::claw_kind(last) {
+                if k == "CLAW_U" && v != want {
+                    self.commands.pop();
+                    return;
+                }
+            }
         }
+        self.commands.push(format!("CLAW_U({});", want));
     }
 
     fn claw_r(&mut self, close: bool) {
-        if self.r_claw != close {
-            self.emit(if close { "CLAW_R(1);" } else { "CLAW_R(0);" });
-            self.r_claw = close;
+        if self.r_claw == close { return; }
+        self.r_claw = close;
+        let want = if close { 1 } else { 0 };
+        if let Some(last) = self.commands.last() {
+            if let Some((k, v)) = Self::claw_kind(last) {
+                if k == "CLAW_R" && v != want {
+                    self.commands.pop();
+                    return;
+                }
+            }
         }
+        self.commands.push(format!("CLAW_R({});", want));
     }
 
     fn rotate_u(&mut self, degrees: i32) {
-        if degrees != 0 {
-            self.emit(&format!("ROTATE_U({:+});", degrees));
-            self.u_angle = normalize_angle(self.u_angle + degrees);
+        let d = Self::canonical_degrees(degrees);
+        if d == 0 { return; }
+        self.u_angle = normalize_angle(self.u_angle + d);
+        self.u_accum += d;
+        // 与上一条 ROTATE_U 合并
+        if let Some(last) = self.commands.last() {
+            if let Some((k, v)) = Self::rotate_kind(last) {
+                if k == "ROTATE_U" {
+                    self.commands.pop();
+                    let merged = Self::canonical_degrees(v + d);
+                    if merged != 0 {
+                        self.commands.push(format!("ROTATE_U({:+});", merged));
+                    }
+                    return;
+                }
+            }
         }
+        self.commands.push(format!("ROTATE_U({:+});", d));
     }
 
     fn rotate_r(&mut self, degrees: i32) {
-        if degrees != 0 {
-            self.emit(&format!("ROTATE_R({:+});", degrees));
-            self.r_angle = normalize_angle(self.r_angle + degrees);
+        let d = Self::canonical_degrees(degrees);
+        if d == 0 { return; }
+        self.r_angle = normalize_angle(self.r_angle + d);
+        self.r_accum += d;
+        if let Some(last) = self.commands.last() {
+            if let Some((k, v)) = Self::rotate_kind(last) {
+                if k == "ROTATE_R" {
+                    self.commands.pop();
+                    let merged = Self::canonical_degrees(v + d);
+                    if merged != 0 {
+                        self.commands.push(format!("ROTATE_R({:+});", merged));
+                    }
+                    return;
+                }
+            }
         }
+        self.commands.push(format!("ROTATE_R({:+});", d));
     }
 
     // ===== 回正（爪子竖着时需要回正）=====
@@ -158,7 +306,7 @@ impl HardwareTranslator {
         if is_flat(self.u_angle) { return; }
         self.claw_r(true);    // R 夹紧固定魔方
         self.claw_u(false);   // U 松开
-        let back = -self.u_angle;
+        let back = pick_back_rotation(self.u_angle, self.u_accum);
         self.rotate_u(back);  // U 回正
         self.claw_u(true);    // U 夹紧
     }
@@ -167,7 +315,7 @@ impl HardwareTranslator {
         if is_flat(self.r_angle) { return; }
         self.claw_u(true);    // U 夹紧固定魔方
         self.claw_r(false);   // R 松开
-        let back = -self.r_angle;
+        let back = pick_back_rotation(self.r_angle, self.r_accum);
         self.rotate_r(back);  // R 回正
         self.claw_r(true);    // R 夹紧
     }
@@ -232,10 +380,18 @@ impl BasicTranslator {
     pub fn new() -> Self { Self }
 }
 
+/// 邻接合并 / 抵消：
 impl Translator for BasicTranslator {
     fn translate(&self, moves: &Moves) -> Result<Steps> {
         let solution_str = moves.to_solution_string();
-        let actions = parse_solution(&solution_str);
+        let raw_actions = parse_solution(&solution_str);
+        // 反复简化直至稳定（例如 U2 U2 → ε 后可能让外层动作变得可合并）
+        let mut actions = raw_actions;
+        loop {
+            let next = simplify_actions(actions.clone());
+            if next == actions { break; }
+            actions = next;
+        }
 
         if actions.is_empty() {
             return Ok(Steps { commands: vec![], encoded: String::new() });
@@ -340,6 +496,68 @@ mod tests {
         let moves = Moves::from_solution_string("");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
         assert!(steps.commands.is_empty());
+    }
+
+    #[test]
+    fn simplify_cancels_inverse() {
+        // U U' 抵消
+        let actions = simplify_actions(vec![Action::U(-90), Action::U(90)]);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn simplify_merges_double() {
+        // U U → U2 (180°)
+        let actions = simplify_actions(vec![Action::U(-90), Action::U(-90)]);
+        assert_eq!(actions.len(), 1);
+        match actions[0] {
+            Action::U(d) => assert!(d.abs() == 180),
+            _ => panic!("expected Action::U"),
+        }
+    }
+
+    #[test]
+    fn merge_adjacent_claw_cancels() {
+        // 直接连续 close→open（通过 HardwareTranslator 公共方法）应抵消
+        let mut hw = HardwareTranslator::new();
+        hw.claw_r(false);
+        hw.claw_r(true);
+        // 初始已是 CLOSED；先 open→close 应产生 CLAW_R(0); 然后被抵消为空
+        assert!(hw.commands.is_empty());
+    }
+
+    #[test]
+    fn merge_adjacent_rotate_combines() {
+        let mut hw = HardwareTranslator::new();
+        hw.rotate_u(90);
+        hw.rotate_u(90);
+        assert_eq!(hw.commands, vec!["ROTATE_U(+180);"]);
+    }
+
+    #[test]
+    fn merge_adjacent_rotate_cancels() {
+        let mut hw = HardwareTranslator::new();
+        hw.rotate_r(-90);
+        hw.rotate_r(90);
+        assert!(hw.commands.is_empty());
+    }
+
+    #[test]
+    fn no_oversize_rotation() {
+        // 任何单条 ROTATE 角度必须在 {-90, +90, +180} 集合内
+        let mut hw = HardwareTranslator::new();
+        hw.rotate_u(270);   // 应当被规范化到 -90
+        assert_eq!(hw.commands, vec!["ROTATE_U(-90);"]);
+        hw.rotate_u(-270);  // 累加到 0，被抵消
+        assert!(hw.commands.is_empty());
+    }
+
+    #[test]
+    fn pick_back_minimizes_accum() {
+        // accum 偏正时应选负方向回正
+        assert_eq!(pick_back_rotation(90, 270), -90);  // -90 → accum=180, +90 → accum=360
+        // accum 偏负时应选正方向
+        assert_eq!(pick_back_rotation(-90, -270), 90);
     }
 
     #[test]
