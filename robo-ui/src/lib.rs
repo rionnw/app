@@ -20,7 +20,7 @@ use robo_camera::{
 };
 use robo_core::{CubeFace, Frame, Recognizer, Roi, Solver, Steps, Translator, Transport};
 use robo_solver::Min2PhaseSolver;
-use robo_translator::BasicTranslator;
+use robo_translator::{default_digit_map, BasicTranslator, DigitMap, MNEMONICS, MOVE_COUNT};
 use robo_transport::SerialTransport;
 use robo_vision::ColorClusterRecognizer;
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,8 @@ struct AppState {
     frame_server_port: u16,
     mode: RuntimeMode,
     solver: Arc<std::sync::OnceLock<Min2PhaseSolver>>,
+    /// 动作 → 下位机数字映射（commands 用 mnemonic，encoded 用此映射）
+    digit_map: Mutex<DigitMap>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +160,7 @@ impl Default for AppState {
             frame_server_port,
             mode: RuntimeMode::from_env(),
             solver: Arc::new(std::sync::OnceLock::new()),
+            digit_map: Mutex::new(default_digit_map()),
         }
     }
 }
@@ -1908,7 +1911,7 @@ fn solve_current_frame(
     let face = recognizer
         .recognize(&capture.frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face, solver)
+    solve_face(face, solver, current_digit_map(&state))
 }
 
 #[tauri::command]
@@ -1926,7 +1929,7 @@ fn solve_latest_frame(
     let face = recognizer
         .recognize(&frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face, solver)
+    solve_face(face, solver, current_digit_map(&state))
 }
 
 #[tauri::command]
@@ -1942,14 +1945,14 @@ fn solve_image_file(
     let face = recognizer
         .recognize(&frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face, solver)
+    solve_face(face, solver, current_digit_map(&state))
 }
 
 #[tauri::command]
 fn solve_facelets(state: tauri::State<'_, AppState>, facelets: String) -> Result<SolveFaceletsResponse, String> {
     let solver = state.solver.get().ok_or("solver 尚未初始化完成")?;
     let face = CubeFace::new(facelets).map_err(|err| err.to_string())?;
-    solve_face(face, solver)
+    solve_face(face, solver, current_digit_map(&state))
 }
 
 #[tauri::command]
@@ -2039,8 +2042,12 @@ fn read_serial(state: tauri::State<'_, AppState>) -> Result<SerialReadResponse, 
     })
 }
 
-fn solve_face(face: CubeFace, solver: &Min2PhaseSolver) -> Result<SolveFaceletsResponse, String> {
-    let translator = BasicTranslator::new();
+fn solve_face(
+    face: CubeFace,
+    solver: &Min2PhaseSolver,
+    digit_map: DigitMap,
+) -> Result<SolveFaceletsResponse, String> {
+    let translator = BasicTranslator::with_digit_map(digit_map);
     let moves = solver.solve(&face).map_err(|err| err.to_string())?;
     let steps = translator
         .translate(&moves)
@@ -2052,6 +2059,169 @@ fn solve_face(face: CubeFace, solver: &Min2PhaseSolver) -> Result<SolveFaceletsR
         steps: steps.commands,
         encoded_steps: steps.encoded,
     })
+}
+
+fn current_digit_map(state: &AppState) -> DigitMap {
+    state
+        .digit_map
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|_| default_digit_map())
+}
+
+// ===== 动作 → 数字映射：持久化 + Tauri 命令 =====
+
+const MOVE_MAPPING_FILENAME: &str = "move_mapping.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MoveMappingDto {
+    /// 助记符（只读，前端展示用）
+    mnemonics: Vec<String>,
+    /// 当前数字映射（10 个字符串，与 mnemonics 一一对应）
+    digits: Vec<String>,
+}
+
+impl MoveMappingDto {
+    fn from_map(map: &DigitMap) -> Self {
+        Self {
+            mnemonics: MNEMONICS.iter().map(|s| s.to_string()).collect(),
+            digits: map.iter().cloned().collect(),
+        }
+    }
+}
+
+/// 返回"软件同目录"用于持久化用户配置。
+///
+/// 规则：
+/// - 普通可执行文件：可执行文件所在目录。
+/// - macOS `.app` 包：检测到路径形如 `…/Foo.app/Contents/MacOS/Foo`，
+///   返回 `.app` 的同级目录（即用户在 Finder 看到 `CubeSolver.app` 的那个文件夹），
+///   避免写入 `.app` 内部（签名/公证后只读，且对用户不可见）。
+fn app_install_dir() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| "无法解析可执行文件父目录".to_string())?
+        .to_path_buf();
+
+    // macOS: …/Foo.app/Contents/MacOS/Foo  → 回到 Foo.app 的同级目录
+    #[cfg(target_os = "macos")]
+    {
+        let mut anc = exe_dir.as_path();
+        // exe_dir = …/Foo.app/Contents/MacOS
+        if anc.file_name().and_then(|s| s.to_str()) == Some("MacOS") {
+            if let Some(contents) = anc.parent() {
+                if contents.file_name().and_then(|s| s.to_str()) == Some("Contents") {
+                    if let Some(app_bundle) = contents.parent() {
+                        if app_bundle
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .map(|e| e.eq_ignore_ascii_case("app"))
+                            .unwrap_or(false)
+                        {
+                            if let Some(beside) = app_bundle.parent() {
+                                anc = beside;
+                                return Ok(anc.to_path_buf());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(exe_dir)
+}
+
+fn move_mapping_path(_app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app_install_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join(MOVE_MAPPING_FILENAME))
+}
+
+/// 校验：必须是 0-9 的一个排列。
+fn validate_digit_map(digits: &[String]) -> Result<DigitMap, String> {
+    if digits.len() != MOVE_COUNT {
+        return Err(format!("映射长度必须为 {}，当前 {}", MOVE_COUNT, digits.len()));
+    }
+    let mut sorted: Vec<String> = digits.iter().map(|s| s.trim().to_string()).collect();
+    let original = sorted.clone();
+    sorted.sort();
+    let expected: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+    if sorted != expected {
+        return Err("映射必须为 0-9 各出现一次的排列".to_string());
+    }
+    let mut out: DigitMap = Default::default();
+    for (i, s) in original.into_iter().enumerate() {
+        out[i] = s;
+    }
+    Ok(out)
+}
+
+fn load_move_mapping_from_disk(app: &tauri::AppHandle) -> Option<DigitMap> {
+    let path = move_mapping_path(app).ok()?;
+    if !path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&path).ok()?;
+    let dto: MoveMappingDto = serde_json::from_str(&content).ok()?;
+    match validate_digit_map(&dto.digits) {
+        Ok(m) => {
+            log::info!("已加载动作映射: {}", path.display());
+            Some(m)
+        }
+        Err(e) => {
+            log::warn!("动作映射文件校验失败 ({})，使用默认映射", e);
+            None
+        }
+    }
+}
+
+#[tauri::command]
+fn get_move_mapping(state: tauri::State<'_, AppState>) -> Result<MoveMappingDto, String> {
+    Ok(MoveMappingDto::from_map(&current_digit_map(&state)))
+}
+
+#[tauri::command]
+fn set_move_mapping(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    digits: Vec<String>,
+) -> Result<MoveMappingDto, String> {
+    let new_map = validate_digit_map(&digits)?;
+    {
+        let mut guard = state
+            .digit_map
+            .lock()
+            .map_err(|_| "digit_map state is poisoned".to_string())?;
+        *guard = new_map.clone();
+    }
+    let path = move_mapping_path(&app)?;
+    let dto = MoveMappingDto::from_map(&new_map);
+    let payload = serde_json::to_string_pretty(&dto).map_err(|e| e.to_string())?;
+    std::fs::write(&path, payload).map_err(|e| e.to_string())?;
+    log::info!("动作映射已保存: {}", path.display());
+    Ok(dto)
+}
+
+#[tauri::command]
+fn reset_move_mapping(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<MoveMappingDto, String> {
+    let default = default_digit_map();
+    {
+        let mut guard = state
+            .digit_map
+            .lock()
+            .map_err(|_| "digit_map state is poisoned".to_string())?;
+        *guard = default.clone();
+    }
+    if let Ok(path) = move_mapping_path(&app) {
+        let _ = std::fs::remove_file(&path);
+    }
+    log::info!("动作映射已重置为默认");
+    Ok(MoveMappingDto::from_map(&default))
 }
 
 fn decode_image_data_url(data_url: &str) -> Result<Frame> {
@@ -2498,6 +2668,15 @@ pub fn run() {
                 Arc::clone(&state.solver)
             };
             let handle = app.handle().clone();
+
+            // 启动时尝试从 app_config_dir 读取保存的动作映射
+            if let Some(loaded) = load_move_mapping_from_disk(&handle) {
+                let state: tauri::State<'_, AppState> = app.state();
+                if let Ok(mut guard) = state.digit_map.lock() {
+                    *guard = loaded;
+                };
+            }
+
             thread::spawn(move || {
                 let solver = Min2PhaseSolver::new();
                 let _ = solver_lock.set(solver);
@@ -2532,7 +2711,10 @@ pub fn run() {
             open_serial,
             close_serial,
             read_serial,
-            send_steps
+            send_steps,
+            get_move_mapping,
+            set_move_mapping,
+            reset_move_mapping
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

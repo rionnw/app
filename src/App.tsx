@@ -38,6 +38,7 @@ import {
   type RoiRegion,
 } from "./roiIndexView";
 import { createSolveFrameRequest, type SolveImageSource } from "./solveAction";
+import { MoveMappingEditor } from "./MoveMappingEditor";
 
 type CameraDevice = { index: string; name: string; description: string };
 type CameraConfig = { index: number; width: number; height: number; fps: number; frameFormat: string };
@@ -212,6 +213,7 @@ function App() {
   const [showRoi, setShowRoi] = useState(true);
   const [focusCurrentRoi, setFocusCurrentRoi] = useState(false);
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
+  const [mappingEditorOpen, setMappingEditorOpen] = useState(false);
   const [panelVisibility, setPanelVisibility] = useState<PanelVisibility>(() => {
     try {
       return createSavedPanelVisibility(JSON.parse(localStorage.getItem(panelVisibilityStorageKey) || "null"));
@@ -1137,8 +1139,22 @@ function App() {
           >
             清空 ROI
           </button>
+          <button
+            type="button"
+            className="icon-button"
+            title="动作映射设置"
+            aria-label="动作映射设置"
+            onClick={() => setMappingEditorOpen(true)}
+          >
+            ⚙
+          </button>
         </div>
       </header>
+
+      <MoveMappingEditor
+        open={mappingEditorOpen}
+        onClose={() => setMappingEditorOpen(false)}
+      />
 
       <section className="workspace">
         <section className="image-panel">

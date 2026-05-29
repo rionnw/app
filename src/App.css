@@ -838,3 +838,156 @@ pre {
     grid-template-columns: 1fr 1fr;
   }
 }
+
+/* ===== 动作映射弹窗 & 顶栏齿轮按钮 ===== */
+
+.icon-button {
+  width: var(--control-height);
+  min-width: var(--control-height);
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-card {
+  width: min(440px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.25);
+  display: flex;
+  flex-direction: column;
+  padding: 18px 20px;
+  gap: 12px;
+  overflow: auto;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.modal-close {
+  width: 28px;
+  min-height: 28px;
+  padding: 0;
+  font-size: 20px;
+  line-height: 1;
+  border: none;
+  background: transparent;
+}
+
+.modal-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.modal-body {
+  font-size: 14px;
+}
+
+.mapping-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px 14px;
+}
+
+.mapping-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mapping-mn {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-weight: 700;
+  width: 56px;
+  color: var(--text);
+}
+
+.mapping-arrow {
+  color: var(--muted);
+}
+
+.mapping-input {
+  width: 56px;
+  text-align: center;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 16px;
+  height: var(--control-height);
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--soft);
+  color: var(--text);
+}
+
+.mapping-input:focus {
+  outline: 2px solid var(--primary);
+  outline-offset: -1px;
+  background: var(--surface);
+}
+
+.modal-status {
+  min-height: 20px;
+  font-size: 13px;
+}
+
+.msg-error {
+  color: var(--danger);
+}
+
+.msg-info {
+  color: var(--success);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.modal-actions-right {
+  display: flex;
+  gap: 8px;
+}
+
+.modal-actions button.primary {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+
+.modal-actions button.primary:hover:not(:disabled) {
+  background: var(--primary-dark);
+  border-color: var(--primary-dark);
+  color: #fff;
+}
+
+.modal-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
