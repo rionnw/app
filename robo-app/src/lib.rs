@@ -1569,8 +1569,10 @@ struct SolveFaceletsResponse {
     steps: Vec<String>,
     /// 机械步骤的最终编码字符串（按 user digit_map）
     encoded_steps: String,
-    /// solver 阶段耗时（毫秒）
+    /// solver（Search.solutions） 阶段耗时（毫秒）
     search_elapsed_ms: u64,
+    /// handstep（候选并行翻译为机械步骤） 阶段耗时（毫秒）
+    handstep_elapsed_ms: u64,
     /// 最终选中候选的机械步数（pipeline 已按此最小化）
     mech_steps: i32,
     /// solver 产出的候选数量（≥1）
@@ -2102,11 +2104,12 @@ fn solve_face(
         .collect();
 
     log::info!(
-        "solve: facelets={} → {}f kociemba, mech={} steps, solver={}ms ({} 候选, timed_out={})",
+        "solve: facelets={} → {}f kociemba, mech={} steps, solver={}ms / handstep={}ms ({} 候选, timed_out={})",
         face.as_str(),
         moves.len(),
         res.best.mech_steps,
         res.solver_elapsed.as_millis(),
+        res.handstep_elapsed.as_millis(),
         res.candidates.len(),
         res.solver_timed_out,
     );
@@ -2117,6 +2120,7 @@ fn solve_face(
         steps,
         encoded_steps,
         search_elapsed_ms: res.solver_elapsed.as_millis() as u64,
+        handstep_elapsed_ms: res.handstep_elapsed.as_millis() as u64,
         mech_steps: res.best.mech_steps,
         candidate_count: res.candidates.len(),
     })

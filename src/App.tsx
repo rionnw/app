@@ -87,8 +87,10 @@ type SolveResponse = {
   moves: string[];
   steps: string[];
   encoded_steps: string;
-  /// solver 阶段耗时（毫秒）
+  /// solver（Search.solutions）阶段耗时（毫秒）
   search_elapsed_ms: number;
+  /// handstep（候选并行翻译为机械步骤）阶段耗时（毫秒）
+  handstep_elapsed_ms: number;
   /// 最终选中候选的机械步数
   mech_steps: number;
   /// solver 产出的候选数量
@@ -97,6 +99,7 @@ type SolveResponse = {
 
 type SolveStats = {
   searchElapsedMs: number;
+  handstepElapsedMs: number;
   mechSteps: number;
   candidateCount: number;
   faceMoves: number;
@@ -941,15 +944,17 @@ function App() {
     setEncodedSteps(result.encoded_steps);
     const stats: SolveStats = {
       searchElapsedMs: result.search_elapsed_ms,
+      handstepElapsedMs: result.handstep_elapsed_ms,
       mechSteps: result.mech_steps,
       candidateCount: result.candidate_count,
       faceMoves: result.moves.length,
     };
+    const totalElapsedMs = stats.searchElapsedMs + stats.handstepElapsedMs;
     setSolveStats(stats);
     addLog(
-      `解算完成：${stats.faceMoves} 步 Moves → ${result.steps.length} 步机械（mech=${stats.mechSteps}），solver ${stats.searchElapsedMs}ms / ${stats.candidateCount} 候选。`,
+      `解算完成：${stats.faceMoves} 步 Moves → ${result.steps.length} 步机械（mech=${stats.mechSteps}），求解总耗时 ${totalElapsedMs}ms（solver ${stats.searchElapsedMs}ms + handstep ${stats.handstepElapsedMs}ms，${stats.candidateCount} 候选）。`,
     );
-    setStatus(`已生成步骤（${result.steps.length} 步 / ${stats.searchElapsedMs}ms）`);
+    setStatus(`已生成步骤（${result.steps.length} 步 / ${totalElapsedMs}ms）`);
   };
 
   const openSerial = async () => {
@@ -1347,8 +1352,16 @@ function App() {
               {solveStats ? (
                 <>
                   <div className="solve-stat">
-                    <span className="solve-stat-label">求解耗时</span>
-                    <span className="solve-stat-value">{solveStats.searchElapsedMs} ms</span>
+                    <span className="solve-stat-label">求解总耗时</span>
+                    <span
+                      className="solve-stat-value"
+                      title={`solver=${solveStats.searchElapsedMs}ms · handstep=${solveStats.handstepElapsedMs}ms`}
+                    >
+                      {solveStats.searchElapsedMs + solveStats.handstepElapsedMs} ms
+                      <span className="solve-stat-sub">
+                        solver={solveStats.searchElapsedMs}ms · hs={solveStats.handstepElapsedMs}ms
+                      </span>
+                    </span>
                   </div>
                   <div className="solve-stat">
                     <span className="solve-stat-label">机械步数</span>
