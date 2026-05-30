@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save as dialogSave } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { resolveCanvasPreviewFps, shouldRequestCanvasFrame } from "./canvasPreview";
 import {
@@ -201,6 +201,69 @@ const nowTime = () =>
 /// 复用挂在旧 session 上的 TCP，画面像被卡住一样延迟）。
 const withCacheBust = (url: string) => `${url}${url.includes("?") ? "&" : "?"}t=${Date.now()}`;
 
+/// ROI overlay 单独 memo 化：54 个 region 全部 render 比较重，又频繁随
+/// `frameStats` 等无关状态变化跟着 App 重渲染。Memo 后只有 regions /
+/// currentRegionId / focus / imageBox 真变化时才会重画。
+type RoiOverlayProps = {
+  regions: RoiRegion[];
+  currentRegionId: string;
+  focusCurrentRoi: boolean;
+  imageBox: ImageBox;
+  onSelectRegion: (id: string) => void;
+};
+
+const RoiOverlay = memo(function RoiOverlay({
+  regions,
+  currentRegionId,
+  focusCurrentRoi,
+  imageBox,
+  onSelectRegion,
+}: RoiOverlayProps) {
+  const visible = focusCurrentRoi
+    ? regions.filter((region) => region.id === currentRegionId)
+    : regions;
+
+  return (
+    <svg
+      className="roi-layer"
+      style={{
+        left: imageBox.left,
+        top: imageBox.top,
+        width: imageBox.width,
+        height: imageBox.height,
+      }}
+      viewBox="0 0 1 1"
+      preserveAspectRatio="none"
+    >
+      {visible.map((region) => {
+        if (!region.rect) return null;
+        const labelPosition = getRoiLabelPosition(region.rect);
+        return (
+          <g key={region.id} onClick={() => onSelectRegion(region.id)}>
+            <rect
+              className={region.id === currentRegionId ? "roi-rect is-active" : "roi-rect"}
+              x={region.rect.x}
+              y={region.rect.y}
+              width={region.rect.w}
+              height={region.rect.h}
+              vectorEffect="non-scaling-stroke"
+            />
+            <text
+              className="roi-label"
+              x={labelPosition.x}
+              y={labelPosition.y}
+              textAnchor="middle"
+              dominantBaseline="hanging"
+            >
+              {region.id}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+});
+
 function App() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const roiInputRef = useRef<HTMLInputElement>(null);
@@ -298,7 +361,6 @@ function App() {
   }, [activeCameraDevice, cameraFormats]);
   const currentRegionIndex = regions.findIndex((region) => region.id === currentRegionId);
   const currentRegion = regions[currentRegionIndex] ?? regions[0];
-  const visibleRegions = focusCurrentRoi ? regions.filter((region) => region.id === currentRegionId) : regions;
   /// 相机模式不再走 canvas + invoke 拉帧（每帧大 JPEG 经 Tauri IPC 延迟很高）。
   /// 直接用 <img> 加载后端的 MJPEG endpoint，由 webview 原生消化 multipart 流，
   /// 延迟从 80~150ms 降到接近实时。canvas 通路完全保留以便后续诊断需要时再启用。
@@ -1397,43 +1459,13 @@ function App() {
                   />
                 )}
                 {showRoi && (
-                  <svg
-                    className="roi-layer"
-                    style={{
-                      left: imageBox.left,
-                      top: imageBox.top,
-                      width: imageBox.width,
-                      height: imageBox.height,
-                    }}
-                    viewBox="0 0 1 1"
-                    preserveAspectRatio="none"
-                  >
-                    {visibleRegions.map((region) => {
-                      if (!region.rect) return null;
-                      const labelPosition = getRoiLabelPosition(region.rect);
-                      return (
-                        <g key={region.id} onClick={() => setCurrentRegionId(region.id)}>
-                          <rect
-                            className={region.id === currentRegionId ? "roi-rect is-active" : "roi-rect"}
-                            x={region.rect.x}
-                            y={region.rect.y}
-                            width={region.rect.w}
-                            height={region.rect.h}
-                            vectorEffect="non-scaling-stroke"
-                          />
-                          <text
-                            className="roi-label"
-                            x={labelPosition.x}
-                            y={labelPosition.y}
-                            textAnchor="middle"
-                            dominantBaseline="hanging"
-                          >
-                            {region.id}
-                          </text>
-                        </g>
-                      );
-                    })}
-                  </svg>
+                  <RoiOverlay
+                    regions={regions}
+                    currentRegionId={currentRegionId}
+                    focusCurrentRoi={focusCurrentRoi}
+                    imageBox={imageBox}
+                    onSelectRegion={setCurrentRegionId}
+                  />
                 )}
               </>
             ) : (

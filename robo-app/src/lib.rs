@@ -1551,11 +1551,11 @@ fn publish_stream_packet(
     let Some(frame) = hub.publish_slot_frame(session_id, packet, Vec::new(), 0)? else {
         return Ok(());
     };
-    // 把"frame"事件 emit 到前端的频率限制到 5Hz：
-    // 4 路 worker 并发产帧时，每帧都 emit 会让前端 React 状态栏刷新 ~100Hz，
-    // setState 队列堆积反而拖慢 UI；MJPEG <img> 显示和 setFrameStats 没关系，
-    // UI 状态栏 200ms 更新一次完全够用。
-    const FRAME_EVENT_EMIT_INTERVAL: Duration = Duration::from_millis(200);
+    // 把"frame"事件 emit 到前端的频率限制到 1Hz：
+    // 4 路 worker 并发产帧时，每帧都 emit 会让前端 React 状态栏触发整个 App
+    // 重渲染（包括 ROI SVG 等无关内容）；MJPEG <img> 显示和 setFrameStats
+    // 没关系，UI 状态栏 1s 更新一次完全够用。
+    const FRAME_EVENT_EMIT_INTERVAL: Duration = Duration::from_millis(1000);
     let should_emit = {
         match hub.inner.lock() {
             Ok(mut inner) => {
