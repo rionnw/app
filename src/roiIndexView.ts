@@ -20,13 +20,16 @@ export type RobotAppRoiExport = {
 
 const faceOrder: RoiFace[] = ["U", "R", "F", "D", "L", "B"];
 
+// Authoritative face → 9 ROI indices mapping mirrors the legacy
+// RubiksCubeSolver `map[]`/`table[]` pair, i.e. each entry is the click index
+// (0..53) feeding into the solver-standard facelet slot (X1..X9 row-major).
 const originalFaceMapping = {
-  B: [45, 46, 47, 48, 49, 50, 51, 52, 53],
-  D: [11, 14, 17, 10, 13, 16, 9, 12, 15],
-  F: [20, 23, 26, 19, 22, 25, 18, 21, 24],
-  L: [0, 1, 2, 3, 4, 5, 6, 7, 8],
-  R: [36, 37, 38, 39, 40, 41, 42, 43, 44],
-  U: [29, 32, 35, 28, 31, 34, 27, 30, 33],
+  U: [53, 52, 51, 50, 49, 48, 47, 46, 45],
+  R: [38, 41, 44, 37, 40, 43, 36, 39, 42],
+  F: [29, 32, 35, 28, 31, 34, 27, 30, 33],
+  D: [20, 23, 26, 19, 22, 25, 18, 21, 24],
+  L: [6, 3, 0, 7, 4, 1, 8, 5, 2],
+  B: [15, 12, 9, 16, 13, 10, 17, 14, 11],
 } satisfies Record<RoiFace, number[]>;
 
 const createRoiIndexViews = () => {

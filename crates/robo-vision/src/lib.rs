@@ -4,11 +4,15 @@ use imageproc::stats::histogram;
 use robo_core::{CubeFace, Frame, Recognizer, Roi};
 
 const FACE_NAMES: [char; 6] = ['U', 'R', 'F', 'D', 'L', 'B'];
-const CENTER_ORIGINAL_ROI_INDICES: [usize; 6] = [31, 40, 22, 13, 4, 49];
+// Authoritative face → 9 ROI indices mapping mirrors the legacy
+// RubiksCubeSolver `map[]`/`table[]` pair. Order is U, R, F, D, L, B; each
+// face lists the click indices (0..53 in user-marking order) that feed solver
+// facelet slots X1..X9 in row-major.
+const CENTER_ORIGINAL_ROI_INDICES: [usize; 6] = [49, 40, 31, 22, 4, 13];
 const SOLVER_FACELET_ORIGINAL_ROI_INDICES: [usize; 54] = [
-    29, 32, 35, 28, 31, 34, 27, 30, 33, 36, 37, 38, 39, 40, 41, 42, 43, 44, 20, 23, 26, 19, 22, 25,
-    18, 21, 24, 11, 14, 17, 10, 13, 16, 9, 12, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 45, 46, 47, 48, 49,
-    50, 51, 52, 53,
+    53, 52, 51, 50, 49, 48, 47, 46, 45, 38, 41, 44, 37, 40, 43, 36, 39, 42, 29, 32, 35, 28, 31, 34,
+    27, 30, 33, 20, 23, 26, 19, 22, 25, 18, 21, 24, 6, 3, 0, 7, 4, 1, 8, 5, 2, 15, 12, 9, 16, 13,
+    10, 17, 14, 11,
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -284,13 +288,13 @@ mod tests {
 
     #[test]
     fn exposes_original_roi_labels_and_center_indices() {
-        assert_eq!(original_roi_label(31).unwrap(), "U5");
+        assert_eq!(original_roi_label(49).unwrap(), "U5");
         assert_eq!(original_roi_label(40).unwrap(), "R5");
-        assert_eq!(original_roi_label(22).unwrap(), "F5");
-        assert_eq!(original_roi_label(13).unwrap(), "D5");
+        assert_eq!(original_roi_label(31).unwrap(), "F5");
+        assert_eq!(original_roi_label(22).unwrap(), "D5");
         assert_eq!(original_roi_label(4).unwrap(), "L5");
-        assert_eq!(original_roi_label(49).unwrap(), "B5");
-        assert_eq!(center_original_roi_indices(), [31, 40, 22, 13, 4, 49]);
+        assert_eq!(original_roi_label(13).unwrap(), "B5");
+        assert_eq!(center_original_roi_indices(), [49, 40, 31, 22, 4, 13]);
     }
 
     #[test]
@@ -317,16 +321,16 @@ mod tests {
         let details = recognize_original_roi_details(&frame, &rois).unwrap();
 
         assert_eq!(details.facelets, SOLVED_FACE);
-        assert_eq!(details.classes[31], 0);
-        assert_eq!(details.labels[31], "U");
+        assert_eq!(details.classes[49], 0);
+        assert_eq!(details.labels[49], "U");
         assert_eq!(details.center_colors[0], [240.0, 240.0, 240.0]);
-        assert_eq!(details.sample_colors[31], [240.0, 240.0, 240.0]);
+        assert_eq!(details.sample_colors[49], [240.0, 240.0, 240.0]);
     }
 
     #[test]
     fn samples_diagnostic_details_when_color_counts_are_invalid() {
         let mut colors = original_roi_order_solved_colors();
-        colors[0] = colors[31];
+        colors[0] = colors[49];
         let frame = Frame::new_rgb(
             colors.len() as u32,
             1,
@@ -363,10 +367,10 @@ mod tests {
             (b'B', [40, 80, 220]),
         ];
         let labels = [
-            b'L', b'L', b'L', b'L', b'L', b'L', b'L', b'L', b'L', b'D', b'D', b'D', b'D', b'D',
-            b'D', b'D', b'D', b'D', b'F', b'F', b'F', b'F', b'F', b'F', b'F', b'F', b'F', b'U',
-            b'U', b'U', b'U', b'U', b'U', b'U', b'U', b'U', b'R', b'R', b'R', b'R', b'R', b'R',
-            b'R', b'R', b'R', b'B', b'B', b'B', b'B', b'B', b'B', b'B', b'B', b'B',
+            b'L', b'L', b'L', b'L', b'L', b'L', b'L', b'L', b'L', b'B', b'B', b'B', b'B', b'B',
+            b'B', b'B', b'B', b'B', b'D', b'D', b'D', b'D', b'D', b'D', b'D', b'D', b'D', b'F',
+            b'F', b'F', b'F', b'F', b'F', b'F', b'F', b'F', b'R', b'R', b'R', b'R', b'R', b'R',
+            b'R', b'R', b'R', b'U', b'U', b'U', b'U', b'U', b'U', b'U', b'U', b'U',
         ];
         labels.map(|label| {
             face_colors
@@ -378,8 +382,8 @@ mod tests {
 
     fn original_roi_order_solved_classes() -> [u8; 54] {
         [
-            4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+            4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2,
+            2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ]
     }
 }

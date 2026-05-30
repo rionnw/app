@@ -30,17 +30,17 @@ ROI_DRAW_SIZE = 15  # 标注时绘制的 ROI 边框大小
 # ROI 到 solver facelet 的映射（从 Rust robo-vision 中的 SOLVER_FACELET_ORIGINAL_ROI_INDICES）
 # solver_facelet[i] 的颜色来自 original_roi[SOLVER_FACELET_ORIGINAL_ROI_INDICES[i]]
 SOLVER_FACELET_ORIGINAL_ROI_INDICES = [
-    29, 32, 35, 28, 31, 34, 27, 30, 33,  # U face
-    36, 37, 38, 39, 40, 41, 42, 43, 44,  # R face
-    20, 23, 26, 19, 22, 25, 18, 21, 24,  # F face
-    11, 14, 17, 10, 13, 16,  9, 12, 15,  # D face
-     0,  1,  2,  3,  4,  5,  6,  7,  8,  # L face
-    45, 46, 47, 48, 49, 50, 51, 52, 53,  # B face
+    53, 52, 51, 50, 49, 48, 47, 46, 45,  # U face
+    38, 41, 44, 37, 40, 43, 36, 39, 42,  # R face
+    29, 32, 35, 28, 31, 34, 27, 30, 33,  # F face
+    20, 23, 26, 19, 22, 25, 18, 21, 24,  # D face
+     6,  3,  0,  7,  4,  1,  8,  5,  2,  # L face
+    15, 12,  9, 16, 13, 10, 17, 14, 11,  # B face
 ]
 
 # 6 个中心色块在 original ROI 中的索引（从 Rust CENTER_ORIGINAL_ROI_INDICES）
 # 顺序: U, R, F, D, L, B 面的中心
-CENTER_ORIGINAL_ROI_IDS = [31, 40, 22, 13, 4, 49]
+CENTER_ORIGINAL_ROI_IDS = [49, 40, 31, 22, 4, 13]
 
 # 自适应过滤参数
 PERCENTILE_LOW = 5
