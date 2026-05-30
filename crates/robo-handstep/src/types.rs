@@ -37,23 +37,49 @@ pub const RO: i32 = 9;
 pub const CLOSE: i32 = 0;
 pub const OPEN: i32 = 1;
 
-// 运动时间常量（HandStep.h:14-30）
-pub const HAND_CLOSE_TIME: i32 = 300;
-pub const HAND_OPEN_TIME: i32 = 300;
-pub const HAND_MOVE_90: i32 = 300;
-pub const HAND_MOVE_180: i32 = 300;
-#[allow(dead_code)]
-pub const DELAY_BETWEEN_2_STEP: i32 = 200;
-
-pub const TIME_AIR: i32 = 120;
-pub const TIM_KZ90: i32 = 53;
-pub const TIM_ND90: i32 = 54;
-pub const TIM_ND180: i32 = 90;
-pub const TIM_DD90: i32 = 122;
-pub const TIM_DD180: i32 = 194;
-
 /// 与 C 端 moveStr[10] 完全一致（HandStep.h:11）
 pub const MOVE_STR: [&str; 10] = ["4", "3", "2", "0", "1", "9", "8", "7", "5", "6"];
+
+// ===== 时间成本配置（DFS 目标函数）=====
+//
+// 这些值是 DFS 用来比较"哪个变体更优"的成本权重。原始数值来自 C 端
+// `RobotApp/HandStep.h:25-30`（`Time_Air / Tim_KZ90 / Tim_ND90 / ...`），
+// 单位约为毫秒（与 motorControl 的加减速曲线总时长有关，未严格校准）。
+//
+// 物理含义：
+//   air_open ：气缸"开爪"动作耗时（LO/RO 各加一次）。
+//              注意：C 端 LC/RC（关爪）不加 cost，沿用之；如需修正
+//              另外加 `air_close` 字段。
+//   nd90/180 ：双爪都闭合时拧动一爪（带魔方层）的纯机械时间。
+//   kz90     ：本爪开（空转）+ 对侧闭（维持），转 90°。
+//   dd90/180 ：本爪闭（夹魔方）+ 对侧开（被带），即一爪带动整方。
+//
+// 字段公开 + Engine::with_cost 可注入，便于在前端调参后比较 DFS 结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CostModel {
+    pub air_open: i32,  // LO / RO
+    pub kz90: i32,      // 空转 90°
+    pub nd90: i32,      // 拧动 90°
+    pub nd180: i32,     // 拧动 180°
+    pub dd90: i32,      // 带动 90°
+    pub dd180: i32,     // 带动 180°
+}
+
+impl CostModel {
+    /// C 端 HandStep.h:25-30 的默认值。
+    pub const DEFAULT: Self = Self {
+        air_open: 120,
+        kz90: 53,
+        nd90: 54,
+        nd180: 90,
+        dd90: 122,
+        dd180: 194,
+    };
+}
+
+impl Default for CostModel {
+    fn default() -> Self { Self::DEFAULT }
+}
 
 // ===== 数据结构 =====
 
@@ -109,21 +135,24 @@ pub struct TheoryStep {
     pub distance: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MechanicalStep {
-    pub time: i32,
-    pub num: i32, // -1 表示 M_END
-}
+/// 单步动作的 num（0..=9，对应 L1/L2/L3/LC/LO/R1/R2/R3/RC/RO）；
+/// `-1` 表示 sentinel（C 端 M_END）。
+///
+/// 原 C 端 `MechanicalStep` 还带一个 `time` 字段（`HandMove90` 等 300 常数），
+/// 但在 RobotApp 全工程内只写不读、DFS 也不依赖（DFS 用 `MechanicalGroup::time`
+/// 整组累加值）。Rust 端把它退化成 `i8` 直接存动作 num，节省内存 + 提升 cache
+/// 友好度。详见 docs §5.x。
+pub type StepNum = i8;
 
-/// 与 RobotStep.h:103 的 MechanicalGroup 等价。
-/// `Steps` 长度按 C 端的 20 位（含 -1 终止）。
+/// 与 RobotStep.h:103 的 MechanicalGroup 等价（剔除 `MechanicalStep::time`）。
+/// `steps` 长度按 C 端的 20 位（含 `-1` 终止）。
 #[derive(Clone, Copy, Debug)]
 pub struct MechanicalGroup {
     pub time: i32,
     pub step_num: i32,
     pub rot: Rot,
     pub end_hand_state: HandState,
-    pub steps: [MechanicalStep; 20],
+    pub steps: [StepNum; 20],
 }
 
 impl Default for MechanicalGroup {
@@ -133,27 +162,28 @@ impl Default for MechanicalGroup {
             step_num: 0,
             rot: Rot::default(),
             end_hand_state: HandState::default(),
-            steps: [MechanicalStep { time: 0, num: -1 }; 20],
+            steps: [-1; 20],
         }
     }
 }
 
 impl MechanicalGroup {
-    /// C 端 MechanicalGroup::Set，遇到 num == -1 时停止并写入 M_END。
-    pub fn set(&mut self, step_num: i32, src_steps: &[MechanicalStep; 20], rot: Rot, hs: HandState) {
+    /// C 端 `MechanicalGroup::Set`，遇到 `num == -1` 时停止并写入 sentinel。
+    pub fn set(&mut self, step_num: i32, src_steps: &[StepNum; 20], rot: Rot, hs: HandState) {
         self.step_num = step_num;
         self.rot = rot;
         self.end_hand_state = hs;
         let mut i = 0usize;
         while i < 20 {
-            // C 端用 name == "M_END" 作为终止；这里用 num == -1（M_END.num = -1）。
-            if src_steps[i].num == -1 {
+            if src_steps[i] == -1 {
                 break;
             }
             self.steps[i] = src_steps[i];
             i += 1;
         }
-        self.steps[i] = MechanicalStep { time: 0, num: -1 };
+        if i < 20 {
+            self.steps[i] = -1;
+        }
     }
 }
 

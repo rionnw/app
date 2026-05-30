@@ -59,29 +59,28 @@ fn lib_index(face: usize, dist: usize, state: usize, variant: usize) -> usize {
 }
 
 fn build_mech_lib() -> Box<[MechanicalGroup; MECH_LIB_SIZE]> {
-    // 模板单步（对应 RobotStepsInit）
-    let m_step_times = [
-        HAND_MOVE_90, HAND_MOVE_180, HAND_MOVE_90, HAND_CLOSE_TIME, HAND_OPEN_TIME,
-        HAND_MOVE_90, HAND_MOVE_180, HAND_MOVE_90, HAND_CLOSE_TIME, HAND_OPEN_TIME,
-    ];
-    let m_steps_template: [MechanicalStep; 10] = std::array::from_fn(|i| MechanicalStep {
-        time: m_step_times[i],
-        num: i as i32,
-    });
-    let m_end = MechanicalStep { time: 0, num: -1 };
+    build_mech_lib_with(CostModel::DEFAULT)
+}
 
+/// `build_mech_lib` 带可注入 cost 的版本，用于"前端调参后重新生成操作库"。
+///
+/// 注：MECH_LIB 是静态 OnceLock，运行时切换 cost 需要绕过它（提供独立
+/// `Engine::with_cost` 持有自己的 lib，不污染全局）。这里先把构造函数
+/// 拆分出来，给上层选择灵活性。
+pub fn build_mech_lib_with(cost: CostModel) -> Box<[MechanicalGroup; MECH_LIB_SIZE]> {
     // 1. 先按 OP_TABLE 填充
     let mut lib_vec: Vec<MechanicalGroup> = vec![MechanicalGroup::default(); MECH_LIB_SIZE];
 
     for idx in 0..op_table::OP_TABLE_SIZE {
         let e = op_table::OP_TABLE[idx];
-        let mut tmp_steps = [MechanicalStep { time: 0, num: -1 }; 20];
+        // OP_TABLE.steps 已经是 num 值（i32），直接转 i8 拷贝；
+        // -1 sentinel 自然带过去（i32::-1 == i8::-1）。
+        let mut tmp_steps: [StepNum; 20] = [-1; 20];
         for i in 0..20 {
+            tmp_steps[i] = e.steps[i] as StepNum;
             if e.steps[i] == -1 {
-                tmp_steps[i] = m_end;
                 break;
             }
-            tmp_steps[i] = m_steps_template[e.steps[i] as usize];
         }
         let mut rot = Rot::default();
         rot.set(
@@ -115,54 +114,54 @@ fn build_mech_lib() -> Box<[MechanicalGroup; MECH_LIB_SIZE]> {
                     let mut left_hand = CLOSE;
                     let mut right_hand = CLOSE;
                     let mut m = 0usize;
-                    while group.steps[m].num != -1 {
-                        let num = group.steps[m].num;
+                    while group.steps[m] != -1 {
+                        let num = group.steps[m] as i32;
                         // 气缸开合
                         if num == LO {
                             left_hand = OPEN;
-                            group.time += TIME_AIR;
+                            group.time += cost.air_open;
                         } else if num == LC {
                             left_hand = CLOSE;
                         } else if num == RO {
                             right_hand = OPEN;
-                            group.time += TIME_AIR;
+                            group.time += cost.air_open;
                         } else if num == RC {
                             right_hand = CLOSE;
                         }
                         // 拧动 ND（双爪都 CLOSE）
                         else if right_hand == CLOSE && left_hand == CLOSE {
                             if num == L2 || num == R2 {
-                                group.time += TIM_ND180;
+                                group.time += cost.nd180;
                             } else {
-                                group.time += TIM_ND90;
+                                group.time += cost.nd90;
                             }
                         }
                         // 左手转动：根据自身爪状态分流
                         else if num == L1 || num == L3 {
                             if left_hand == OPEN && right_hand == CLOSE {
                                 // 左爪开 = 空转
-                                group.time += TIM_KZ90;
+                                group.time += cost.kz90;
                             } else if left_hand == CLOSE && right_hand == OPEN {
                                 // 左爪闭夹魔方 + 右爪开被带 = 带动 90
-                                group.time += TIM_DD90;
+                                group.time += cost.dd90;
                             }
                             // 其它组合（双开）物理上不会出现
                         } else if num == L2 {
                             // L2 在双闭已被上面分支吃掉；此处只可能是 CLOSE/OPEN
                             if left_hand == CLOSE && right_hand == OPEN {
-                                group.time += TIM_DD180;
+                                group.time += cost.dd180;
                             }
                         }
                         // 右手转动：对称
                         else if num == R1 || num == R3 {
                             if right_hand == OPEN && left_hand == CLOSE {
-                                group.time += TIM_KZ90;
+                                group.time += cost.kz90;
                             } else if right_hand == CLOSE && left_hand == OPEN {
-                                group.time += TIM_DD90;
+                                group.time += cost.dd90;
                             }
                         } else if num == R2 {
                             if right_hand == CLOSE && left_hand == OPEN {
-                                group.time += TIM_DD180;
+                                group.time += cost.dd180;
                             }
                         }
                         m += 1;
@@ -199,12 +198,12 @@ pub struct Engine {
     g_theory_steps2: [[TheoryStep; 25]; 2],
     g_cube_rot: Rot,
     g_hand_state: HandState,
-    g_mov_buff: [[i32; MOV_BUF_SIZE]; 2],
+    g_mov_buff: [[StepNum; MOV_BUF_SIZE]; 2],
 
     // ===== Dfs 存储变量 =====
     s_time: [i32; 2],
     s_step_num: [i32; 2],
-    s_mov_buff: [[i32; MOV_BUF_SIZE]; 2],
+    s_mov_buff: [[StepNum; MOV_BUF_SIZE]; 2],
     s_hand_state: [HandState; 2],
     s_rot: [Rot; 2],
 
@@ -401,7 +400,7 @@ impl Engine {
     pub fn get_steps(&self) -> String {
         let mut robot_steps = String::new();
         for i in 0..self.s_step_num[0] as usize {
-            let num = self.s_mov_buff[0][i];
+            let num = self.s_mov_buff[0][i] as i32;
             if num < 0 || num >= 10 {
                 break;
             }
@@ -501,9 +500,10 @@ impl Engine {
                 self.g_step_num[state] = temp_step_num;
                 continue;
             }
-            for _i in 0..step_num_to_copy {
-                self.g_mov_buff[state][base + _i] = group.steps[_i].num;
-            }
+            // 整段 copy_from_slice，编译器可识别为 SIMD memcpy
+            // （steps 已是 [i8; 20]，类型直接匹配 g_mov_buff 元素类型）。
+            self.g_mov_buff[state][base..base + step_num_to_copy]
+                .copy_from_slice(&group.steps[..step_num_to_copy]);
             self.g_step_num[state] += group.step_num;
 
             // 查看此结果在此深度下有没有发生过
@@ -650,7 +650,7 @@ mod tests {
         // 检查至少有一个非默认值的 group
         let g = e.lib(F, _1, L_0_R_0, 0);
         assert_eq!(g.step_num, 1);
-        assert_eq!(g.steps[0].num, L1);
+        assert_eq!(g.steps[0] as i32, L1);
     }
 
     #[test]
