@@ -1,26 +1,31 @@
 //! solve-server: min2phase HTTP API server
 //!
-//! Implements the API defined in http-api.md.
-//! Endpoints: GET /v1/health, POST /v1/verify, POST /v1/solve2l
+//! 求解路径：`robo_pipeline::translate_optimal`，即 `robo_solver::search::Search`
+//! 多候选 + handstep 翻译择 mech 最短。**不再使用 Search2L**：
+//! `/v1/solve` 和 `/v1/solve2l` 现在行为等价（都走 Search 路径），
+//! 后者保留是为了向后兼容旧 API 客户端。
+//!
+//! 端点：GET /v1/health, POST /v1/verify, POST /v1/solve, POST /v1/solve2l
 //!
 //! Usage:
 //!   solve-server [--host 127.0.0.1] [--port 8080]
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use robo_core::{CubeFace, Solver, Translator};
-use robo_solver::Min2PhaseSolver;
-use robo_translator::BasicTranslator;
+use robo_core::CubeFace;
+use robo_pipeline::multi::translate_optimal;
+use robo_solver::search::{Search, SearchOptions};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 // ===== State =====
 
 struct AppState {
-    solver: Mutex<Option<Min2PhaseSolver>>,
+    /// 求解表是否已初始化完成。pipeline 是 stateless，只需要 Search::init()
+    /// 跑过一次即可（内部 OnceLock 全局表）。
     ready: AtomicBool,
 }
 
@@ -81,17 +86,30 @@ struct VerifyDetail {
 struct SolveResponse {
     ok: bool,
     status: &'static str,
+    /// Kociemba face 序列字符串（如 "R2 F' D2 ..."）
     #[serde(skip_serializing_if = "Option::is_none")]
     solution: Option<String>,
+    /// face 数量（kociemba 长度）
     length: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     facelets: Option<String>,
+    /// 机械步骤 mnemonic 列表（M_L1 / M_R3 / ...）
     #[serde(skip_serializing_if = "Option::is_none")]
     hardware_commands: Option<Vec<String>>,
+    /// 机械步骤数字编码（默认 digit map）
     #[serde(skip_serializing_if = "Option::is_none")]
     encoded_steps: Option<String>,
+    /// 最终选中候选的机械步数（pipeline 已最小化）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mech_steps: Option<i32>,
+    /// solver 阶段耗时（毫秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_elapsed_ms: Option<u64>,
+    /// solver 产出的候选数量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_count: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -118,17 +136,15 @@ fn main() {
     let bind = format!("{host}:{port}");
 
     let state = Arc::new(AppState {
-        solver: Mutex::new(None),
         ready: AtomicBool::new(false),
     });
 
-    // Init solver in background
+    // Init solver tables in background
     let state_init = Arc::clone(&state);
     thread::spawn(move || {
         log::info!("正在初始化 solver 表...");
         let t0 = Instant::now();
-        let solver = Min2PhaseSolver::new();
-        *state_init.solver.lock().unwrap() = Some(solver);
+        Search::init();
         state_init.ready.store(true, Ordering::Release);
         log::info!("Solver 初始化完成 ({:.2}s)", t0.elapsed().as_secs_f64());
     });
@@ -187,7 +203,8 @@ fn handle_health(request: Request, state: &AppState) {
         ready,
         tables: TablesStatus {
             search: ready,
-            search2l: ready,
+            // 已不再使用 Search2L；保留字段为 false 让旧 client 看到改动而不崩溃
+            search2l: false,
         },
     };
     respond_json(request, 200, &resp);
@@ -307,39 +324,46 @@ fn handle_solve(mut request: Request, state: &AppState, _use_2l: bool) {
                 facelets: Some(facelets),
                 hardware_commands: None,
                 encoded_steps: None,
+                mech_steps: None,
+                search_elapsed_ms: None,
+                candidate_count: None,
             };
             respond_json(request, 200, &resp);
             return;
         }
     };
 
-    // Solve
-    let solver_guard = state.solver.lock().unwrap();
-    let solver = solver_guard.as_ref().unwrap();
+    // 求解：100ms / max=∞ / slack=0（实测 mech 平均 68.9，与 300ms 旧基线持平，
+    // solver 100ms 严格用满）。SolveOptions 字段（max_depth/probe_*）暂不暴露
+    // 给客户端覆盖，行为统一可控。
+    let opts = SearchOptions {
+        timeout: Duration::from_millis(100),
+        max_solutions: usize::MAX,
+        length_slack: 0,
+        ..Default::default()
+    };
 
-    let result = solver.solve(&face);
+    match translate_optimal(face.as_str(), opts) {
+        Ok(res) => {
+            let solution_str = res.best.kociemba.clone();
+            let length = solution_str.split_whitespace().count() as i32;
 
-    match result {
-        Ok(moves) => {
-            let solution_str = moves.to_solution_string();
-            let move_count = moves.as_slice().iter().filter(|m| !m.trim().is_empty()).count();
-
-            // Translate to hardware commands
-            let translator = BasicTranslator::new();
-            let (hw_cmds, encoded) = match translator.translate(&moves) {
-                Ok(steps) => (Some(steps.commands), Some(steps.encoded)),
-                Err(_) => (None, None),
-            };
+            // mech_encoded 用 handstep 默认 digit map（与 BasicTranslator 默认一致）
+            // 反查得到 mnemonic 列表
+            let hardware_commands = decode_to_mnemonics(&res.best.mech_encoded);
 
             let resp = SolveResponse {
                 ok: true,
                 status: "ok",
                 solution: Some(solution_str),
-                length: move_count as i32,
+                length,
                 message: None,
                 facelets: Some(facelets),
-                hardware_commands: hw_cmds,
-                encoded_steps: encoded,
+                hardware_commands: Some(hardware_commands),
+                encoded_steps: Some(res.best.mech_encoded.clone()),
+                mech_steps: Some(res.best.mech_steps),
+                search_elapsed_ms: Some(res.solver_elapsed.as_millis() as u64),
+                candidate_count: Some(res.candidates.len()),
             };
             respond_json(request, 200, &resp);
         }
@@ -353,10 +377,32 @@ fn handle_solve(mut request: Request, state: &AppState, _use_2l: bool) {
                 facelets: Some(facelets),
                 hardware_commands: None,
                 encoded_steps: None,
+                mech_steps: None,
+                search_elapsed_ms: None,
+                candidate_count: None,
             };
             respond_json(request, 200, &resp);
         }
     }
+}
+
+/// 把 handstep 输出的"默认 digit map 编码字符串"反查成 mnemonic 列表。
+///
+/// handstep `MOVE_STR = ["4","3","2","0","1","9","8","7","5","6"]` 与
+/// 助记符 `["M_L1","M_L2","M_L3","M_LC","M_LO","M_R1","M_R2","M_R3","M_RC","M_RO"]`
+/// 一一对应（顺序固定，无需引入 robo-translator）。
+const HARDWARE_MNEMONICS: [&str; 10] = [
+    "M_L1", "M_L2", "M_L3", "M_LC", "M_LO", "M_R1", "M_R2", "M_R3", "M_RC", "M_RO",
+];
+const HARDWARE_DIGITS: [char; 10] = ['4', '3', '2', '0', '1', '9', '8', '7', '5', '6'];
+
+fn decode_to_mnemonics(encoded: &str) -> Vec<String> {
+    encoded
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .filter_map(|c| HARDWARE_DIGITS.iter().position(|d| *d == c))
+        .map(|i| HARDWARE_MNEMONICS[i].to_string())
+        .collect()
 }
 
 // ===== Helpers =====

@@ -35,4 +35,5 @@ robo-solver = { path = "../crates/robo-solver" }
 robo-translator = { path = "../crates/robo-translator" }
 robo-transport = { path = "../crates/robo-transport" }
 robo-vision = { path = "../crates/robo-vision" }
+robo-pipeline = { path = "../crates/robo-pipeline" }
 serialport = "4.9"

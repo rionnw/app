@@ -18,9 +18,10 @@ use robo_camera::{
     CameraSlotWorkerEvent, CameraStatusEventKind, FramePacket, MultiCameraCapture,
     MultiCameraSource,
 };
-use robo_core::{CubeFace, Frame, Recognizer, Roi, Solver, Steps, Translator, Transport};
-use robo_solver::Min2PhaseSolver;
-use robo_translator::{default_digit_map, BasicTranslator, DigitMap, MNEMONICS, MOVE_COUNT};
+use robo_core::{CubeFace, Frame, Recognizer, Roi, Steps, Transport};
+use robo_pipeline::multi::translate_optimal;
+use robo_solver::search::{Search, SearchOptions};
+use robo_translator::{default_digit_map, DigitMap, DEFAULT_DIGIT_MAP, MNEMONICS, MOVE_COUNT};
 use robo_transport::SerialTransport;
 use robo_vision::ColorClusterRecognizer;
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,8 @@ struct AppState {
     discovery_cache: Mutex<DiscoveryCache>,
     frame_server_port: u16,
     mode: RuntimeMode,
-    solver: Arc<std::sync::OnceLock<Min2PhaseSolver>>,
+    /// 求解表就绪标志（`Search::init()` 完成后 set；前端等待此标志再 invoke 求解命令）
+    solver: Arc<std::sync::OnceLock<()>>,
     /// 动作 → 下位机数字映射（commands 用 mnemonic，encoded 用此映射）
     digit_map: Mutex<DigitMap>,
 }
@@ -1559,9 +1561,18 @@ impl Transport for MockSerialTransport {
 #[derive(Debug, Serialize)]
 struct SolveFaceletsResponse {
     facelets: String,
+    /// Kociemba face 序列（如 "R2 F' D2 ..."）
     moves: Vec<String>,
+    /// 机械步骤助记符（M_L1 / M_R3 / ...），按 user digit_map 重映射后的顺序
     steps: Vec<String>,
+    /// 机械步骤的最终编码字符串（按 user digit_map）
     encoded_steps: String,
+    /// solver 阶段耗时（毫秒）
+    search_elapsed_ms: u64,
+    /// 最终选中候选的机械步数（pipeline 已按此最小化）
+    mech_steps: i32,
+    /// solver 产出的候选数量（≥1）
+    candidate_count: usize,
 }
 
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -1904,14 +1915,14 @@ fn solve_current_frame(
     state: tauri::State<'_, AppState>,
     rois: Vec<RoiDto>,
 ) -> Result<SolveFaceletsResponse, String> {
-    let solver = state.solver.get().ok_or("solver 尚未初始化完成")?;
+    state.solver.get().ok_or("solver 尚未初始化完成")?;
     let capture = capture_from_state(&state).map_err(|err| err.to_string())?;
     let rois = rois.into_iter().map(Roi::from).collect::<Vec<_>>();
     let recognizer = ColorClusterRecognizer;
     let face = recognizer
         .recognize(&capture.frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face, solver, current_digit_map(&state))
+    solve_face(face, current_digit_map(&state))
 }
 
 #[tauri::command]
@@ -1919,7 +1930,7 @@ fn solve_latest_frame(
     state: tauri::State<'_, AppState>,
     rois: Vec<RoiDto>,
 ) -> Result<SolveFaceletsResponse, String> {
-    let solver = state.solver.get().ok_or("solver 尚未初始化完成")?;
+    state.solver.get().ok_or("solver 尚未初始化完成")?;
     let frame = state
         .stream_hub
         .latest_grid_rgb()
@@ -1929,7 +1940,7 @@ fn solve_latest_frame(
     let face = recognizer
         .recognize(&frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face, solver, current_digit_map(&state))
+    solve_face(face, current_digit_map(&state))
 }
 
 #[tauri::command]
@@ -1938,21 +1949,21 @@ fn solve_image_file(
     image_data_url: String,
     rois: Vec<RoiDto>,
 ) -> Result<SolveFaceletsResponse, String> {
-    let solver = state.solver.get().ok_or("solver 尚未初始化完成")?;
+    state.solver.get().ok_or("solver 尚未初始化完成")?;
     let frame = decode_image_data_url(&image_data_url).map_err(|err| err.to_string())?;
     let rois = rois.into_iter().map(Roi::from).collect::<Vec<_>>();
     let recognizer = ColorClusterRecognizer;
     let face = recognizer
         .recognize(&frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face, solver, current_digit_map(&state))
+    solve_face(face, current_digit_map(&state))
 }
 
 #[tauri::command]
 fn solve_facelets(state: tauri::State<'_, AppState>, facelets: String) -> Result<SolveFaceletsResponse, String> {
-    let solver = state.solver.get().ok_or("solver 尚未初始化完成")?;
+    state.solver.get().ok_or("solver 尚未初始化完成")?;
     let face = CubeFace::new(facelets).map_err(|err| err.to_string())?;
-    solve_face(face, solver, current_digit_map(&state))
+    solve_face(face, current_digit_map(&state))
 }
 
 #[tauri::command]
@@ -2044,21 +2055,75 @@ fn read_serial(state: tauri::State<'_, AppState>) -> Result<SerialReadResponse, 
 
 fn solve_face(
     face: CubeFace,
-    solver: &Min2PhaseSolver,
     digit_map: DigitMap,
 ) -> Result<SolveFaceletsResponse, String> {
-    let translator = BasicTranslator::with_digit_map(digit_map);
-    let moves = solver.solve(&face).map_err(|err| err.to_string())?;
-    let steps = translator
-        .translate(&moves)
-        .map_err(|err| err.to_string())?;
+    // 求解参数：100ms / max=∞ / slack=0
+    // 实测 50 cube benchmark：mech 平均 68.9，solver 100ms 严格用满，
+    // 比旧 300ms/max=8 配置 mech 持平且延迟降到 1/3。
+    let opts = SearchOptions {
+        timeout: Duration::from_millis(100),
+        max_solutions: usize::MAX,
+        length_slack: 0,
+        ..Default::default()
+    };
+    let res = translate_optimal(face.as_str(), opts).map_err(|err| err.to_string())?;
+
+    // res.best.kociemba: "R2 F' D2 ..." (face 序列)
+    // res.best.mech_encoded: "4147094..." (handstep 默认映射下的数字串)
+    // 把 handstep 默认编码 → mnemonic 索引 → user digit_map 重新编码。
+    let (steps, encoded_steps) = remap_handstep_output(&res.best.mech_encoded, &digit_map);
+    let moves: Vec<String> = res
+        .best
+        .kociemba
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+
+    log::info!(
+        "solve: facelets={} → {}f kociemba, mech={} steps, solver={}ms ({} 候选, timed_out={})",
+        face.as_str(),
+        moves.len(),
+        res.best.mech_steps,
+        res.solver_elapsed.as_millis(),
+        res.candidates.len(),
+        res.solver_timed_out,
+    );
 
     Ok(SolveFaceletsResponse {
         facelets: face.into_string(),
-        moves: moves.0,
-        steps: steps.commands,
-        encoded_steps: steps.encoded,
+        moves,
+        steps,
+        encoded_steps,
+        search_elapsed_ms: res.solver_elapsed.as_millis() as u64,
+        mech_steps: res.best.mech_steps,
+        candidate_count: res.candidates.len(),
     })
+}
+
+/// 把 handstep 输出的"默认 digit_map 编码字符串"翻译成
+/// (mnemonic 助记符列表, user digit_map 编码字符串)。
+///
+/// handstep `MOVE_STR` 与 `robo_translator::DEFAULT_DIGIT_MAP` 字面值
+/// 一致（都是 `["4","3","2","0","1","9","8","7","5","6"]`），所以可以
+/// 用 `DEFAULT_DIGIT_MAP` 反查每个字符对应的 mnemonic 索引。
+fn remap_handstep_output(mech_encoded: &str, digit_map: &DigitMap) -> (Vec<String>, String) {
+    let mut commands: Vec<String> = Vec::with_capacity(mech_encoded.len());
+    let mut encoded = String::with_capacity(mech_encoded.len() * 2);
+    for ch in mech_encoded.chars() {
+        // 跳过空白；正常 handstep 输出全是 0-9
+        if ch.is_whitespace() {
+            continue;
+        }
+        let buf = [ch as u8];
+        let s = std::str::from_utf8(&buf).unwrap_or("");
+        if let Some(idx) = DEFAULT_DIGIT_MAP.iter().position(|d| *d == s) {
+            commands.push(MNEMONICS[idx].to_string());
+            encoded.push_str(&digit_map[idx]);
+        } else {
+            log::warn!("handstep 输出含非法字符 {:?}（来自 {:?}）", ch, mech_encoded);
+        }
+    }
+    (commands, encoded)
 }
 
 fn current_digit_map(state: &AppState) -> DigitMap {
@@ -2678,10 +2743,15 @@ pub fn run() {
             }
 
             thread::spawn(move || {
-                let solver = Min2PhaseSolver::new();
-                let _ = solver_lock.set(solver);
+                // 触发 robo-solver 内部 coord/cubie 表的懒加载。
+                // 第一次跑 ~几十 ms（依机器而定），之后 translate_optimal 的
+                // 每次首搜 ~1-50 ms。handstep::Engine 是 per-call 创建（~500 ns），
+                // 其全局 MECH_LIB 也是 OnceLock，第一次 translate_optimal 内会
+                // 触发；这里不显式预热，让首次解算多花 < 1 ms 可接受。
+                Search::init();
+                let _ = solver_lock.set(());
                 let _ = handle.emit("solver-ready", ());
-                log::info!("solver 初始化完成");
+                log::info!("solver 初始化完成（min2phase Search + handstep 多候选择优）");
             });
             Ok(())
         })

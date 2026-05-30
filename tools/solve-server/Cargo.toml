@@ -2,7 +2,7 @@
 name = "solve-server"
 version = "0.1.0"
 edition = "2021"
-description = "HTTP API server for min2phase cube solver (Search & Search2L)"
+description = "HTTP API server for min2phase cube solver (Search + handstep multi-candidate optimal)"
 
 [[bin]]
 name = "solve-server"
@@ -17,4 +17,4 @@ log = "0.4"
 env_logger = "0.11"
 robo-core = { path = "../../crates/robo-core" }
 robo-solver = { path = "../../crates/robo-solver" }
-robo-translator = { path = "../../crates/robo-translator" }
+robo-pipeline = { path = "../../crates/robo-pipeline" }
