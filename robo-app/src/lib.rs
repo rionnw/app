@@ -766,6 +766,36 @@ impl CameraStreamWorker {
     }
 }
 
+impl CameraStreamRuntime {
+    /// 流式预览模式下读取相机控制参数：直接走 CameraSlotWorker 的 control channel
+    /// （capture loop 间隙处理），无需关闭流就能拿到当前生效的硬件参数值。
+    fn controls(&self, slot: usize) -> Result<Vec<robo_camera::CameraControlInfo>> {
+        let worker = self
+            .workers
+            .get(slot)
+            .with_context(|| format!("camera stream slot {slot} does not exist"))?;
+        match worker {
+            CameraStreamWorker::Real(worker) => worker.controls(),
+            CameraStreamWorker::Mock(_) => {
+                anyhow::bail!("mock stream slot does not support real camera controls")
+            }
+        }
+    }
+
+    fn set_control(&self, slot: usize, id: String, value: f64) -> Result<()> {
+        let worker = self
+            .workers
+            .get(slot)
+            .with_context(|| format!("camera stream slot {slot} does not exist"))?;
+        match worker {
+            CameraStreamWorker::Real(worker) => worker.set_control(id, value),
+            CameraStreamWorker::Mock(_) => {
+                anyhow::bail!("mock stream slot does not support real camera controls")
+            }
+        }
+    }
+}
+
 fn spawn_camera_stream_aggregator(
     hub: Arc<FrameHub>,
     session_id: u64,
@@ -1908,12 +1938,24 @@ fn list_camera_controls(
     state: tauri::State<'_, AppState>,
     slot: usize,
 ) -> Result<Vec<CameraControlDto>, String> {
+    // 路由：
+    // - mock 模式：走 mock_camera（不依赖任何硬件状态）；
+    // - 真机 + 流式预览运行中：走 CameraStreamRuntime（CameraSlotWorker 间隙处理），
+    //   不需要关闭相机就能读到当前硬件值；
+    // - 真机 + 仅 capture_frame 模式：走旧 CameraWorker。
     let controls = if state.mode.mock_camera {
         state
             .mock_camera
             .lock()
             .map_err(|_| "mock camera state is poisoned".to_string())?
             .controls(slot)
+    } else if let Some(runtime) = state
+        .camera_stream
+        .lock()
+        .map_err(|_| "camera stream state is poisoned".to_string())?
+        .as_ref()
+    {
+        runtime.controls(slot)
     } else {
         state
             .camera
@@ -1950,21 +1992,32 @@ fn set_camera_control(
     id: String,
     value: f64,
 ) -> Result<(), String> {
+    // 路由同 list_camera_controls：流式预览运行时直接通过 worker 的 control channel
+    // 写参数，与 capture loop 串行；不再要求用户先关相机。
     if state.mode.mock_camera {
-        state
+        return state
             .mock_camera
             .lock()
             .map_err(|_| "mock camera state is poisoned".to_string())?
             .set_control(slot, id, value)
-            .map_err(|err| err.to_string())
-    } else {
-        state
-            .camera
-            .lock()
-            .map_err(|_| "camera state is poisoned".to_string())?
-            .set_control(slot, id, value)
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string());
     }
+    if let Some(runtime) = state
+        .camera_stream
+        .lock()
+        .map_err(|_| "camera stream state is poisoned".to_string())?
+        .as_ref()
+    {
+        return runtime
+            .set_control(slot, id, value)
+            .map_err(|err| err.to_string());
+    }
+    state
+        .camera
+        .lock()
+        .map_err(|_| "camera state is poisoned".to_string())?
+        .set_control(slot, id, value)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]

@@ -278,7 +278,6 @@ function App() {
   const canvasPreviewFps = useMemo(() => resolveCanvasPreviewFps(maxConfiguredFps), [maxConfiguredFps]);
   const activeCameraConfig = cameraConfigs[controlSlot] ?? cameraConfigs[0];
   const slotParamsVisible = loadedControlSlot === controlSlot;
-  const cameraPositionLocked = slotParamsVisible;
   const activeCameraDevice = devices.find((device) => device.index === String(activeCameraConfig?.index ?? ""));
   const cameraProfileKey = useMemo(() => {
     if (!activeCameraDevice || !cameraFormats.length) return "";
@@ -365,9 +364,11 @@ function App() {
         addLog(`槽 ${slot + 1} 已读取相机格式；打开相机后可读取硬件控制参数。`);
         return;
       }
-      setCameraControls([]);
-      addLog("流式预览中暂不读取硬件控制参数；请关闭相机后再调整参数。", "warn");
-      return;
+      // 流式预览运行中也能读硬件控制参数：后端走 CameraSlotWorker 的 control channel，
+      // 在 capture 间隙读取，不需要关闭相机。
+      const controls = await invoke<CameraControl[]>("list_camera_controls", { slot });
+      setCameraControls(controls);
+      addLog(`已读取槽 ${slot + 1} 的相机控制参数（${controls.length} 项）。`);
     } catch (error) {
       setCameraControls([]);
       setCameraFormats([]);
@@ -619,9 +620,14 @@ function App() {
         if (canvas.height !== naturalSize.height) canvas.height = naturalSize.height;
         context.drawImage(drawable, 0, 0, naturalSize.width, naturalSize.height);
       } catch (error) {
+        // 相机刚启动 / 切换槽位的瞬时窗口里，stream_hub 还没接到第一帧，
+        // 后端会返 "no stream frame available"——这是预期，不刷屏到用户日志。
+        const message = String(error);
+        const isWarmup = message.includes("no stream frame available");
         const nowMs = performance.now();
         if (
           !stopped &&
+          !isWarmup &&
           shouldLogThrottledDiagnostic({
             nowMs,
             lastLoggedAtMs: lastCanvasFrameLogAtRef.current,
@@ -629,7 +635,7 @@ function App() {
           })
         ) {
           lastCanvasFrameLogAtRef.current = nowMs;
-          addDiagnosticLog(`画布预览帧失败：${String(error)}`, "warn");
+          addDiagnosticLog(`画布预览帧失败：${message}`, "warn");
         }
       } finally {
         bitmap?.close();
@@ -692,10 +698,6 @@ function App() {
   };
 
   const selectCameraSlot = async (slot: number) => {
-    if (cameraPositionLocked) {
-      addLog("参数调节界面打开时不能交换相机位置，请先切换或关闭参数面板。", "warn");
-      return;
-    }
     if (swapSlot === null) {
       setSwapSlot(slot);
       addLog(`已选择槽 ${slot + 1}，再点另一个槽进行互换。`);
@@ -709,6 +711,13 @@ function App() {
     [next[swapSlot], next[slot]] = [next[slot], next[swapSlot]];
     setCameraConfigs(next);
     setSwapSlot(null);
+    // 配置交换后流会被重启 → 当前展开的参数面板基于的是旧 slot 索引，
+    // 折叠面板让用户看到"重新读取"提示，避免误以为还在调旧设备。
+    if (loadedControlSlot !== null) {
+      setLoadedControlSlot(null);
+      setCameraControls([]);
+      setCameraFormats([]);
+    }
     await reopenIfNeeded(next);
   };
 
@@ -761,10 +770,7 @@ function App() {
   };
 
   const setCameraControlValue = async (control: CameraControl, value: number) => {
-    if (cameraOpen) {
-      addLog("流式预览中暂不写入硬件控制参数；请关闭相机后再调整参数。", "warn");
-      return;
-    }
+    // 乐观更新：先把 UI 滑块值切到 value，后端写参数失败时再 refresh 拉回真实值。
     setCameraControls((items) => items.map((item) => (item.id === control.id ? { ...item, value } : item)));
     try {
       await invoke("set_camera_control", { slot: controlSlot, id: control.id, value });
@@ -1505,8 +1511,7 @@ function App() {
                     className={`slot-button ${swapSlot === index ? "is-selected" : ""}`}
                     type="button"
                     key={index}
-                    disabled={cameraPositionLocked}
-                    title={cameraPositionLocked ? "参数调节界面打开时不能交换相机位置" : "点击两个槽位交换相机位置"}
+                    title="点击两个槽位交换相机位置；交换会自动重启相机流"
                     onClick={() => selectCameraSlot(index)}
                   >
                     <span>槽 {index + 1}</span>
@@ -1547,7 +1552,7 @@ function App() {
             </label>
             <p className="hint-line">
               {slotParamsVisible
-                ? `参数调节界面已打开，相机位置交换已锁定；当前最高配置 ${maxConfiguredFps} FPS。`
+                ? `参数调节界面已打开，调整后实时生效；当前最高配置 ${maxConfiguredFps} FPS。交换槽位会自动重启相机流并重置面板。`
                 : "点击读取后展开该槽位的 Index、分辨率、FPS 和可调参数；格式列表只显示 30 FPS 及以上的常用分辨率。"}
             </p>
             <div className="camera-profile">

@@ -251,9 +251,21 @@ pub enum CameraSlotWorkerEvent {
     Event(CameraStatusEvent),
 }
 
+/// Worker 间隙处理的控制面请求。capture loop 在每帧间检查一次，
+/// 复用同一 nokhwa 实例完成读/写——和 capture 串行化，避免锁竞争或线程冲突。
+pub enum CameraSlotControlRequest {
+    Controls(mpsc::Sender<Result<Vec<CameraControlInfo>, String>>),
+    SetControl {
+        id: String,
+        value: f64,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+}
+
 pub struct CameraSlotWorker {
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    control_tx: mpsc::Sender<CameraSlotControlRequest>,
 }
 
 impl CameraSlotWorker {
@@ -264,14 +276,44 @@ impl CameraSlotWorker {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let (control_tx, control_rx) = mpsc::channel::<CameraSlotControlRequest>();
         let join = thread::spawn(move || {
-            run_slot_worker(slot, config, events, worker_stop);
+            run_slot_worker(slot, config, events, worker_stop, control_rx);
         });
 
         Self {
             stop,
             join: Some(join),
+            control_tx,
         }
+    }
+
+    /// 在 worker 间隙读取相机控制参数。worker 关闭后返回 Err。
+    pub fn controls(&self) -> Result<Vec<CameraControlInfo>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.control_tx
+            .send(CameraSlotControlRequest::Controls(reply_tx))
+            .map_err(|_| anyhow::anyhow!("camera slot worker stopped"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("camera slot worker dropped reply"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// 在 worker 间隙写相机控制参数。worker 关闭后返回 Err。
+    pub fn set_control(&self, id: String, value: f64) -> Result<()> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.control_tx
+            .send(CameraSlotControlRequest::SetControl {
+                id,
+                value,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("camera slot worker stopped"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("camera slot worker dropped reply"))?
+            .map_err(anyhow::Error::msg)
     }
 
     pub fn close(&mut self) {
@@ -489,11 +531,33 @@ fn ensure_slot_camera(
     Ok(())
 }
 
+/// 在 worker 主循环间隙服务一条控制请求。相机未连接时所有请求直接返错；
+/// 已连接则用同一 nokhwa 实例执行读/写——与 capture 串行，无锁/无竞态。
+fn handle_control_request(camera: Option<&mut NokhwaCamera>, request: CameraSlotControlRequest) {
+    match request {
+        CameraSlotControlRequest::Controls(reply) => {
+            let result = match camera {
+                Some(camera) => camera.controls().map_err(|err| err.to_string()),
+                None => Err("camera not connected".to_string()),
+            };
+            let _ = reply.send(result);
+        }
+        CameraSlotControlRequest::SetControl { id, value, reply } => {
+            let result = match camera {
+                Some(camera) => camera.set_control(&id, value).map_err(|err| err.to_string()),
+                None => Err("camera not connected".to_string()),
+            };
+            let _ = reply.send(result);
+        }
+    }
+}
+
 fn run_slot_worker(
     slot: usize,
     config: CameraConfig,
     events: mpsc::Sender<CameraSlotWorkerEvent>,
     stop: Arc<AtomicBool>,
+    control_rx: mpsc::Receiver<CameraSlotControlRequest>,
 ) {
     let target_interval = if config.fps == 0 {
         Duration::from_millis(33)
@@ -507,6 +571,12 @@ fn run_slot_worker(
     let mut last_error: Option<String> = None;
 
     while !stop.load(Ordering::SeqCst) {
+        // 处理积压的 control 请求（capture 之间的间隙）。读/写共享同一 nokhwa 实例，
+        // 与 capture 串行；相机未就绪时直接返错让前端感知。
+        while let Ok(request) = control_rx.try_recv() {
+            handle_control_request(camera.as_mut(), request);
+        }
+
         if camera.is_none() {
             let now = Instant::now();
             if last_open_attempt
