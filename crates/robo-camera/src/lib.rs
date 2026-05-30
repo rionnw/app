@@ -630,29 +630,67 @@ fn run_slot_worker(
             continue;
         }
 
-        let started = Instant::now();
-        let result = camera
-            .as_mut()
-            .expect("camera is checked above")
-            .capture();
-        match result {
-            Ok(frame) => {
+        // **关键：drain driver 内部累积的旧帧。**
+        //
+        // nokhwa 在 Windows MSMF 后端跑久了，driver 解码缓冲会堆满，之后
+        // frame() 会立即返回队列里的旧帧（capture_ms 跌到 ~2ms，UI 上看到
+        // 500fps 抓帧 2ms，但实际是几秒前的旧画面 → 延迟非常高）。
+        //
+        // 解药：当 frame() 在 stale_threshold（半个目标 interval）内返回时，
+        // 视为拿到了 driver 队列里的旧帧 → 不送下游，继续 frame() 直到拿到
+        // 真正阻塞返回的新帧（capture_ms 接近 target_interval）；之后 worker
+        // 不再额外 sleep —— frame() 本身的阻塞就提供了精确节流。
+        //
+        // 这等价于 OpenCV / DirectShow 里 grab() 主动消费驱动队列保留最新一帧、
+        // 再 retrieve() 解码的模式。
+        let stale_threshold = target_interval / 2;
+        let stale_max_drain = 16usize;
+        let mut drained = 0usize;
+        let mut latest_frame: Option<Frame> = None;
+        let mut latest_capture_ms: u128 = 0;
+        let mut capture_err: Option<anyhow::Error> = None;
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let started = Instant::now();
+            let result = camera
+                .as_mut()
+                .expect("camera is checked above")
+                .capture();
+            match result {
+                Ok(frame) => {
+                    let elapsed = started.elapsed();
+                    latest_frame = Some(frame);
+                    latest_capture_ms = elapsed.as_millis();
+                    if elapsed >= stale_threshold {
+                        break; // 真正的新帧
+                    }
+                    drained += 1;
+                    if drained >= stale_max_drain {
+                        break; // 兜底：避免驱动一直返回 stale 时死循环
+                    }
+                }
+                Err(err) => {
+                    capture_err = Some(err);
+                    break;
+                }
+            }
+        }
+
+        match (latest_frame.take(), capture_err.take()) {
+            (Some(frame), _) => {
                 seq += 1;
                 let _ = events.send(CameraSlotWorkerEvent::Frame(FramePacket {
                     slot,
                     index: config.index,
                     seq,
                     frame,
-                    capture_ms: started.elapsed().as_millis(),
+                    capture_ms: latest_capture_ms,
                 }));
-                if connected {
-                    let elapsed = started.elapsed();
-                    if elapsed < target_interval {
-                        sleep_until_next_attempt(&stop, target_interval - elapsed);
-                    }
-                }
+                // 不再 sleep target_interval —— frame() 自身阻塞就是节流。
             }
-            Err(err) => {
+            (None, Some(err)) => {
                 camera = None;
                 let message = err.to_string();
                 if connected {
@@ -671,6 +709,9 @@ fn run_slot_worker(
                     connected: false,
                     message,
                 }));
+            }
+            (None, None) => {
+                // stop 触发时；下一轮 while 会退出
             }
         }
     }

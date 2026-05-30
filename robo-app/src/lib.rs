@@ -122,6 +122,11 @@ struct FrameHubInner {
     last_grid_encode_at: Option<Instant>,
     last_grid_diagnostic_log_at: Option<Instant>,
     last_snapshot_diagnostic_log_at: Option<Instant>,
+    /// 节流"camera-stream-event(frame)"事件给前端 UI 的频率。
+    /// 4 路 worker × ~25fps = 100 events/s，前端 setState 跟不上还会
+    /// 把整个 React 渲染线程打满 → 画面卡顿 / 看似的"500fps"假象。
+    /// 实际帧依然走 MJPEG `<img>` 实时显示，UI 状态栏 5fps 刷新就够了。
+    last_frame_event_emit_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -913,6 +918,7 @@ impl FrameHub {
             last_grid_encode_at: None,
             last_grid_diagnostic_log_at: None,
             last_snapshot_diagnostic_log_at: None,
+            last_frame_event_emit_at: None,
         };
         self.changed.notify_all();
         Ok(session_id)
@@ -1400,6 +1406,31 @@ fn publish_stream_packet(
     let Some(frame) = hub.publish_slot_frame(session_id, packet, jpeg, encode_ms)? else {
         return Ok(());
     };
+    // 把"frame"事件 emit 到前端的频率限制到 5Hz：
+    // 4 路 worker 并发产帧时，每帧都 emit 会让前端 React 状态栏刷新 ~100Hz，
+    // setState 队列堆积反而拖慢 UI；MJPEG <img> 显示和 setFrameStats 没关系，
+    // UI 状态栏 200ms 更新一次完全够用。
+    const FRAME_EVENT_EMIT_INTERVAL: Duration = Duration::from_millis(200);
+    let should_emit = {
+        match hub.inner.lock() {
+            Ok(mut inner) => {
+                let now = Instant::now();
+                let due = match inner.last_frame_event_emit_at {
+                    Some(prev) => now.duration_since(prev) >= FRAME_EVENT_EMIT_INTERVAL,
+                    None => true,
+                };
+                if due {
+                    inner.last_frame_event_emit_at = Some(now);
+                }
+                due
+            }
+            Err(_) => false,
+        }
+    };
+    if !should_emit {
+        return Ok(());
+    }
+
     let fps = if frame.capture_ms == 0 {
         None
     } else {
