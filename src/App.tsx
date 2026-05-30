@@ -3,11 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { save as dialogSave } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
-import {
-  createCanvasFrameDiagnostic,
-  resolveCanvasPreviewFps,
-  shouldRequestCanvasFrame,
-} from "./canvasPreview";
+import { resolveCanvasPreviewFps, shouldRequestCanvasFrame } from "./canvasPreview";
 import {
   createCameraFrameGapDiagnostic,
   createImageBoxDiagnostic,
@@ -605,13 +601,10 @@ function App() {
       let bitmap: ImageBitmap | null = null;
 
       try {
-        const fetchStartedAtMs = performance.now();
         const frame = await invoke<ArrayBuffer | Uint8Array | number[]>("snapshot_frame");
-        const fetchedAtMs = performance.now();
         if (stopped) return;
 
         const blob = new Blob([toFrameArrayBuffer(frame)], { type: "image/jpeg" });
-        const decodeStartedAtMs = performance.now();
         let drawable: CanvasImageSource;
         if ("createImageBitmap" in window) {
           bitmap = await createImageBitmap(blob);
@@ -620,32 +613,11 @@ function App() {
           objectUrl = URL.createObjectURL(blob);
           drawable = await loadImageElement(objectUrl);
         }
-        const decodedAtMs = performance.now();
         if (stopped) return;
 
         if (canvas.width !== naturalSize.width) canvas.width = naturalSize.width;
         if (canvas.height !== naturalSize.height) canvas.height = naturalSize.height;
         context.drawImage(drawable, 0, 0, naturalSize.width, naturalSize.height);
-        const drawnAtMs = performance.now();
-
-        if (
-          shouldLogThrottledDiagnostic({
-            nowMs: drawnAtMs,
-            lastLoggedAtMs: lastCanvasFrameLogAtRef.current,
-            intervalMs: canvasFrameDiagnosticThrottleMs,
-          })
-        ) {
-          lastCanvasFrameLogAtRef.current = drawnAtMs;
-          addDiagnosticLog(
-            createCanvasFrameDiagnostic({
-              fetchMs: fetchedAtMs - fetchStartedAtMs,
-              decodeMs: decodedAtMs - decodeStartedAtMs,
-              drawMs: drawnAtMs - decodedAtMs,
-              width: naturalSize.width,
-              height: naturalSize.height,
-            }),
-          );
-        }
       } catch (error) {
         const nowMs = performance.now();
         if (
@@ -896,9 +868,16 @@ function App() {
       const solveResultJson = JSON.stringify(result, null, 2);
       void (async () => {
         try {
-          let dataUrl = imageSrc;
-          if (!dataUrl && cameraOpen) {
+          // 与 saveImage 同：相机视图下 imageSrc 是 MJPEG URL，不能直接当 data URL
+          let dataUrl: string | null;
+          if (imageSource === "camera") {
             dataUrl = await invoke<string>("latest_frame_data_url");
+          } else if (imageSource === "file" && imageSrc) {
+            dataUrl = imageSrc;
+          } else if (cameraOpen) {
+            dataUrl = await invoke<string>("latest_frame_data_url");
+          } else {
+            dataUrl = null;
           }
           if (dataUrl) {
             await invoke("save_solve_image", { imageDataUrl: dataUrl, solveResult: solveResultJson });
@@ -923,9 +902,19 @@ function App() {
 
   const saveImage = async () => {
     try {
-      let dataUrl = imageSrc;
-      if (!dataUrl && cameraOpen) {
+      // 相机视图下 imageSrc 是 MJPEG 流 URL（http://...grid.mjpeg），不是 data URL，
+      // 不能直接喂给 base64 解码——必须从后端拉一帧 JPEG 转出的 data URL。
+      // 文件视图下 imageSrc 已经是 data:image/...;base64,xxxx 形式，直接用即可。
+      let dataUrl: string | null;
+      if (imageSource === "camera") {
         dataUrl = await invoke<string>("latest_frame_data_url");
+      } else if (imageSource === "file" && imageSrc) {
+        dataUrl = imageSrc;
+      } else if (cameraOpen) {
+        // 兜底：相机开着但 imageSource 还没切到 'camera'
+        dataUrl = await invoke<string>("latest_frame_data_url");
+      } else {
+        dataUrl = null;
       }
       if (!dataUrl) {
         addLog("没有可保存的图片。", "warn");
