@@ -44,6 +44,30 @@ struct AppState {
     digit_map: Mutex<DigitMap>,
     /// 应用配置（持久化到 `app-config.json`）
     config: Mutex<AppConfig>,
+    /// 前端推送的 ROI 状态，由 grid_timer 在每张 grid JPEG 上直接绘制矩形
+    /// 与编号——把"54 个 SVG 矩形 + 文字"的渲染开销从 webview 主线程搬到
+    /// 后端，避免 30Hz 画面刷新与 SVG 重排叠加导致点击/标注卡顿。
+    overlay: Arc<Mutex<RoiOverlayState>>,
+}
+
+#[derive(Default, Clone)]
+struct RoiOverlayState {
+    /// 54 个 ROI（按 0..54 排序，None 表示未标注）。坐标已归一化到 [0,1]。
+    /// 前端在相机模式下负责通过 `set_overlay_rois` 同步给后端。
+    rois: Vec<Option<NormRoi>>,
+    /// 当前选中的 ROI 索引（用于高亮颜色）。None 表示无选中。
+    current: Option<usize>,
+    /// 是否启用 overlay 绘制。文件模式 / 关闭相机时前端会传 false 关掉，
+    /// 避免 grid_timer 多做无用功。
+    enabled: bool,
+}
+
+#[derive(Default, Clone, Copy)]
+struct NormRoi {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +208,7 @@ impl Default for AppState {
             solver: Arc::new(std::sync::OnceLock::new()),
             digit_map: Mutex::new(default_digit_map()),
             config: Mutex::new(AppConfig::default()),
+            overlay: Arc::new(Mutex::new(RoiOverlayState::default())),
         }
     }
 }
@@ -697,7 +722,12 @@ fn fill_rect(
 }
 
 impl CameraStreamRuntime {
-    fn open(configs: Vec<CameraConfig>, hub: Arc<FrameHub>, app: tauri::AppHandle) -> Result<Self> {
+    fn open(
+        configs: Vec<CameraConfig>,
+        hub: Arc<FrameHub>,
+        app: tauri::AppHandle,
+        overlay: Arc<Mutex<RoiOverlayState>>,
+    ) -> Result<Self> {
         let session_id = hub.configure(&configs)?;
         let (tx, rx) = mpsc::channel();
         let workers = configs
@@ -718,6 +748,7 @@ impl CameraStreamRuntime {
             session_id,
             app,
             Arc::clone(&grid_timer_stop),
+            overlay,
         );
 
         Ok(Self {
@@ -732,6 +763,7 @@ impl CameraStreamRuntime {
         configs: Vec<CameraConfig>,
         hub: Arc<FrameHub>,
         app: tauri::AppHandle,
+        overlay: Arc<Mutex<RoiOverlayState>>,
     ) -> Result<Self> {
         let session_id = hub.configure(&configs)?;
         let (tx, rx) = mpsc::channel();
@@ -753,6 +785,7 @@ impl CameraStreamRuntime {
             session_id,
             app,
             Arc::clone(&grid_timer_stop),
+            overlay,
         );
 
         Ok(Self {
@@ -924,6 +957,7 @@ fn spawn_grid_timer(
     session_id: u64,
     app: tauri::AppHandle,
     stop: Arc<AtomicBool>,
+    overlay: Arc<Mutex<RoiOverlayState>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while !stop.load(Ordering::SeqCst) {
@@ -946,7 +980,14 @@ fn spawn_grid_timer(
                     snapshot.tile_height,
                     snapshot.columns,
                 ) {
-                    Ok(Some(grid_frame)) => {
+                    Ok(Some(mut grid_frame)) => {
+                        // 在 RGB buffer 上直接画 ROI 矩形（不画文字，简单快），
+                        // 避免前端 54 个 SVG 矩形 + 文字与 30Hz 画面刷新争主线程。
+                        if let Ok(overlay_state) = overlay.lock() {
+                            if overlay_state.enabled {
+                                draw_overlay_rois(&mut grid_frame, &overlay_state);
+                            }
+                        }
                         let compose_ms = compose_started.elapsed().as_millis();
                         let encode_started = Instant::now();
                         match encode_frame_jpeg(&grid_frame) {
@@ -1485,6 +1526,99 @@ fn status_dto(status: &CameraSlotStatus) -> CameraStatusDto {
     }
 }
 
+/// 在 grid RGB buffer 上直接画 54 个 ROI 矩形（无字体依赖，仅画框）。
+/// 当前选中的 ROI 用蓝色描边，其余用绿色——和前端 SVG 配色一致。
+///
+/// 为了画面清晰且性能好，矩形使用 2px 描边、纯像素操作；不抗锯齿，
+/// 1280x960 上 54 个 10x10 矩形描边总写入约 4500 像素，<<1ms。
+fn draw_overlay_rois(frame: &mut Frame, overlay: &RoiOverlayState) {
+    let width = frame.width as i32;
+    let height = frame.height as i32;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    const STROKE_PX: i32 = 2;
+    const ACTIVE_RGB: [u8; 3] = [37, 99, 235]; // 蓝色（与前端 .roi-rect.is-active 一致）
+    const NORMAL_RGB: [u8; 3] = [19, 148, 71]; // 绿色（与前端 .roi-rect 一致）
+
+    for (idx, opt_roi) in overlay.rois.iter().enumerate() {
+        let Some(roi) = opt_roi else { continue };
+        let x0 = (roi.x * width as f32).round() as i32;
+        let y0 = (roi.y * height as f32).round() as i32;
+        let x1 = ((roi.x + roi.w) * width as f32).round() as i32;
+        let y1 = ((roi.y + roi.h) * height as f32).round() as i32;
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        let color = if Some(idx) == overlay.current {
+            ACTIVE_RGB
+        } else {
+            NORMAL_RGB
+        };
+        draw_rect_stroke(
+            &mut frame.rgb,
+            width,
+            height,
+            x0,
+            y0,
+            x1 - 1,
+            y1 - 1,
+            STROKE_PX,
+            color,
+        );
+    }
+}
+
+/// 在 RGB buffer 上画一个矩形描边（实心边框，宽度 stroke_px）。
+fn draw_rect_stroke(
+    rgb: &mut [u8],
+    width: i32,
+    height: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    stroke_px: i32,
+    color: [u8; 3],
+) {
+    let stroke = stroke_px.max(1);
+    let cx0 = x0.max(0);
+    let cy0 = y0.max(0);
+    let cx1 = x1.min(width - 1);
+    let cy1 = y1.min(height - 1);
+    if cx0 > cx1 || cy0 > cy1 {
+        return;
+    }
+    // 上下两条横边
+    for t in 0..stroke {
+        let y_top = (y0 + t).clamp(0, height - 1);
+        let y_bot = (y1 - t).clamp(0, height - 1);
+        for y in [y_top, y_bot] {
+            let row_start = (y * width * 3) as usize;
+            for x in cx0..=cx1 {
+                let off = row_start + (x as usize) * 3;
+                rgb[off] = color[0];
+                rgb[off + 1] = color[1];
+                rgb[off + 2] = color[2];
+            }
+        }
+    }
+    // 左右两条竖边
+    for t in 0..stroke {
+        let x_left = (x0 + t).clamp(0, width - 1);
+        let x_right = (x1 - t).clamp(0, width - 1);
+        for x in [x_left, x_right] {
+            for y in cy0..=cy1 {
+                let off = ((y * width + x) * 3) as usize;
+                rgb[off] = color[0];
+                rgb[off + 1] = color[1];
+                rgb[off + 2] = color[2];
+            }
+        }
+    }
+}
+
 fn encode_frame_jpeg(frame: &Frame) -> Result<Vec<u8>> {
     // 直接用底层 encode 接口，避免 RgbImage::from_raw 需要的整张 rgb 数据 clone
     // （1280x960x3 ≈ 3.5MB/帧，省一次大块内存拷贝）。质量 60 对预览足够，
@@ -1995,10 +2129,11 @@ fn open_camera_stream(
         existing.close();
     }
     *runtime = None;
+    let overlay = Arc::clone(&state.overlay);
     let next_runtime = match if state.mode.mock_camera {
-        CameraStreamRuntime::open_mock(configs, Arc::clone(&state.stream_hub), app)
+        CameraStreamRuntime::open_mock(configs, Arc::clone(&state.stream_hub), app, overlay)
     } else {
-        CameraStreamRuntime::open(configs, Arc::clone(&state.stream_hub), app)
+        CameraStreamRuntime::open(configs, Arc::clone(&state.stream_hub), app, overlay)
     } {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -2481,6 +2616,56 @@ fn get_app_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, String
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default())
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OverlayRoiDto {
+    /// 0..54 的索引；缺省 / 越界则忽略此项。
+    index: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OverlayRoisDto {
+    /// 仅包含已标注的 ROI；未在列表中的索引视为未标注。
+    rois: Vec<OverlayRoiDto>,
+    /// 当前选中的 ROI 索引（用于高亮颜色）。
+    current: Option<usize>,
+    /// 是否启用 overlay；文件模式 / 关闭相机时前端传 false。
+    enabled: bool,
+}
+
+/// 由前端在 ROI 状态变更时（标注 / 翻页 / 删除 / 重置 / 启用关闭）调用，
+/// 写入 AppState.overlay；下一拍 grid_timer 会用最新数据画矩形。
+#[tauri::command]
+fn set_overlay_rois(
+    state: tauri::State<'_, AppState>,
+    payload: OverlayRoisDto,
+) -> Result<(), String> {
+    let mut rois: Vec<Option<NormRoi>> = vec![None; 54];
+    for item in payload.rois {
+        if item.index < 54 {
+            rois[item.index] = Some(NormRoi {
+                x: item.x.clamp(0.0, 1.0),
+                y: item.y.clamp(0.0, 1.0),
+                w: item.w.clamp(0.0, 1.0),
+                h: item.h.clamp(0.0, 1.0),
+            });
+        }
+    }
+    let mut guard = state
+        .overlay
+        .lock()
+        .map_err(|_| "overlay state is poisoned".to_string())?;
+    *guard = RoiOverlayState {
+        rois,
+        current: payload.current.filter(|i| *i < 54),
+        enabled: payload.enabled,
+    };
+    Ok(())
 }
 
 #[tauri::command]
@@ -3239,7 +3424,8 @@ pub fn run() {
             save_move_mapping_to_path,
             reset_move_mapping,
             get_app_config,
-            set_app_config
+            set_app_config,
+            set_overlay_rois
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

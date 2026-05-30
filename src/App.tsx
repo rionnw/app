@@ -492,6 +492,33 @@ function App() {
     localStorage.setItem(panelVisibilityStorageKey, JSON.stringify(panelVisibility));
   }, [panelVisibility]);
 
+  /// 把 ROI 状态同步给后端：相机模式下后端会在 grid JPEG 上直接画矩形。
+  /// 任何 setRegions / setCurrentRegionId / 显示模式切换 / showRoi 切换
+  /// 都会触发本 effect 一次 invoke，~微秒级开销。
+  useEffect(() => {
+    const enabled = imageSource === "camera" && showRoi;
+    const payload = {
+      payload: {
+        rois: regions
+          .filter((region) => region.rect)
+          .map((region) => ({
+            index: region.index,
+            x: region.rect!.x,
+            y: region.rect!.y,
+            w: region.rect!.w,
+            h: region.rect!.h,
+          })),
+        current: enabled
+          ? regions.findIndex((region) => region.id === currentRegionId)
+          : null,
+        enabled,
+      },
+    };
+    void invoke("set_overlay_rois", payload).catch(() => {
+      // 静默——后端没就绪 / 命令未注册时不影响 UI 行为
+    });
+  }, [regions, currentRegionId, imageSource, showRoi]);
+
   useEffect(() => {
     if (!timerRunning) return;
     const startAt = performance.now() - elapsedMs;
@@ -1458,7 +1485,13 @@ function App() {
                     onError={handleStreamImageError}
                   />
                 )}
-                {showRoi && (
+                {/*
+                  相机模式下 ROI 由后端 grid_timer 直接画在 grid JPEG 上
+                  （见后端 draw_overlay_rois），不再走前端 SVG，避免 30Hz 画面
+                  刷新与 SVG 重排争抢 webview 主线程。
+                  文件模式的快照画面是静态的，前端 SVG 没有性能问题，仍走原路径。
+                */}
+                {showRoi && imageSource !== "camera" && (
                   <RoiOverlay
                     regions={regions}
                     currentRegionId={currentRegionId}
