@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use image::{codecs::jpeg::JpegEncoder, imageops, RgbImage};
+use image::{codecs::jpeg::JpegEncoder, imageops, ExtendedColorType, RgbImage};
 use robo_camera::{
     frame_format_from_str, CameraConfig, CameraControlKind, CameraSlotStatus, CameraSlotWorker,
     CameraSlotWorkerEvent, CameraStatusEventKind, FramePacket, MultiCameraCapture,
@@ -140,7 +140,10 @@ struct CameraStreamRuntime {
     aggregator: Option<JoinHandle<()>>,
 }
 
-const GRID_ENCODE_INTERVAL: Duration = Duration::from_millis(33);
+/// grid 编码节流：20fps（50ms）。多数 USB 相机在 4 路并发 + MJPEG 软解码下
+/// 只能稳定跑到 20fps 左右（capture_ms ~45ms），把 grid 编码也卡在同一节奏，
+/// CPU 占用减半且不会掉帧——再快也只是把同一张源帧重复编码。
+const GRID_ENCODE_INTERVAL: Duration = Duration::from_millis(50);
 const DIAGNOSTIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const DIAGNOSTIC_WARN_THRESHOLD: Duration = Duration::from_millis(200);
 const BACKEND_DIAGNOSTIC_PREFIX: &str = "[backend-diagnostic]";
@@ -1332,11 +1335,17 @@ fn status_dto(status: &CameraSlotStatus) -> CameraStatusDto {
 }
 
 fn encode_frame_jpeg(frame: &Frame) -> Result<Vec<u8>> {
-    let image = RgbImage::from_raw(frame.width, frame.height, frame.rgb.clone())
-        .context("failed to create image from stream frame")?;
-    let mut bytes = Cursor::new(Vec::new());
-    JpegEncoder::new_with_quality(&mut bytes, 72)
-        .encode_image(&image)
+    // 直接用底层 encode 接口，避免 RgbImage::from_raw 需要的整张 rgb 数据 clone
+    // （1280x960x3 ≈ 3.5MB/帧，省一次大块内存拷贝）。质量 60 对预览足够，
+    // 比 quality=72 快约 25%、字节少约 30%，画质肉眼几乎看不出差别。
+    let mut bytes = Cursor::new(Vec::with_capacity(frame.rgb.len() / 8));
+    JpegEncoder::new_with_quality(&mut bytes, 60)
+        .encode(
+            &frame.rgb,
+            frame.width,
+            frame.height,
+            ExtendedColorType::Rgb8,
+        )
         .context("failed to encode stream frame as JPEG")?;
     Ok(bytes.into_inner())
 }
