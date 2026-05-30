@@ -62,12 +62,14 @@ struct RoiOverlayState {
     enabled: bool,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct NormRoi {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
+    /// ROI 标签（"U1".."B9"），由 grid_timer 画在矩形上方。
+    label: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1526,11 +1528,13 @@ fn status_dto(status: &CameraSlotStatus) -> CameraStatusDto {
     }
 }
 
-/// 在 grid RGB buffer 上直接画 54 个 ROI 矩形（无字体依赖，仅画框）。
+/// 在 grid RGB buffer 上直接画 54 个 ROI 矩形 + 编号文字。
 /// 当前选中的 ROI 用蓝色描边，其余用绿色——和前端 SVG 配色一致。
+/// 文字（如 "U1".."B9"）画在矩形上方，白色填充 + 黑色 1px 轮廓便于在
+/// 任意背景上可读。
 ///
-/// 为了画面清晰且性能好，矩形使用 2px 描边、纯像素操作；不抗锯齿，
-/// 1280x960 上 54 个 10x10 矩形描边总写入约 4500 像素，<<1ms。
+/// 为了画面清晰且性能好，矩形使用 2px 描边、文字用内置 5x7 bitmap 字体
+/// 放大 2 倍（10x14），纯像素操作不抗锯齿；54 个 ROI 总写入 < 1ms。
 fn draw_overlay_rois(frame: &mut Frame, overlay: &RoiOverlayState) {
     let width = frame.width as i32;
     let height = frame.height as i32;
@@ -1541,6 +1545,9 @@ fn draw_overlay_rois(frame: &mut Frame, overlay: &RoiOverlayState) {
     const STROKE_PX: i32 = 2;
     const ACTIVE_RGB: [u8; 3] = [37, 99, 235]; // 蓝色（与前端 .roi-rect.is-active 一致）
     const NORMAL_RGB: [u8; 3] = [19, 148, 71]; // 绿色（与前端 .roi-rect 一致）
+    const TEXT_RGB: [u8; 3] = [255, 255, 255];
+    const TEXT_OUTLINE_RGB: [u8; 3] = [15, 23, 42]; // 接近黑（前端 .roi-label 描边色）
+    const TEXT_SCALE: i32 = 2; // 5x7 → 10x14 像素
 
     for (idx, opt_roi) in overlay.rois.iter().enumerate() {
         let Some(roi) = opt_roi else { continue };
@@ -1567,6 +1574,36 @@ fn draw_overlay_rois(frame: &mut Frame, overlay: &RoiOverlayState) {
             STROKE_PX,
             color,
         );
+
+        if !roi.label.is_empty() {
+            // 文字在矩形上方居中：每字符宽 5*scale + 1 间距
+            let char_w = BITMAP_FONT_WIDTH as i32 * TEXT_SCALE;
+            let char_h = BITMAP_FONT_HEIGHT as i32 * TEXT_SCALE;
+            let spacing = TEXT_SCALE; // 字符间隔 1*scale 像素
+            let text_w = roi.label.chars().count() as i32 * char_w
+                + (roi.label.chars().count() as i32 - 1).max(0) * spacing;
+            let mut text_x = x0 + (x1 - x0) / 2 - text_w / 2;
+            // 优先放在矩形上方；空间不够则放下方。
+            let mut text_y = y0 - char_h - 2;
+            if text_y < 0 {
+                text_y = y1 + 2;
+            }
+            // 边界裁剪由 draw_bitmap_char 内部处理；这里直接画。
+            draw_text(
+                &mut frame.rgb,
+                width,
+                height,
+                text_x.max(0),
+                text_y.max(0),
+                &roi.label,
+                TEXT_SCALE,
+                TEXT_RGB,
+                Some(TEXT_OUTLINE_RGB),
+            );
+            // 静默 unused warning
+            let _ = &mut text_x;
+            let _ = &mut text_y;
+        }
     }
 }
 
@@ -1616,6 +1653,129 @@ fn draw_rect_stroke(
                 rgb[off + 2] = color[2];
             }
         }
+    }
+}
+
+// ─── 5x7 bitmap 字体（仅 ROI 标签需要的字符） ────────────────────
+//
+// 每个字符 5 列 × 7 行，按 row-major 编码为 7 个 u8（取低 5 位）。
+// 1 = 前景像素，0 = 背景。这是 ROI 标签 "U1".."B9" 用到的字符集（字母 6 个 + 数字 9 个）。
+// 自实现避免引入 imageproc / ab_glyph 等大依赖；54 个标签每帧绘制 < 1ms。
+
+const BITMAP_FONT_WIDTH: usize = 5;
+const BITMAP_FONT_HEIGHT: usize = 7;
+
+fn bitmap_glyph(c: char) -> Option<&'static [u8; BITMAP_FONT_HEIGHT]> {
+    Some(match c {
+        // 字母（仅 ROI face 标签用到的）
+        'B' => &[0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'D' => &[0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+        'F' => &[0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+        'L' => &[0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'R' => &[0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'U' => &[0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        // 数字
+        '0' => &[0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+        '1' => &[0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2' => &[0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+        '3' => &[0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110],
+        '4' => &[0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        '5' => &[0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+        '6' => &[0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+        '7' => &[0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+        '8' => &[0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        '9' => &[0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+        _ => return None,
+    })
+}
+
+/// 在 (x, y) 处绘制一个字符（左上角为基准点），放大 `scale` 倍。
+/// outline 提供时，先在四周一圈画轮廓色再叠主色，文字在任意背景都可读。
+#[allow(clippy::too_many_arguments)]
+fn draw_bitmap_char(
+    rgb: &mut [u8],
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+    c: char,
+    scale: i32,
+    color: [u8; 3],
+    outline: Option<[u8; 3]>,
+) {
+    let Some(glyph) = bitmap_glyph(c) else {
+        return;
+    };
+    let scale = scale.max(1);
+
+    let put = |rgb: &mut [u8], px: i32, py: i32, color: [u8; 3]| {
+        if px < 0 || py < 0 || px >= width || py >= height {
+            return;
+        }
+        let off = ((py * width + px) * 3) as usize;
+        rgb[off] = color[0];
+        rgb[off + 1] = color[1];
+        rgb[off + 2] = color[2];
+    };
+
+    // 先画轮廓（在每个前景像素的 8 邻居方向画一遍 outline），再画主色。
+    if let Some(out_color) = outline {
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..BITMAP_FONT_WIDTH {
+                let bit = (*bits >> (BITMAP_FONT_WIDTH - 1 - col)) & 1;
+                if bit == 0 {
+                    continue;
+                }
+                let bx = x + col as i32 * scale;
+                let by = y + row as i32 * scale;
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        for dy in -1..=1 {
+                            for dx in -1..=1 {
+                                put(rgb, bx + sx + dx, by + sy + dy, out_color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (row, bits) in glyph.iter().enumerate() {
+        for col in 0..BITMAP_FONT_WIDTH {
+            let bit = (*bits >> (BITMAP_FONT_WIDTH - 1 - col)) & 1;
+            if bit == 0 {
+                continue;
+            }
+            let bx = x + col as i32 * scale;
+            let by = y + row as i32 * scale;
+            for sy in 0..scale {
+                for sx in 0..scale {
+                    put(rgb, bx + sx, by + sy, color);
+                }
+            }
+        }
+    }
+}
+
+/// 在 (x, y) 处绘制一行文本（仅支持 bitmap_glyph 中已定义的字符）。
+#[allow(clippy::too_many_arguments)]
+fn draw_text(
+    rgb: &mut [u8],
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+    text: &str,
+    scale: i32,
+    color: [u8; 3],
+    outline: Option<[u8; 3]>,
+) {
+    let mut cursor = x;
+    let char_w = BITMAP_FONT_WIDTH as i32 * scale;
+    let spacing = scale; // 字符间隙 1*scale 像素
+    for ch in text.chars() {
+        draw_bitmap_char(rgb, width, height, cursor, y, ch, scale, color, outline);
+        cursor += char_w + spacing;
     }
 }
 
@@ -2626,6 +2786,8 @@ struct OverlayRoiDto {
     y: f32,
     w: f32,
     h: f32,
+    /// ROI 标签（"U1".."B9"），由 grid_timer 画在矩形上方。
+    label: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2653,6 +2815,7 @@ fn set_overlay_rois(
                 y: item.y.clamp(0.0, 1.0),
                 w: item.w.clamp(0.0, 1.0),
                 h: item.h.clamp(0.0, 1.0),
+                label: item.label,
             });
         }
     }

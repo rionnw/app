@@ -507,6 +507,7 @@ function App() {
             y: region.rect!.y,
             w: region.rect!.w,
             h: region.rect!.h,
+            label: region.label,
           })),
         current: enabled
           ? regions.findIndex((region) => region.id === currentRegionId)
