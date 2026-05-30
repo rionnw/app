@@ -111,6 +111,8 @@ const panelVisibilityStorageKey = "cubesolver.panel-visibility";
 const imageLayoutDiagnosticThrottleMs = 3_000;
 const cameraGapDiagnosticThrottleMs = 5_000;
 const canvasFrameDiagnosticThrottleMs = 3_000;
+/// 滑块拖动写硬件的 debounce 窗口；80ms 在视觉跟手和减少 IPC 之间折中。
+const controlWriteDebounceMs = 80;
 const roiLabelOffset = 0.006;
 const roiLabelInset = 0.012;
 
@@ -208,6 +210,8 @@ function App() {
   const lastCameraFrameAtBySlotRef = useRef<Record<number, number>>({});
   const lastCameraFrameGapLogAtBySlotRef = useRef<Record<number, number>>({});
   const lastCanvasFrameLogAtRef = useRef<number | null>(null);
+  /// 控件 id → setTimeout handle，用于滑块连拖时合并 IPC 写硬件
+  const pendingControlWriteRef = useRef<Map<string, number>>(new Map());
 
   const [devices, setDevices] = useState<CameraDevice[]>([]);
   const [cameraConfigs, setCameraConfigs] = useState<CameraConfig[]>(defaultCameraConfigs);
@@ -347,9 +351,14 @@ function App() {
     }
   };
 
-  const refreshCameraControls = async (slot = controlSlot) => {
+  /// `configs` 缺省时取 React state 中的 `cameraConfigs`；当 caller 刚做完
+  /// `setCameraConfigs(next)` 又立即调本函数时（比如 reopenIfNeeded），由于
+  /// React setState 是异步的，闭包里的 `cameraConfigs` 还是旧值——caller 必须
+  /// 把 `next` 通过参数传进来，否则 list_camera_formats 会读到旧 index。
+  const refreshCameraControls = async (slot = controlSlot, configs?: CameraConfig[]) => {
     setLoadedControlSlot(slot);
-    const config = cameraConfigs[slot];
+    const sourceConfigs = configs ?? cameraConfigs;
+    const config = sourceConfigs[slot];
     try {
       if (config) {
         const formats = await invoke<CameraPreset[]>("list_camera_formats", { index: config.index });
@@ -666,8 +675,15 @@ function App() {
   };
 
   const updateCameraPreset = async (index: number, value: string) => {
-    const preset = cameraPresets.find((item) => presetValue(item) === value);
-    if (!preset) return;
+    // 优先在面板展开时显示的硬件 cameraFormats 中查找；否则回退到硬编码 cameraPresets。
+    // 之前永远只查 cameraPresets，导致选择硬件原生格式时静默失败。
+    const preset =
+      cameraFormats.find((item) => presetValue(item) === value) ??
+      cameraPresets.find((item) => presetValue(item) === value);
+    if (!preset) {
+      addLog(`未找到分辨率配置：${value}`, "warn");
+      return;
+    }
     await applyCameraConfig(index, {
       width: preset.width,
       height: preset.height,
@@ -679,6 +695,16 @@ function App() {
   const reopenIfNeeded = async (configs: CameraConfig[]) => {
     if (!cameraOpen) return;
     try {
+      // 显式先 close → 短暂等待 → 再 open。后端 open_camera_stream 内部虽然也会
+      // 销毁旧 runtime，但 nokhwa / AVFoundation 在 macOS 上释放 device 有延迟，
+      // 紧接着重开同一 index 偶发拿不到帧（"failed to capture frame"）。
+      // 先关再等 120ms 给 driver 释放时间，可显著降低换索引后卡顿/掉帧概率。
+      try {
+        await invoke("close_camera_stream");
+      } catch (closeErr) {
+        addLog(`重启前关闭旧相机流失败：${String(closeErr)}`, "warn");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 120));
       const stream = await invoke<CameraStreamInfo>("open_camera_stream", { configs });
       lastCameraFrameAtBySlotRef.current = {};
       lastCameraFrameGapLogAtBySlotRef.current = {};
@@ -691,7 +717,9 @@ function App() {
       setCameraStatuses(stream.statuses);
       setFrameStats("stream restarting");
       addLog(`相机流已按新配置重启，画布预览目标 ${canvasPreviewFps} FPS。`);
-      refreshCameraControls(controlSlot);
+      // 把 next configs 显式传给 refresh，避免 React state 异步导致 closure
+      // 里读到旧 index → 控件面板里"Index"显示对，但分辨率/格式列表却是旧设备的。
+      refreshCameraControls(controlSlot, configs);
     } catch (error) {
       addLog(String(error), "error");
     }
@@ -769,6 +797,7 @@ function App() {
     }
   };
 
+  /// 立即写硬件，不做合并/节流——用于复选框等离散点击和"恢复默认"等场景。
   const setCameraControlValue = async (control: CameraControl, value: number) => {
     // 乐观更新：先把 UI 滑块值切到 value，后端写参数失败时再 refresh 拉回真实值。
     setCameraControls((items) => items.map((item) => (item.id === control.id ? { ...item, value } : item)));
@@ -778,6 +807,32 @@ function App() {
       addLog(String(error), "error");
       refreshCameraControls(controlSlot);
     }
+  };
+
+  /// 滑块连拖时，UI 立即更新（视觉跟手），但 IPC 写硬件用 debounce——
+  /// CameraSlotWorker 在 capture 间隙才能处理 control 请求（~33ms 节奏），
+  /// 连发 N 个会排队累积；只取最后一个值发给硬件，等同于"拖完再写"，
+  /// 既保留 UI 响应性又避免拥塞。
+  const setCameraControlValueDebounced = (control: CameraControl, value: number) => {
+    setCameraControls((items) => items.map((item) => (item.id === control.id ? { ...item, value } : item)));
+    const id = control.id;
+    const slot = controlSlot;
+    const prev = pendingControlWriteRef.current.get(id);
+    if (prev !== undefined) {
+      window.clearTimeout(prev);
+    }
+    const timer = window.setTimeout(() => {
+      pendingControlWriteRef.current.delete(id);
+      void (async () => {
+        try {
+          await invoke("set_camera_control", { slot, id, value });
+        } catch (error) {
+          addLog(String(error), "error");
+          refreshCameraControls(slot);
+        }
+      })();
+    }, controlWriteDebounceMs);
+    pendingControlWriteRef.current.set(id, timer);
   };
 
   const selectControlSlot = (slot: number) => {
@@ -1618,7 +1673,9 @@ function App() {
                               max={control.max ?? control.value + 100}
                               step={control.step && control.step > 0 ? control.step : control.kind === "integer" ? 1 : 0.1}
                               value={control.value}
-                              onChange={(event) => setCameraControlValue(control, Number(event.target.value))}
+                              onChange={(event) =>
+                                setCameraControlValueDebounced(control, Number(event.target.value))
+                              }
                             />
                           )}
                           <em>{control.kind === "boolean" ? (control.value >= 0.5 ? "开" : "关") : control.value.toFixed(2)}</em>
