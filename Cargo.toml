@@ -11,6 +11,7 @@ members = [
     "tools/recognize-cli",
     "tools/solve-cli",
     "tools/solve-server",
+    "tools/camera-bench",
 ]
 resolver = "2"
 

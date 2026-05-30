@@ -1,0 +1,16 @@
+[package]
+name = "camera-bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "camera-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+image = "0.25"
+nokhwa = { version = "0.10.11", default-features = true, features = ["input-native"] }
+robo-camera = { path = "../../crates/robo-camera" }
+robo-core = { path = "../../crates/robo-core" }
