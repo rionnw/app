@@ -1866,8 +1866,30 @@ fn capture_frame(state: tauri::State<'_, AppState>) -> Result<FrameResponse, Str
     encode_capture(capture, &state).map_err(|err| err.to_string())
 }
 
+/// 拿一帧 JPEG 并 base64 编码成 data URL，给前端"保存图片"等场景使用。
+///
+/// 优先级：
+/// 1. **stream_hub 的最新 grid JPEG**：相机以 MJPEG 流模式跑时（开 camera_stream），
+///    grid 帧由 aggregator 实时刷新；这条路径完全不需要去抢相机。
+/// 2. fallback 到 `AppState.latest_frame`：旧的 `capture_frame` 命令同步抓帧后会
+///    写到这里。当用户手动 `capture_frame` 而不是流式预览时仍可用。
+/// 3. 两者都没有 → `no camera frame available`。
+///
+/// 历史上只看 `latest_frame` 字段，导致流式预览模式下永远报 "no camera frame
+/// available"——因为流路径不写这个字段。
 #[tauri::command]
 fn latest_frame_data_url(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    // 1) 先看 stream_hub.grid.jpeg（流式预览的实时最新帧，零开销 clone Arc<Vec<u8>>）
+    if let Ok(inner) = state.stream_hub.inner.lock() {
+        if let Some(grid) = inner.grid.as_ref() {
+            return Ok(format!(
+                "data:image/jpeg;base64,{}",
+                STANDARD.encode(grid.jpeg.as_slice())
+            ));
+        }
+    }
+
+    // 2) fallback：旧 capture_frame 写入的 latest_frame
     let frame = state
         .latest_frame
         .lock()
