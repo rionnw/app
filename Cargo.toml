@@ -6,6 +6,7 @@ members = [
     "crates/robo-vision",
     "crates/robo-solver",
     "crates/robo-translator",
+    "crates/robo-handstep",
     "crates/robo-transport",
     "crates/robo-pipeline",
     "tools/recognize-cli",

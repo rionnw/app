@@ -4241,6 +4241,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "robo-handstep"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+]
+
+[[package]]
 name = "robo-pipeline"
 version = "0.1.0"
 dependencies = [
@@ -4272,6 +4280,7 @@ name = "robo-transport"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "log",
  "robo-core",
  "serialport",
 ]
