@@ -34,6 +34,13 @@ const STATES: usize = 3;
 const VARIANTS: usize = 16;
 const MECH_LIB_SIZE: usize = FACES * DISTS * STATES * VARIANTS; // = 864
 
+/// 单次 search 输出机械步骤的最大数量。
+///
+/// C 端原值是 120（`MotorControl/main.c` `States[150]` 也只 ≤148），
+/// 但 Kociemba 求解器 ~20 face 输入展开后 mech 步数可能超 200。
+/// 256 在常见场景下足够；超过会 panic（仍受 g_theory_steps[25] 上界约束）。
+const MOV_BUF_SIZE: usize = 256;
+
 // ============================================================================
 //  全局操作库（5.3：静态化）
 // ============================================================================
@@ -169,12 +176,12 @@ pub struct Engine {
     g_theory_steps2: [[TheoryStep; 25]; 2],
     g_cube_rot: Rot,
     g_hand_state: HandState,
-    g_mov_buff: [[i32; 120]; 2],
+    g_mov_buff: [[i32; MOV_BUF_SIZE]; 2],
 
     // ===== Dfs 存储变量 =====
     s_time: [i32; 2],
     s_step_num: [i32; 2],
-    s_mov_buff: [[i32; 120]; 2],
+    s_mov_buff: [[i32; MOV_BUF_SIZE]; 2],
     s_hand_state: [HandState; 2],
     s_rot: [Rot; 2],
 
@@ -239,10 +246,10 @@ impl Engine {
             g_theory_steps2: [[TheoryStep::default(); 25]; 2],
             g_cube_rot: Rot::default(),
             g_hand_state: HandState::default(),
-            g_mov_buff: [[-1; 120]; 2],
+            g_mov_buff: [[-1; MOV_BUF_SIZE]; 2],
             s_time: [0; 2],
             s_step_num: [0; 2],
-            s_mov_buff: [[-1; 120]; 2],
+            s_mov_buff: [[-1; MOV_BUF_SIZE]; 2],
             s_hand_state: [HandState::default(); 2],
             s_rot: [Rot::default(); 2],
             // `Box::new([cell; N])` 会在栈上先构造再拷到堆，N 太大有
@@ -461,9 +468,16 @@ impl Engine {
             self.g_time[state] += group.time;
             self.g_cube_rot = rot_mtpl_rot(group.rot, self.g_cube_rot);
             self.g_hand_state = group.end_hand_state;
-            // 直接借引用复制 step.num 到 g_mov_buff（无需 deref 整个 group）
             let step_num_to_copy = group.step_num as usize;
             let base = temp_step_num as usize;
+            // 防御：缓冲区溢出时直接放弃此分支（与 book 剪枝一样视为不可达）
+            if base + step_num_to_copy > MOV_BUF_SIZE {
+                self.g_cube_rot = _temp_rot;
+                self.g_hand_state = _temp_hand_state;
+                self.g_time[state] = temp_time;
+                self.g_step_num[state] = temp_step_num;
+                continue;
+            }
             for _i in 0..step_num_to_copy {
                 self.g_mov_buff[state][base + _i] = group.steps[_i].num;
             }
@@ -753,8 +767,6 @@ mod tests {
     /// ```
     ///
     /// DFS 单节点 ~150 ns，已接近 cache 友好小函数极限。
-    /// 注：20+ face 输入会因 C 端固有 `g_mov_buff[120]` 上限触发越界 panic
-    /// （独立问题，与本次性能优化无关），故输入控制在 ~10 face。
     #[test]
     fn perf_long_input() {
         let input = "F1 R2 U3 B1 L2 D3 F2 R1 U2 B3 ";  // 10 face
@@ -790,6 +802,65 @@ mod tests {
     }
 
 
+
+    /// 把标准 Kociemba 记号（`F / F2 / F'`）转换成 RobotStep 内部格式（`F1 / F2 / F3 `）。
+    /// 用于喂给 search()。返回 None 表示无法解析。
+    fn kociemba_to_robotstep(kociemba: &str) -> Option<String> {
+        let mut out = String::new();
+        for token in kociemba.split_whitespace() {
+            let mut chars = token.chars();
+            let face = chars.next()?;
+            if !"FRUBLD".contains(face) {
+                return None;
+            }
+            let suffix: String = chars.collect();
+            let dist_char = match suffix.as_str() {
+                "" => '1',  // F   → +90 → _1
+                "2" => '2', // F2  → 180 → _2
+                "'" => '3', // F'  → -90 → _3
+                _ => return None,
+            };
+            out.push(face);
+            out.push(dist_char);
+            out.push(' ');
+        }
+        Some(out)
+    }
+
+    /// 用户给的真实 Kociemba 输出序列：跑一遍看耗时 + 输出长度。
+    /// 不做正确性断言（没有 reference 真值），只验证不 panic 且输出非空。
+    #[test]
+    fn user_provided_sequences() {
+        let cases = [
+            "R2 F' D2 F' U2 R2 F  R2 U2 F' D  L  F2 D' B' R' B  R2 F  U'",
+            "L2 U' B2 R2 D' B2 L2 D' B2 R2 D  R2 L' D2 U' B' F  R  D2 B' L'",
+            "U  B' D  L  U2 F' U  L2 U' L  B2 U2 B2 D2 R  F2 B2 D2 R2 D",
+            "F2 R  U  R  B  R  D2 F2 U' B  D  L2 F2 D  B2 U  R2 D  L2",
+            "U' L' U' L' B' R  U  D' L  B2 R2 U  L2 U  R2 D' L2 U2 L2 D' B'",
+            "L2 F  B2 U2 L2 D  R2 B2 F2 D' L2 B2 U' R' B2 R  D  L  B2 F'",
+            "F  D  R2 L2 B2 D' F  D2 F2 U2 D' F2 B2 R2 D2 R2 L2 F  R  D",
+            "R  L  B2 R' D' R  D  B' U' R2 D2 L2 F' D2 F2 B' L2 R",
+            "L  D  B  L' F  R2 B' U  L2 F2 U' F2 R2 U' L2 U' R2 U2 R2 F' L2",
+            "R2 D2 B2 F2 R2 B2 U' B2 F2 L2 U  B  L2 F  R  U' R2 D  B' U2",
+            "R  D2 R' D2 B2 U2 F2 R2 U2 L2 R  B2 U' R  B' L2 B' L' R2 U' B",
+        ];
+        let mut e = Engine::new();
+        for (i, kc) in cases.iter().enumerate() {
+            let face_count = kc.split_whitespace().count();
+            let rs = kociemba_to_robotstep(kc).expect("Kociemba 解析失败");
+            DFS_NODE_COUNTER.with(|c| c.set(0));
+            let start = std::time::Instant::now();
+            let n = e.search(&rs);
+            let elapsed = start.elapsed();
+            let nodes = DFS_NODE_COUNTER.with(|c| c.get());
+            let s = e.get_steps();
+            eprintln!(
+                "[{:2}] {:>2} face → mech_steps={:>3}, dfs_nodes={:>5}, time={:>8?}, output={}",
+                i, face_count, n, nodes, elapsed,
+                if s.len() > 60 { format!("{}...({} chars)", &s[..40], s.len()) } else { s.clone() }
+            );
+        }
+    }
 
     /// 多 face 长串 baseline：覆盖 DFS 多深度 + book 剪枝 + cube_rot 累乘。
     /// 等同 `baseline_single_face` 的角色——锁住语义、抓性能优化引入的偏移。
