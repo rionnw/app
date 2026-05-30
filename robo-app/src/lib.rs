@@ -142,7 +142,12 @@ struct CachedValue<T> {
 
 struct CameraStreamRuntime {
     workers: Vec<CameraStreamWorker>,
+    /// 处理来自 worker 的状态/事件流（不再处理 frame，frame 直接写入 hub）。
     aggregator: Option<JoinHandle<()>>,
+    /// 定时拉取 4 路最新 RGB → 拼接 → JPEG 编码 → 写回 hub.grid。
+    /// 让 grid 编码频率与 worker 产帧解耦，永远拼"最新一张"，不会堆积延迟。
+    grid_timer: Option<JoinHandle<()>>,
+    grid_timer_stop: Arc<AtomicBool>,
 }
 
 /// grid 编码节流：20fps（50ms）。多数 USB 相机在 4 路并发 + MJPEG 软解码下
@@ -706,11 +711,21 @@ impl CameraStreamRuntime {
             .collect::<Vec<_>>();
         drop(tx);
 
-        let aggregator = spawn_camera_stream_aggregator(Arc::clone(&hub), session_id, app, rx);
+        let aggregator =
+            spawn_camera_stream_aggregator(Arc::clone(&hub), session_id, app.clone(), rx);
+        let grid_timer_stop = Arc::new(AtomicBool::new(false));
+        let grid_timer = spawn_grid_timer(
+            Arc::clone(&hub),
+            session_id,
+            app,
+            Arc::clone(&grid_timer_stop),
+        );
 
         Ok(Self {
             workers,
             aggregator: Some(aggregator),
+            grid_timer: Some(grid_timer),
+            grid_timer_stop,
         })
     }
 
@@ -731,15 +746,33 @@ impl CameraStreamRuntime {
             .collect::<Vec<_>>();
         drop(tx);
 
-        let aggregator = spawn_camera_stream_aggregator(Arc::clone(&hub), session_id, app, rx);
+        let aggregator =
+            spawn_camera_stream_aggregator(Arc::clone(&hub), session_id, app.clone(), rx);
+        let grid_timer_stop = Arc::new(AtomicBool::new(false));
+        let grid_timer = spawn_grid_timer(
+            Arc::clone(&hub),
+            session_id,
+            app,
+            Arc::clone(&grid_timer_stop),
+        );
 
         Ok(Self {
             workers,
             aggregator: Some(aggregator),
+            grid_timer: Some(grid_timer),
+            grid_timer_stop,
         })
     }
 
     fn close(&mut self) {
+        // 先停 grid timer：notify_all 唤醒任何在 hub.changed 上等待的线程，
+        // timer 自身的 sleep 也会通过 stop flag 提前退出。
+        self.grid_timer_stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.grid_timer.take() {
+            // 不 join——driver 可能正在 capture 阻塞。timer 是纯 CPU 线程，
+            // 50ms 内会自然退出，drop handle detach 即可。
+            drop(handle);
+        }
         for worker in &mut self.workers {
             worker.close();
         }
@@ -878,6 +911,107 @@ fn spawn_camera_stream_aggregator(
     })
 }
 
+/// 定时拼接 grid + 编码 JPEG 写回 hub.grid 的后台线程。
+///
+/// 与 worker 完全解耦：worker 只负责覆盖式更新各槽位的最新一帧；这里每隔
+/// `GRID_ENCODE_INTERVAL`（默认 50ms / 20Hz）拉一次 4 路最新 RGB 进行拼接 +
+/// 编码。这样：
+/// - grid 的输出帧率严格固定（20Hz），不受 worker 产帧速率波动影响；
+/// - 不会因 4 路 worker 并发产帧而把 aggregator 单线程打满；
+/// - driver 即使吐出旧帧 / 速率失控（500fps）也只是不停覆盖槽位最新一帧，
+///   timer 永远拼"当下最新"，UI 看到的延迟最差就是 50ms（一个 timer 周期）。
+fn spawn_grid_timer(
+    hub: Arc<FrameHub>,
+    session_id: u64,
+    app: tauri::AppHandle,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            let cycle_started = Instant::now();
+            // 在锁内只读 4 路 RGB 的 Arc 引用 + tile 配置，立刻释放锁；
+            // 避免 compose + JPEG 编码这种 ~10ms 的重活儿持锁阻塞 worker。
+            let snapshot = match hub.snapshot_slots(session_id) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => break, // session 失效（被 close 或 reconfigure），退出
+                Err(_) => break,
+            };
+            // 只有在至少有一路收到帧时才做 grid 编码——避免设备未就绪时
+            // 反复编码全黑画面。
+            let any_frame = snapshot.frames.iter().any(|f| f.is_some());
+            if any_frame {
+                let compose_started = Instant::now();
+                match compose_grid_frame(
+                    snapshot.frames,
+                    snapshot.tile_width,
+                    snapshot.tile_height,
+                    snapshot.columns,
+                ) {
+                    Ok(Some(grid_frame)) => {
+                        let compose_ms = compose_started.elapsed().as_millis();
+                        let encode_started = Instant::now();
+                        match encode_frame_jpeg(&grid_frame) {
+                            Ok(grid_jpeg) => {
+                                let grid_encode_ms = encode_started.elapsed().as_millis();
+                                let _ = hub.publish_grid_frame(
+                                    session_id,
+                                    grid_frame,
+                                    grid_jpeg,
+                                    compose_ms,
+                                    grid_encode_ms,
+                                );
+                            }
+                            Err(err) => {
+                                let _ = app.emit(
+                                    "camera-stream-event",
+                                    CameraStreamEventDto {
+                                        kind: "error".to_string(),
+                                        slot: None,
+                                        index: None,
+                                        seq: None,
+                                        width: None,
+                                        height: None,
+                                        fps: None,
+                                        capture_ms: None,
+                                        encode_ms: None,
+                                        message: Some(format!("grid encode failed: {err}")),
+                                        statuses: hub.statuses().unwrap_or_default(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+            }
+
+            // 节流到 GRID_ENCODE_INTERVAL：本次循环耗时不足时 sleep 补足；
+            // 用 stop flag 提前退出，避免 close 时还要等满一拍。
+            let elapsed = cycle_started.elapsed();
+            if elapsed < GRID_ENCODE_INTERVAL {
+                let mut remain = GRID_ENCODE_INTERVAL - elapsed;
+                while remain > Duration::ZERO {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let chunk = remain.min(Duration::from_millis(20));
+                    thread::sleep(chunk);
+                    remain = remain.saturating_sub(chunk);
+                }
+            }
+        }
+    })
+}
+
+/// 由 timer 线程拼好 grid 后写回 hub.grid 的辅助方法。
+struct GridSnapshot {
+    frames: Vec<Option<Arc<Frame>>>,
+    tile_width: u32,
+    tile_height: u32,
+    columns: u32,
+}
+
 impl FrameHub {
     fn configure(&self, configs: &[CameraConfig]) -> Result<u64> {
         anyhow::ensure!(!configs.is_empty(), "at least one camera is required");
@@ -992,6 +1126,13 @@ impl FrameHub {
         Ok(statuses)
     }
 
+    /// 写入指定槽位的最新帧——**只更新内存里的"最新一帧"，不做任何 grid 拼接/编码**。
+    ///
+    /// grid 的合成由独立的 `spawn_grid_timer` 线程定时（50ms）拉取所有槽位的最新
+    /// RGB 自行完成，与 worker 产帧速率彻底解耦：
+    /// - worker 产帧再快也只是覆盖式刷新自己槽位的"最新一帧"，不会堆积；
+    /// - grid timer 永远拼"当下最新的 4 张"，所以即便某路相机吐出旧帧，下一拍
+    ///   一旦真的有新帧到，UI 就能立刻看到——彻底消除"延迟越积越高"的现象。
     fn publish_slot_frame(
         &self,
         session_id: u64,
@@ -1018,126 +1159,131 @@ impl FrameHub {
             created_at,
         };
 
-        let (frames, tile_width, tile_height, columns, should_encode_grid) = {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
-            if inner.session_id != session_id {
-                return Ok(None);
-            }
-            let slot_state = inner
-                .slots
-                .get_mut(slot)
-                .with_context(|| format!("stream slot {} does not exist", slot))?;
-            let slot_interval = slot_state
-                .frame
-                .as_ref()
-                .map(|frame| created_at.duration_since(frame.created_at));
-            let slot_warning = slot_interval
-                .map(|interval| interval > DIAGNOSTIC_WARN_THRESHOLD)
-                .unwrap_or(false);
-            if should_log_diagnostic(
-                &mut slot_state.last_diagnostic_log_at,
-                created_at,
-                slot_warning,
-            ) {
-                log::info!(
-                    "{BACKEND_DIAGNOSTIC_PREFIX} category=slot_frame level={} slot={} packet_seq={} capture_ms={} encode_ms={} interval_ms={}",
-                    diagnostic_level(slot_warning),
-                    slot,
-                    seq,
-                    stream_frame.capture_ms,
-                    stream_frame.encode_ms,
-                    diagnostic_duration_ms(slot_interval)
-                );
-            }
-            slot_state.status = CameraSlotStatus {
-                slot,
-                index,
-                connected: true,
-                message: "connected".to_string(),
-            };
-            slot_state.frame = Some(stream_frame.clone());
-            let frames = inner
-                .slots
-                .iter()
-                .map(|slot| slot.frame.as_ref().map(|frame| Arc::clone(&frame.rgb)))
-                .collect::<Vec<_>>();
-            let now = Instant::now();
-            let should_encode_grid = match inner.last_grid_encode_at {
-                Some(last) => now.duration_since(last) >= GRID_ENCODE_INTERVAL,
-                None => true,
-            } || inner.grid.is_none();
-            if should_encode_grid {
-                inner.last_grid_encode_at = Some(now);
-            }
-            self.changed.notify_all();
-            (
-                frames,
-                inner.tile_width,
-                inner.tile_height,
-                inner.columns,
-                should_encode_grid,
-            )
-        };
-
-        if should_encode_grid {
-            let compose_started = Instant::now();
-            if let Some(grid_frame) = compose_grid_frame(frames, tile_width, tile_height, columns)?
-            {
-                let compose_ms = compose_started.elapsed().as_millis();
-                let started = Instant::now();
-                let grid_jpeg = encode_frame_jpeg(&grid_frame)?;
-                let grid_encode_ms = started.elapsed().as_millis();
-                let grid_created_at = Instant::now();
-                let mut inner = self
-                    .inner
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
-                if inner.session_id != session_id || !inner.active {
-                    return Ok(None);
-                }
-                let grid_interval = inner
-                    .grid
-                    .as_ref()
-                    .map(|frame| grid_created_at.duration_since(frame.created_at));
-                inner.grid_seq += 1;
-                let grid_seq = inner.grid_seq;
-                let grid_warning = grid_interval
-                    .map(|interval| interval > DIAGNOSTIC_WARN_THRESHOLD)
-                    .unwrap_or(false)
-                    || compose_ms > DIAGNOSTIC_WARN_THRESHOLD.as_millis()
-                    || grid_encode_ms > DIAGNOSTIC_WARN_THRESHOLD.as_millis();
-                if should_log_diagnostic(
-                    &mut inner.last_grid_diagnostic_log_at,
-                    grid_created_at,
-                    grid_warning,
-                ) {
-                    log::info!(
-                        "{BACKEND_DIAGNOSTIC_PREFIX} category=grid_frame level={} grid_seq={} compose_ms={} encode_ms={} interval_ms={}",
-                        diagnostic_level(grid_warning),
-                        grid_seq,
-                        compose_ms,
-                        grid_encode_ms,
-                        diagnostic_duration_ms(grid_interval)
-                    );
-                }
-                inner.grid = Some(StreamFrame {
-                    seq: grid_seq,
-                    width: grid_frame.width,
-                    height: grid_frame.height,
-                    jpeg: Arc::new(grid_jpeg),
-                    rgb: Arc::new(grid_frame),
-                    capture_ms: stream_frame.capture_ms,
-                    encode_ms: grid_encode_ms,
-                    created_at: grid_created_at,
-                });
-                self.changed.notify_all();
-            }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
+        if inner.session_id != session_id {
+            return Ok(None);
         }
-
+        let slot_state = inner
+            .slots
+            .get_mut(slot)
+            .with_context(|| format!("stream slot {} does not exist", slot))?;
+        let slot_interval = slot_state
+            .frame
+            .as_ref()
+            .map(|frame| created_at.duration_since(frame.created_at));
+        let slot_warning = slot_interval
+            .map(|interval| interval > DIAGNOSTIC_WARN_THRESHOLD)
+            .unwrap_or(false);
+        if should_log_diagnostic(
+            &mut slot_state.last_diagnostic_log_at,
+            created_at,
+            slot_warning,
+        ) {
+            log::info!(
+                "{BACKEND_DIAGNOSTIC_PREFIX} category=slot_frame level={} slot={} packet_seq={} capture_ms={} encode_ms={} interval_ms={}",
+                diagnostic_level(slot_warning),
+                slot,
+                seq,
+                stream_frame.capture_ms,
+                stream_frame.encode_ms,
+                diagnostic_duration_ms(slot_interval)
+            );
+        }
+        slot_state.status = CameraSlotStatus {
+            slot,
+            index,
+            connected: true,
+            message: "connected".to_string(),
+        };
+        slot_state.frame = Some(stream_frame.clone());
+        // 仅唤醒 /slot/N.mjpeg 这种慢消费者的 wait_slot_frame；
+        // grid 由 timer 自行调度，无需在这里 notify。
+        self.changed.notify_all();
         Ok(Some(stream_frame))
+    }
+
+    /// 在锁内只 clone Arc<Frame> 引用 + 读 tile 配置，立刻释放锁；
+    /// 用于 grid_timer 在锁外做耗时的 compose + 编码。
+    fn snapshot_slots(&self, session_id: u64) -> Result<Option<GridSnapshot>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
+        if !inner.active || inner.session_id != session_id {
+            return Ok(None);
+        }
+        let frames = inner
+            .slots
+            .iter()
+            .map(|slot| slot.frame.as_ref().map(|frame| Arc::clone(&frame.rgb)))
+            .collect::<Vec<_>>();
+        Ok(Some(GridSnapshot {
+            frames,
+            tile_width: inner.tile_width,
+            tile_height: inner.tile_height,
+            columns: inner.columns,
+        }))
+    }
+
+    /// timer 拼接好 grid + 编码完 JPEG 后写回 hub。
+    /// 同时记录 grid 诊断日志，节流到 1Hz。
+    fn publish_grid_frame(
+        &self,
+        session_id: u64,
+        grid_frame: Frame,
+        grid_jpeg: Vec<u8>,
+        compose_ms: u128,
+        grid_encode_ms: u128,
+    ) -> Result<()> {
+        let grid_created_at = Instant::now();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stream hub is poisoned"))?;
+        if !inner.active || inner.session_id != session_id {
+            return Ok(());
+        }
+        let grid_interval = inner
+            .grid
+            .as_ref()
+            .map(|frame| grid_created_at.duration_since(frame.created_at));
+        inner.grid_seq += 1;
+        let grid_seq = inner.grid_seq;
+        let grid_warning = grid_interval
+            .map(|interval| interval > DIAGNOSTIC_WARN_THRESHOLD)
+            .unwrap_or(false)
+            || compose_ms > DIAGNOSTIC_WARN_THRESHOLD.as_millis()
+            || grid_encode_ms > DIAGNOSTIC_WARN_THRESHOLD.as_millis();
+        if should_log_diagnostic(
+            &mut inner.last_grid_diagnostic_log_at,
+            grid_created_at,
+            grid_warning,
+        ) {
+            log::info!(
+                "{BACKEND_DIAGNOSTIC_PREFIX} category=grid_frame level={} grid_seq={} compose_ms={} encode_ms={} interval_ms={}",
+                diagnostic_level(grid_warning),
+                grid_seq,
+                compose_ms,
+                grid_encode_ms,
+                diagnostic_duration_ms(grid_interval)
+            );
+        }
+        inner.grid = Some(StreamFrame {
+            seq: grid_seq,
+            width: grid_frame.width,
+            height: grid_frame.height,
+            jpeg: Arc::new(grid_jpeg),
+            rgb: Arc::new(grid_frame),
+            capture_ms: 0,
+            encode_ms: grid_encode_ms,
+            created_at: grid_created_at,
+        });
+        inner.last_grid_encode_at = Some(grid_created_at);
+        self.changed.notify_all();
+        Ok(())
     }
 
     fn wait_slot_frame(&self, slot: usize, last_seq: u64) -> Option<StreamFrame> {
@@ -1397,13 +1543,13 @@ fn publish_stream_packet(
     app: &tauri::AppHandle,
     packet: FramePacket,
 ) -> Result<()> {
-    let started = Instant::now();
-    let jpeg = encode_frame_jpeg(&packet.frame)?;
-    let encode_ms = started.elapsed().as_millis();
+    // 不再每帧 encode 单 tile JPEG —— 前端走 /grid.mjpeg 由 grid_timer 统一编码。
+    // 4 路 × ~22fps × 3ms encode = ~265ms/s（>1/4 核）的 CPU 浪费，省掉。
+    // 单 tile JPEG 留空，/slot/N.mjpeg endpoint 暂不可用（无需求时不再发负担）。
     let slot = packet.slot;
     let index = packet.index;
     let seq = packet.seq;
-    let Some(frame) = hub.publish_slot_frame(session_id, packet, jpeg, encode_ms)? else {
+    let Some(frame) = hub.publish_slot_frame(session_id, packet, Vec::new(), 0)? else {
         return Ok(());
     };
     // 把"frame"事件 emit 到前端的频率限制到 5Hz：
