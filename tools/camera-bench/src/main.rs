@@ -11,7 +11,10 @@ use anyhow::{Context, Result};
 use image::{codecs::jpeg::JpegEncoder, imageops, ExtendedColorType, RgbImage};
 use nokhwa::{
     pixel_format::RgbFormat,
-    utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution},
+    utils::{
+        ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
+        Resolution,
+    },
     Camera,
 };
 use std::{
@@ -68,6 +71,8 @@ struct Args {
     height: u32,
     fps: u32,
     format: FrameFormat,
+    list: bool,
+    probe: bool,
 }
 
 impl Args {
@@ -78,6 +83,8 @@ impl Args {
         let mut height = 480u32;
         let mut fps = 30u32;
         let mut format = FrameFormat::MJPEG;
+        let mut list = false;
+        let mut probe = false;
 
         let argv: Vec<String> = env::args().collect();
         let mut i = 1;
@@ -111,6 +118,14 @@ impl Args {
                     };
                     i += 2;
                 }
+                "--list" => {
+                    list = true;
+                    i += 1;
+                }
+                "--probe" => {
+                    probe = true;
+                    i += 1;
+                }
                 other => {
                     eprintln!("unknown arg: {other}");
                     i += 1;
@@ -124,15 +139,116 @@ impl Args {
             height,
             fps,
             format,
+            list,
+            probe,
         }
     }
 }
 
+/// 列出每个相机支持的所有 (resolution, fps, frame_format) 组合，
+/// 方便用户挑一个真实可用的参数再跑 bench。
+fn list_all_cameras() -> Result<()> {
+    let devices = nokhwa::query(ApiBackend::Auto).unwrap_or_default();
+    if devices.is_empty() {
+        println!("(no cameras found)");
+        return Ok(());
+    }
+    for d in &devices {
+        println!("\n# camera #{} {}", d.index(), d.human_name());
+        // 用 None 打开，nokhwa 会用设备默认格式，避免占用太久
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+        let mut cam = match Camera::new(d.index().clone(), requested) {
+            Ok(c) => c,
+            Err(err) => {
+                println!("  (failed to open: {err})");
+                continue;
+            }
+        };
+        let formats = cam.compatible_camera_formats().unwrap_or_default();
+        if formats.is_empty() {
+            println!("  (no compatible formats reported)");
+            continue;
+        }
+        for f in formats {
+            println!(
+                "  {}x{} @ {}fps {:?}",
+                f.resolution().width(),
+                f.resolution().height(),
+                f.frame_rate(),
+                f.format()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 探测：依次按 (640x480 MJPEG @ {1,5,10,15,20,25,30,60}) 打开相机，
+/// 实测每秒钟能拿到多少帧。用于判断 driver 协商出来的 fps 是否真的能跑到。
+fn probe_fps(args: &Args) -> Result<()> {
+    println!("[probe] camera #0 {}x{} MJPEG, sweep fps", args.width, args.height);
+    let candidates = [1u32, 5, 10, 15, 20, 24, 25, 30, 60];
+    for &fps in &candidates {
+        let format = CameraFormat::new(
+            Resolution::new(args.width, args.height),
+            FrameFormat::MJPEG,
+            fps,
+        );
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(format));
+        let mut cam = match Camera::new(CameraIndex::Index(0), requested) {
+            Ok(c) => c,
+            Err(err) => {
+                println!("  request fps={fps:>3}  open FAILED: {err}");
+                continue;
+            }
+        };
+        if let Err(err) = cam.open_stream() {
+            println!("  request fps={fps:>3}  stream FAILED: {err}");
+            continue;
+        }
+        let neg_fps = cam.frame_rate();
+        let neg_res = cam.resolution();
+        // warm up 3 frames
+        for _ in 0..3 {
+            let _ = cam.frame();
+        }
+        // 测 1 秒内能取多少帧
+        let start = Instant::now();
+        let mut count = 0u32;
+        while start.elapsed() < Duration::from_secs(1) {
+            if cam.frame().is_ok() {
+                count += 1;
+            }
+        }
+        println!(
+            "  request fps={fps:>3}  negotiated={}x{}@{}fps  measured={:.1} fps in 1s",
+            neg_res.width(),
+            neg_res.height(),
+            neg_fps,
+            count as f64
+        );
+        drop(cam);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
 fn open_camera(idx: u32, args: &Args) -> Result<Camera> {
+    // Closest 比 Exact 更稳：相机若不支持精确的 (w,h,fmt,fps) 组合，
+    // Exact 会 fallback 到设备返回的第一个格式（常见是 1fps），导致 frame()
+    // 像被卡住一样；Closest 会找最接近的可用格式（比如 30fps 不行就 25fps）。
     let format = CameraFormat::new(Resolution::new(args.width, args.height), args.format, args.fps);
-    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(format));
+    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(format));
     let mut camera = Camera::new(CameraIndex::Index(idx), requested)
         .with_context(|| format!("failed to open camera #{idx}"))?;
+    let res = camera.resolution();
+    let fps = camera.frame_rate();
+    let fmt = camera.frame_format();
+    if fps != args.fps || res.width() != args.width || res.height() != args.height || fmt != args.format {
+        eprintln!(
+            "  [warn] camera #{idx} negotiated to {}x{} @ {}fps fmt={:?} (requested {}x{} @ {}fps {:?})",
+            res.width(), res.height(), fps, fmt, args.width, args.height, args.fps, args.format
+        );
+    }
     camera
         .open_stream()
         .with_context(|| format!("failed to start stream on camera #{idx}"))?;
@@ -159,6 +275,14 @@ fn encode_jpeg_via_rgbimage(rgb: &[u8], w: u32, h: u32, quality: u8) -> Result<V
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.list {
+        return list_all_cameras();
+    }
+    if args.probe {
+        return probe_fps(&args);
+    }
+
     println!(
         "[bench] slots={} frames={} {}x{}@{}fps fmt={:?}",
         args.slots, args.frames, args.width, args.height, args.fps, args.format
