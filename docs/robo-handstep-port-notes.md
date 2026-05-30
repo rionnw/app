@@ -156,17 +156,65 @@ C 端原版每个递归节点都开 `int tempMoveBuff[120]` 整块复制。
 
 测试：`tests::malformed_input_does_not_panic`。
 
-### 5.10 实施后的性能对比（10 face 输入 / release 模式 / 200 次）
+### 5.10 实施后的性能对比
+
+#### 第一轮（5.2/5.3/5.4/5.5/5.6 完成后）
+
+10 face 输入 / release / 200 次：
 
 | 指标            | 优化前  | 优化后 | 提升  |
 | --------------- | ------- | ------ | ----- |
 | `Engine::new()` | 22 µs   | 0.5 µs | ~45×  |
 | `search()`      | 931 µs  | 284 µs | ~3.3× |
 
-`Engine::new` 主要受益于 5.3（操作库不再每实例重建）；`search`
-主要受益于 5.2（DFS 不再每节点全量备份 g_mov_buff）。
+`Engine::new` 主要受益于 5.3；`search` 主要受益于 5.2。
 
-baseline 18+5 个用例输出全部 byte-equivalent，未引入语义偏移。
+#### 第二轮（lazy book + 入口写消除 + book_index 展开）
+
+| 输入长度 | search 提升 | DFS 节点 | µs/node |
+| -------- | ----------- | -------- | ------- |
+| 1 face   | 1.5 → 0.24 µs（**6×**） | 18    | 13 ns   |
+| 2 face   | 5.1 → 3.8 µs            | 41    | 93 ns   |
+| 3 face   | 9.9 → 8.6 µs            | 71    | 121 ns  |
+| 5 face   | 29 → 28 µs              | 185   | 145 ns  |
+| 7 face   | 54 → 53 µs              | 310   | 170 ns  |
+| 10 face  | 177 → 177 µs            | 1107  | 160 ns  |
+
+**结论**：`book_init` 改 lazy（epoch 计数）只对短查询显著；
+长查询 (≥5 face) DFS 主体已经主导，每节点 ~150 ns 已经接近
+cache 友好小函数的极限。
+
+baseline 23 个用例（18 单 face + 5 多 face）输出全部 byte-equivalent。
+
+#### 不再继续的原因
+
+- 1 个 Kociemba 解通常 15-25 face；按线性外推 ~300-500 µs/解
+- firmware 串口 115200 bps × 一帧 ~10 字节 ≈ 1 ms，**翻译时间已
+  远低于传输时间**
+- 上位机调用频率每秒最多十次，不会成瓶颈
+
+继续算法层（IDA*、variant 按 time 排序、去递归）的工作量大、
+等价性风险高，性价比急剧下降——已记入 §5.11 待选项。
+
+### 5.11 待选优化（暂不实施）
+
+- **A. OP_TABLE 内 16 variant 按 group.time 排序**：让 DFS 早期
+  hit 短 time 的分支，强化后续 book 剪枝。预期 10 face 收益
+  10-20%。风险：变更数据表布局、需要重新校准 baseline 输出
+  （新输出才是"真正最优"，但与 C 端逐字节不再等价）。
+- **B. IDA\* 替代当前 DFS+book**：admissible heuristic 下界用
+  `min(group.time)`，每次 deepen 阈值。工作量大。
+- **C. `RotMtplRot` 改 24 个置换的查表**：cube_rot 是
+  octahedral 群元素，可以编码成 0-23 的 ID + `compose[24][24]`
+  查表替代 9 次循环。工作量中。
+- **D. DFS 改迭代 + 显式栈**：函数调用开销不大，主要是消除
+  borrow checker 友好的状态拷贝模板代码。收益微。
+- **E. `Box<[BookCell; N]>` 改 `Box<[u32; N]>` 紧凑表示**：
+  把 epoch+time 编码到一个 u32（高 16 位 epoch + 低 16 位 time）。
+  cache 占用从 64×8 = 512 KB 降到 64 KB（注：这里是按 cache
+  line 算的——实际数据 16200×8 = 130KB → 16200×4 = 65KB）。
+  需要 time 不超过 i16 上限 32767。10 face 累计 time 通常
+  <2000，安全。预期 cache miss 减少 20-30%。
 
 ### 5.7 顶层无状态 API
 

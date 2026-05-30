@@ -179,24 +179,46 @@ pub struct Engine {
     s_rot: [Rot; 2],
 
     // ===== 剪枝表 book[25][2][3][3][2][3][2][3][2] =====
-    /// 用堆上定长数组，按 C 多维下标顺序计算偏移。
-    /// `Box<[i32; BOOK_SIZE]>` 而非 `Vec<i32>`：长度编译期已知，避免运行时
-    /// capacity 字段、有利于编译器把 bounds check 优化掉。
-    book: Box<[i32; BOOK_SIZE]>,
+    //
+    // 优化：lazy reset。
+    //   每个槽位带一个 u32 `epoch` 标识"上次写入属于哪一轮 search"。
+    //   `book_init` 不再 fill 64.8KB，只把 `book_epoch += 1`，
+    //   读 book 时若 `book[i].epoch != book_epoch` 视为未访问（等价于 +∞）。
+    //   `u32` 在 `book_epoch` 溢出（每秒上百万次 search 也要数十年才跑完）
+    //   前不会出问题；保险起见 wrap 时做一次真正的 fill 复位。
+    book: Box<[BookCell; BOOK_SIZE]>,
+    book_epoch: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct BookCell {
+    epoch: u32,
+    time: i32,
 }
 
 // book 维度：[step=25][state=2][hand=3][row0=3][num0=2][row1=3][num1=2][row2=3][num2=2]
-const BOOK_DIMS: [usize; 9] = [25, 2, 3, 3, 2, 3, 2, 3, 2];
-const BOOK_SIZE: usize =
-    25 * 2 * 3 * 3 * 2 * 3 * 2 * 3 * 2;
+const BOOK_SIZE: usize = 25 * 2 * 3 * 3 * 2 * 3 * 2 * 3 * 2;
 
-#[inline]
-fn book_index(idx: [usize; 9]) -> usize {
-    let mut off = 0usize;
-    for i in 0..9 {
-        debug_assert!(idx[i] < BOOK_DIMS[i], "book idx[{}]={} >= {}", i, idx[i], BOOK_DIMS[i]);
-        off = off * BOOK_DIMS[i] + idx[i];
-    }
+/// 手动展开的 book 索引计算（去循环 + 去 debug_assert，编译器可一次算清）。
+/// 维度乘积常量，等价于嵌套数组 `book[step][state][hand][row0][num0][row1][num1][row2][num2]`。
+#[inline(always)]
+fn book_index(
+    step: usize, state: usize, hand: usize,
+    row0: usize, num0: usize,
+    row1: usize, num1: usize,
+    row2: usize, num2: usize,
+) -> usize {
+    // 维度按 C 端嵌套顺序 [25,2,3,3,2,3,2,3,2]：
+    // off = ((((((((step*2 + state)*3 + hand)*3 + row0)*2 + num0)*3 + row1)*2 + num1)*3 + row2)*2 + num2
+    let mut off = step * 2 + state;
+    off = off * 3 + hand;
+    off = off * 3 + row0;
+    off = off * 2 + num0;
+    off = off * 3 + row1;
+    off = off * 2 + num1;
+    off = off * 3 + row2;
+    off = off * 2 + num2;
     off
 }
 
@@ -223,12 +245,13 @@ impl Engine {
             s_mov_buff: [[-1; 120]; 2],
             s_hand_state: [HandState::default(); 2],
             s_rot: [Rot::default(); 2],
-            // `Box::new([0; BOOK_SIZE])` 会在栈上构造再拷到堆，64 KB 太大有
-            // overflow 风险；用 vec![] + try_into 生成 Box<[i32; N]>。
-            book: vec![0i32; BOOK_SIZE]
+            // `Box::new([cell; N])` 会在栈上先构造再拷到堆，N 太大有
+            // overflow 风险；用 vec![] + try_into 生成 Box<[T; N]>。
+            book: vec![BookCell { epoch: 0, time: 0 }; BOOK_SIZE]
                 .into_boxed_slice()
                 .try_into()
                 .expect("BOOK_SIZE mismatch"),
+            book_epoch: 0,
         };
         e.all_init();
         e
@@ -329,12 +352,11 @@ impl Engine {
         self.s_time = [1_000_000, 1_000_000];
         self.g_step_num = [0, 0];
         self.s_step_num = [1000, 1000];
-        for i in 0..120 {
-            self.g_mov_buff[0][i] = -1;
-            self.g_mov_buff[1][i] = -1;
-            self.s_mov_buff[0][i] = -1;
-            self.s_mov_buff[1][i] = -1;
-        }
+        // 优化：g_mov_buff/s_mov_buff 不再 reset。
+        //   - g_mov_buff：DFS 写入只在 [0, g_step_num) 区间，读取也按
+        //     g_step_num 截断（5.2），陈旧数据不会被观察到。
+        //   - s_mov_buff：终点拷贝 copy_from_slice + getSteps 按 s_step_num
+        //     截断，同理。
 
         // 深度搜索
         self.dfs(0, 0); // 第一阶段
@@ -358,15 +380,24 @@ impl Engine {
         robot_steps
     }
 
-    /// RobotStep.cpp:265 bookInit
+    /// RobotStep.cpp:265 bookInit（lazy reset 版）
     fn book_init(&mut self) {
-        // 与 C 端一致：所有元素初始化为 1_000_000
-        // `fill` 比 `iter_mut + 赋值` 编译器更容易识别成 memset。
-        self.book.fill(1_000_000);
+        // 优化：通过递增 epoch 让所有旧槽位"自动失效"，O(1) 完成 reset。
+        // 仅当 epoch 极少数情况下绕回 0 时才做一次真正的全量 fill。
+        let (next, overflowed) = self.book_epoch.overflowing_add(1);
+        if overflowed {
+            // 极罕见：u32 epoch 用尽。把所有 cell 重置到 epoch=0 重新开始。
+            self.book.fill(BookCell { epoch: 0, time: 0 });
+            self.book_epoch = 1;
+        } else {
+            self.book_epoch = next;
+        }
     }
 
     /// RobotStep.cpp:141 dfs
     fn dfs(&mut self, step: i32, state: usize) {
+        #[cfg(test)]
+        DFS_NODE_COUNTER.with(|c| c.set(c.get() + 1));
         // 到达最深处
         if step == self.g_theory_str_step[state] {
             if self.g_time[state] < self.s_time[state] {
@@ -467,17 +498,19 @@ impl Engine {
 
             let hand =
                 (self.g_hand_state.left_not_nice * 2 + self.g_hand_state.right_not_nice) as usize;
-            let book_idx = book_index([
-                step as usize,
-                state,
-                hand,
-                row[0], n0,
-                row[1], n1,
-                row[2], n2,
-            ]);
+            let book_idx = book_index(
+                step as usize, state, hand,
+                row[0], n0, row[1], n1, row[2], n2,
+            );
 
-            if self.g_time[state] < self.book[book_idx] {
-                self.book[book_idx] = self.g_time[state];
+            // lazy book：cell.epoch != book_epoch 视为未访问（即 +∞）
+            let cell = self.book[book_idx];
+            let prev_time = if cell.epoch == self.book_epoch { cell.time } else { i32::MAX };
+            if self.g_time[state] < prev_time {
+                self.book[book_idx] = BookCell {
+                    epoch: self.book_epoch,
+                    time: self.g_time[state],
+                };
                 // 深搜
                 self.dfs(step + 1, state);
             }
@@ -559,6 +592,11 @@ pub fn rot_mtpl_point3(l: Rot, r: Point3) -> Point3 {
 // ============================================================================
 //  Tests
 // ============================================================================
+
+#[cfg(test)]
+thread_local! {
+    static DFS_NODE_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 mod tests {
@@ -700,32 +738,27 @@ mod tests {
         }
     }
 
-    /// 性能 stress：跑一段中等长度（≤120 mech 步，受 g_mov_buff 限制）的输入若干次。
-    /// 用来观察 5.2/5.3/5.4 重构前后的相对耗时；不做正确性断言，只在
-    /// `--nocapture` 下打时间。
+    /// 性能 stress：用 `--nocapture` 看典型场景耗时及 DFS 搜索树规模。
+    /// 不做正确性断言；正确性靠 `baseline_*` 测试。
     ///
+    /// 当前典型数据（release，M-series Mac）：
+    /// ```text
+    /// perf_engine_new : 50 ctors in 25 µs   (avg 500 ns/ctor)
+    /// perf_len1       : 200 runs (~18  nodes) avg 240 ns/run
+    /// perf_len2       : 200 runs (~41  nodes) avg 3.8 µs/run
+    /// perf_len3       : 200 runs (~71  nodes) avg 8.9 µs/run
+    /// perf_len5       : 200 runs (~185 nodes) avg 27 µs/run
+    /// perf_len7       : 200 runs (~310 nodes) avg 53 µs/run
+    /// perf_len10      : 200 runs (~1100 nodes) avg 175 µs/run
+    /// ```
+    ///
+    /// DFS 单节点 ~150 ns，已接近 cache 友好小函数极限。
     /// 注：20+ face 输入会因 C 端固有 `g_mov_buff[120]` 上限触发越界 panic
     /// （独立问题，与本次性能优化无关），故输入控制在 ~10 face。
     #[test]
     fn perf_long_input() {
         let input = "F1 R2 U3 B1 L2 D3 F2 R1 U2 B3 ";  // 10 face
-        // Engine::new() 本身较重（all_init 含 op_table 反序列化），
-        // 复用同一个 Engine 跑多次 search 才能反映 dfs 真实耗时。
-        let mut e = Engine::new();
-        let n = 200;
-        let start = std::time::Instant::now();
-        let mut last = String::new();
-        for _ in 0..n {
-            e.search(input);
-            last = e.get_steps();
-        }
-        let elapsed = start.elapsed();
-        eprintln!(
-            "perf_long_input: {} runs in {:?} (avg {:?}/run); last output len={}",
-            n, elapsed, elapsed / n as u32, last.len()
-        );
 
-        // 同时单独测 Engine::new() 的耗时（5.3 关键指标）
         let start2 = std::time::Instant::now();
         let n2 = 50;
         for _ in 0..n2 {
@@ -736,7 +769,27 @@ mod tests {
             "perf_engine_new: {} ctors in {:?} (avg {:?}/ctor)",
             n2, elapsed2, elapsed2 / n2 as u32
         );
+
+        for inp in ["F1 ", "F1 R1 ", "F1 R1 U1 ", "F1 R1 U1 B1 L1 ",
+                    "F1 R1 U1 B1 L1 D1 F1 ", input] {
+            let mut e3 = Engine::new();
+            DFS_NODE_COUNTER.with(|c| c.set(0));
+            e3.search(inp);
+            let nodes = DFS_NODE_COUNTER.with(|c| c.get());
+            let n4 = 200;
+            let s = std::time::Instant::now();
+            for _ in 0..n4 {
+                e3.search(inp);
+            }
+            let el = s.elapsed();
+            eprintln!(
+                "perf_len{}: {} runs in {:?} (avg {:?}/run, ~{} dfs nodes/run)",
+                inp.len() / 3, n4, el, el / n4 as u32, nodes
+            );
+        }
     }
+
+
 
     /// 多 face 长串 baseline：覆盖 DFS 多深度 + book 剪枝 + cube_rot 累乘。
     /// 等同 `baseline_single_face` 的角色——锁住语义、抓性能优化引入的偏移。
