@@ -10,7 +10,10 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev --release",
     "tauri:dev:debug": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "bench:build": "cargo build --release -p camera-bench",
+    "bench:list": "cargo run --release -p camera-bench -- --list",
+    "bench:probe": "cargo run --release -p camera-bench -- --probe"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

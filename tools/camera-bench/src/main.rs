@@ -188,28 +188,12 @@ fn probe_fps(args: &Args) -> Result<()> {
     let res = Resolution::new(args.width, args.height);
     println!("[probe] camera #0 sweep at {}x{}", args.width, args.height);
 
-    let strategies: Vec<(String, RequestedFormatType)> = vec![
-        (
-            "Closest(MJPEG@30)".to_string(),
-            RequestedFormatType::Closest(CameraFormat::new(res, FrameFormat::MJPEG, 30)),
-        ),
-        (
-            "Closest(MJPEG@25)".to_string(),
-            RequestedFormatType::Closest(CameraFormat::new(res, FrameFormat::MJPEG, 25)),
-        ),
-        (
-            "Closest(MJPEG@15)".to_string(),
-            RequestedFormatType::Closest(CameraFormat::new(res, FrameFormat::MJPEG, 15)),
-        ),
-        (
-            "Closest(YUYV@30)".to_string(),
-            RequestedFormatType::Closest(CameraFormat::new(res, FrameFormat::YUYV, 30)),
-        ),
+    let mut strategies: Vec<(String, RequestedFormatType)> = vec![
         (
             // 关键策略：在指定分辨率下让 driver 给最高 fps，不手动指定 fps。
             // 这正对应 RobotApp 的 C++ 写法（set FOURCC=MJPG + WIDTH/HEIGHT，
             // 不 set FPS，由 driver 自动给最高）。
-            format!("HighestResolution({}x{}) [highest fps for that res]", args.width, args.height),
+            format!("HighestResolution({}x{})", args.width, args.height),
             RequestedFormatType::HighestResolution(res),
         ),
         (
@@ -221,22 +205,38 @@ fn probe_fps(args: &Args) -> Result<()> {
             RequestedFormatType::AbsoluteHighestResolution,
         ),
         (
-            "HighestFrameRate(30) [highest res at 30fps]".to_string(),
+            "HighestFrameRate(30)".to_string(),
             RequestedFormatType::HighestFrameRate(30),
         ),
     ];
+
+    // 对所有可能的 FrameFormat 都尝试一次 Closest@30，看 nokhwa MSMF 后端
+    // 哪些格式实际能拿到帧。Logi C270 在 MSMF 下只暴露 NV12 / YUYV，没有 MJPEG，
+    // 这里要把 NV12 / YUYV 也测出来。
+    for fmt in [
+        FrameFormat::MJPEG,
+        FrameFormat::YUYV,
+        FrameFormat::NV12,
+        FrameFormat::GRAY,
+        FrameFormat::RAWRGB,
+    ] {
+        strategies.push((
+            format!("Closest({:?}@30)", fmt),
+            RequestedFormatType::Closest(CameraFormat::new(res, fmt, 30)),
+        ));
+    }
 
     for (name, strategy) in strategies {
         let requested = RequestedFormat::new::<RgbFormat>(strategy);
         let mut cam = match Camera::new(CameraIndex::Index(0), requested) {
             Ok(c) => c,
             Err(err) => {
-                println!("  {:<30}  open FAILED: {err}", name);
+                println!("  {:<32}  open FAILED: {err}", name);
                 continue;
             }
         };
         if let Err(err) = cam.open_stream() {
-            println!("  {:<30}  stream FAILED: {err}", name);
+            println!("  {:<32}  stream FAILED: {err}", name);
             continue;
         }
         let neg_fps = cam.frame_rate();
@@ -255,7 +255,7 @@ fn probe_fps(args: &Args) -> Result<()> {
             }
         }
         println!(
-            "  {:<30}  negotiated={}x{}@{}fps {:?}  measured={:.1} fps",
+            "  {:<32}  negotiated={}x{}@{}fps {:?}  measured={:.1} fps",
             name,
             neg_res.width(),
             neg_res.height(),
