@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { save as dialogSave } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import {
@@ -226,6 +227,9 @@ function App() {
   const [imageName, setImageName] = useState("实时相机画面");
   const [frameStats, setFrameStats] = useState("stream idle");
   const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
+  /// 相机已打开时记下 grid MJPEG URL 与原始尺寸，便于"读取图片→切回相机"在不重开相机的情况下恢复视图
+  const [cameraStreamUrl, setCameraStreamUrl] = useState<string | null>(null);
+  const [cameraStreamSize, setCameraStreamSize] = useState<{ width: number; height: number } | null>(null);
   const [imageBox, setImageBox] = useState<ImageBox>({ left: 0, top: 0, width: 0, height: 0 });
 
   const [regions, setRegions] = useState<RoiRegion[]>(createDefaultRoiRegions);
@@ -703,6 +707,8 @@ function App() {
       lastCanvasFrameLogAtRef.current = null;
       setImageSrc(stream.gridUrl);
       setImageSource("camera");
+      setCameraStreamUrl(stream.gridUrl);
+      setCameraStreamSize({ width: stream.width, height: stream.height });
       setNaturalSize({ width: stream.width, height: stream.height });
       setCameraStatuses(stream.statuses);
       setFrameStats("stream restarting");
@@ -742,6 +748,8 @@ function App() {
       lastCanvasFrameLogAtRef.current = null;
       setImageSrc(stream.gridUrl);
       setImageSource("camera");
+      setCameraStreamUrl(stream.gridUrl);
+      setCameraStreamSize({ width: stream.width, height: stream.height });
       setNaturalSize({ width: stream.width, height: stream.height });
       setCameraStatuses(stream.statuses);
       setImageName("实时相机流");
@@ -761,8 +769,13 @@ function App() {
       setCameraStatuses([]);
       setCameraControls([]);
       setLoadedControlSlot(null);
-      setImageSrc(null);
-      setImageSource(null);
+      // 仅当当前展示的是相机画面时才清空展示；如果用户在看文件图片，保留它
+      if (imageSource === "camera") {
+        setImageSrc(null);
+        setImageSource(null);
+      }
+      setCameraStreamUrl(null);
+      setCameraStreamSize(null);
       lastCameraFrameAtBySlotRef.current = {};
       lastCameraFrameGapLogAtBySlotRef.current = {};
       lastCanvasFrameLogAtRef.current = null;
@@ -1011,28 +1024,45 @@ function App() {
     }
   };
 
+  /// 读取本地图片：仅切换视图源到文件，**不**关闭相机硬件流。
+  /// 相机继续在后端跑，下方 `restoreCameraView` 可以瞬时切回。
   const loadImageFile = async (file: File) => {
-    if (cameraOpen) {
-      try {
-        await invoke("close_camera_stream");
-        setCameraOpen(false);
-        setCameraStatuses([]);
-        setCameraControls([]);
-        setLoadedControlSlot(null);
-      } catch (error) {
-        addLog(`切换到文件图片时关闭相机流失败：${String(error)}`, "warn");
-      }
-    }
     const reader = new FileReader();
     reader.onload = () => {
       setImageSource("file");
       setImageSrc(String(reader.result));
       setImageName(file.name);
       setFrameStats("file loaded");
-      setStatus("已读取图片");
-      addLog(`已读取图片：${file.name}`);
+      setStatus(cameraOpen ? "已读取图片（相机后台运行中）" : "已读取图片");
+      addLog(
+        cameraOpen
+          ? `已读取图片：${file.name}（相机仍在后台运行，可点「切回相机」恢复实时画面）`
+          : `已读取图片：${file.name}`,
+      );
+    };
+    reader.onerror = () => {
+      const msg = reader.error?.message ?? "unknown";
+      addLog(`读取图片失败：${file.name}（${msg}）`, "error");
+      setStatus("读取失败");
     };
     reader.readAsDataURL(file);
+  };
+
+  /// 在相机仍开启的情况下把视图切回相机流（不重新打开硬件，瞬时完成）。
+  const restoreCameraView = () => {
+    if (!cameraOpen || !cameraStreamUrl) {
+      addLog("相机未开启，无法切回相机视图。", "warn");
+      return;
+    }
+    setImageSrc(cameraStreamUrl);
+    setImageSource("camera");
+    if (cameraStreamSize) {
+      setNaturalSize(cameraStreamSize);
+    }
+    setImageName("实时相机流");
+    setFrameStats("stream resumed");
+    setStatus("相机预览中");
+    addLog("已切回相机实时画面。");
   };
 
   const handleStreamImageError = () => {
@@ -1083,12 +1113,49 @@ function App() {
     };
   };
 
+  /// 弹原生保存对话框，默认目录 = 软件安装目录，默认文件名预填好。
+  /// 用户保存到默认目录下的同名文件，下次启动会自动加载（见后端
+  /// `load_default_roi` / `load_move_mapping_from_disk`）；保存到其他位置则
+  /// 仅作导出/备份。返回用户选择的绝对路径，取消时返回 null。
+  const promptSavePath = async (
+    filenameHint: string,
+    title: string,
+  ): Promise<string | null> => {
+    let defaultPath = filenameHint;
+    try {
+      const dirs = await invoke<{ install_dir: string }>("get_default_save_paths");
+      // 用 / 拼接对 macOS / Linux 直接生效；Windows 上 dialog.save 也接受正斜杠
+      defaultPath = `${dirs.install_dir}/${filenameHint}`;
+    } catch {
+      // 拿不到默认目录就只填文件名，让对话框用系统默认起点
+    }
+    const picked = await dialogSave({
+      title,
+      defaultPath,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    return picked ?? null;
+  };
+
   const saveRoi = async () => {
     const filename = "robot-roi.json";
     const { text, format } = getSavedRoiText();
-
+    let target: string | null;
     try {
-      const path = await invoke<string>("save_text_file", { filename, contents: text });
+      target = await promptSavePath(filename, "保存 ROI");
+    } catch (error) {
+      addLog(`打开保存对话框失败：${String(error)}`, "error");
+      return;
+    }
+    if (!target) {
+      addLog("保存 ROI 已取消。");
+      return;
+    }
+    try {
+      const path = await invoke<string>("save_text_file_to_path", {
+        path: target,
+        contents: text,
+      });
       addLog(`ROI 已保存：${path}（${format}）。`);
     } catch (error) {
       try {
@@ -1149,9 +1216,19 @@ function App() {
               </>
             )}
           </div>
-          <button type="button" onClick={() => imageInputRef.current?.click()}>
-            读取图片
-          </button>
+          {cameraOpen && imageSource === "file" ? (
+            <button
+              type="button"
+              onClick={restoreCameraView}
+              title="相机仍在后台运行；点击瞬时切回相机画面"
+            >
+              切回相机
+            </button>
+          ) : (
+            <button type="button" onClick={() => imageInputRef.current?.click()}>
+              读取图片
+            </button>
+          )}
           <button type="button" onClick={saveImage} disabled={!imageSrc && !cameraOpen}>
             保存图片
           </button>

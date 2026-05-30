@@ -1594,28 +1594,52 @@ fn diagnostic_log(message: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 把 ROI 等用户配置文件写入 `app_install_dir/<filename>`。
+#[derive(Debug, Serialize)]
+struct DefaultSavePaths {
+    /// 软件安装目录（用作 dialog.save() 的 defaultPath 起点）
+    install_dir: String,
+    /// ROI 默认文件名（用作 defaultPath 末段）
+    roi_filename: String,
+    /// 步骤映射默认文件名
+    move_mapping_filename: String,
+}
+
+/// 返回前端弹"保存"对话框时用的默认目录与默认文件名。
 ///
-/// 历史上写到 cwd（开发时是 robo-app/，打包后路径不确定），
-/// 现统一到与 `app-config.json` / `move_mapping.json` 相同的安装目录，
-/// 启动时 `load_default_roi` 也优先从该目录读，确保保存→重启可见。
+/// install_dir 来自 `app_install_dir()`（macOS .app bundle 同级目录 / 其它平台
+/// 是可执行文件所在目录），roi_filename / move_mapping_filename 与启动时自动加载
+/// 用的文件名一致——用户保存到这个目录下的同名文件，下次启动会自动读回。
 #[tauri::command]
-fn save_text_file(
-    filename: String,
+fn get_default_save_paths() -> Result<DefaultSavePaths, String> {
+    Ok(DefaultSavePaths {
+        install_dir: app_install_dir()?.display().to_string(),
+        roi_filename: DEFAULT_ROI_FILENAME.to_string(),
+        move_mapping_filename: MOVE_MAPPING_FILENAME.to_string(),
+    })
+}
+
+/// 把任意文本内容写到指定的绝对路径（路径由前端 `dialog.save()` 选好）。
+///
+/// 用于保存 ROI 等用户文件。如果用户把它保存到默认安装目录下的标准文件名
+/// （如 `app_install_dir/robot-roi.json`），启动时会被 `load_default_roi`
+/// 自动读回；保存到其它路径仅作导出/备份。
+#[tauri::command]
+fn save_text_file_to_path(
+    path: String,
     contents: String,
 ) -> Result<String, String> {
-    let safe_filename = Path::new(&filename)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| "文件名无效。".to_string())?;
-    let dir = app_install_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    let path = dir.join(safe_filename);
-
-    std::fs::write(&path, contents).map_err(|err| err.to_string())?;
-    log::info!("文件已保存: {}", path.display());
-    Ok(path.display().to_string())
+    let target = std::path::PathBuf::from(&path);
+    if target.as_os_str().is_empty() {
+        return Err("路径为空。".to_string());
+    }
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+    }
+    std::fs::write(&target, contents).map_err(|err| err.to_string())?;
+    log::info!("文件已保存: {}", target.display());
+    Ok(target.display().to_string())
 }
 
 #[tauri::command]
@@ -2342,9 +2366,13 @@ fn get_move_mapping(state: tauri::State<'_, AppState>) -> Result<MoveMappingDto,
     Ok(MoveMappingDto::from_map(&current_digit_map(&state)))
 }
 
+/// 只更新内存中的 digit_map（校验后），不写文件。
+///
+/// 文件持久化由前端单独调 `save_move_mapping_to_path`（弹 dialog 选路径）。
+/// 当用户保存到默认路径 `app_install_dir/move_mapping.json` 时，下次启动会自动
+/// 读回（见 `load_move_mapping_from_disk`）；保存到其它路径仅作导出/备份。
 #[tauri::command]
 fn set_move_mapping(
-    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     digits: Vec<String>,
 ) -> Result<MoveMappingDto, String> {
@@ -2356,12 +2384,30 @@ fn set_move_mapping(
             .map_err(|_| "digit_map state is poisoned".to_string())?;
         *guard = new_map.clone();
     }
-    let path = move_mapping_path(&app)?;
-    let dto = MoveMappingDto::from_map(&new_map);
+    Ok(MoveMappingDto::from_map(&new_map))
+}
+
+/// 把当前内存中的步骤映射序列化写到指定绝对路径。
+///
+/// 路径由前端 `dialog.save()` 选好；空路径或目录不存在视为错误。
+/// 写入成功后返回最终落盘路径（与传入相同，便于日志展示）。
+#[tauri::command]
+fn save_move_mapping_to_path(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<String, String> {
+    let map = current_digit_map(&state);
+    let dto = MoveMappingDto::from_map(&map);
     let payload = serde_json::to_string_pretty(&dto).map_err(|e| e.to_string())?;
-    std::fs::write(&path, payload).map_err(|e| e.to_string())?;
-    log::info!("动作映射已保存: {}", path.display());
-    Ok(dto)
+    let target = std::path::PathBuf::from(&path);
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::write(&target, payload).map_err(|e| e.to_string())?;
+    log::info!("步骤映射已保存: {}", target.display());
+    Ok(target.display().to_string())
 }
 
 #[tauri::command]
@@ -2806,8 +2852,9 @@ fn roi_candidate_paths() -> Vec<std::path::PathBuf> {
 
 /// 启动时尝试读取默认 ROI 文件 (robot-roi.json)，不存在则返回 null。
 ///
-/// 修改后保存到 `app_install_dir/robot-roi.json`（见 `save_text_file`），
-/// 因此读取优先看那里；若没有再 fallback 到 cwd（兼容默认带的 ROI）。
+/// 用户保存到 `app_install_dir/robot-roi.json`（前端 dialog.save() 默认就指向
+/// 这里）时下次启动会被自动读回；保存到其它路径仅作导出/备份。
+/// 没找到默认路径文件时再 fallback 到 cwd（兼容打包附带的默认 ROI）。
 #[tauri::command]
 fn load_default_roi() -> Option<String> {
     for path in roi_candidate_paths() {
@@ -2836,6 +2883,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .setup(|app| {
             let solver_lock = {
@@ -2887,7 +2935,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             diagnostic_log,
-            save_text_file,
+            save_text_file_to_path,
+            get_default_save_paths,
             list_cameras,
             list_camera_formats,
             open_cameras,
@@ -2914,6 +2963,7 @@ pub fn run() {
             send_steps,
             get_move_mapping,
             set_move_mapping,
+            save_move_mapping_to_path,
             reset_move_mapping,
             get_app_config,
             set_app_config

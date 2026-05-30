@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { save as dialogSave } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState } from "react";
 
 export type MoveMapping = {
@@ -67,13 +68,39 @@ export function MoveMappingEditor({ open, onClose, onSaved }: Props) {
     setInfo(null);
     setSaving(true);
     try {
+      // 1) 先把映射写入内存（校验 + 立即生效），再弹对话框选落盘位置。
       const saved = await invoke<MoveMapping>("set_move_mapping", {
         digits: draft.map((d) => d.trim()),
       });
       setMapping(saved);
       setDraft([...saved.digits]);
-      setInfo("已保存");
       onSaved?.(saved);
+
+      // 2) 弹原生保存对话框，默认目录 = 软件安装目录，默认文件名 move_mapping.json。
+      //    保存到默认目录的同名文件下次启动会自动加载；其它位置仅作导出。
+      let defaultPath = "move_mapping.json";
+      try {
+        const dirs = await invoke<{
+          install_dir: string;
+          move_mapping_filename: string;
+        }>("get_default_save_paths");
+        defaultPath = `${dirs.install_dir}/${dirs.move_mapping_filename}`;
+      } catch {
+        // 拿不到默认目录就让对话框用系统默认
+      }
+      const target = await dialogSave({
+        title: "保存步骤映射",
+        defaultPath,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!target) {
+        setInfo("映射已生效（本次运行），未写入文件。");
+        return;
+      }
+      const written = await invoke<string>("save_move_mapping_to_path", {
+        path: target,
+      });
+      setInfo(`已保存到：${written}`);
     } catch (e) {
       setError(String(e));
     } finally {
