@@ -714,6 +714,53 @@ pre {
   gap: 5px;
 }
 
+/* 解算结果总览：在 Moves/Encoded 上方，横排 4 个关键指标 */
+.solve-overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 6px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--soft);
+}
+
+.solve-overview-empty {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 0.85em;
+  text-align: center;
+}
+
+.solve-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.solve-stat-label {
+  color: var(--muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+}
+
+.solve-stat-value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  font-size: 1rem;
+  color: var(--text);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.solve-stat-sub {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+
 .steps-list,
 .empty-steps {
   min-height: 180px;
@@ -839,15 +886,7 @@ pre {
   }
 }
 
-/* ===== 动作映射弹窗 & 顶栏齿轮按钮 ===== */
-
-.icon-button {
-  width: var(--control-height);
-  min-width: var(--control-height);
-  padding: 0;
-  font-size: 18px;
-  line-height: 1;
-}
+/* ===== 步骤映射弹窗 ===== */
 
 .modal-overlay {
   position: fixed;

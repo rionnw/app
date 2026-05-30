@@ -82,7 +82,25 @@ type SerialReadResponse = {
   param_write_ok: boolean;
   param_write_error: boolean;
 };
-type SolveResponse = { facelets: string; moves: string[]; steps: string[]; encoded_steps: string };
+type SolveResponse = {
+  facelets: string;
+  moves: string[];
+  steps: string[];
+  encoded_steps: string;
+  /// solver 阶段耗时（毫秒）
+  search_elapsed_ms: number;
+  /// 最终选中候选的机械步数
+  mech_steps: number;
+  /// solver 产出的候选数量
+  candidate_count: number;
+};
+
+type SolveStats = {
+  searchElapsedMs: number;
+  mechSteps: number;
+  candidateCount: number;
+  faceMoves: number;
+};
 type ImageBox = { left: number; top: number; width: number; height: number };
 type LogItem = { time: string; text: string; kind: "info" | "warn" | "error" };
 type CameraPreset = { label: string; width: number; height: number; fps: number; frameFormat: string };
@@ -234,6 +252,7 @@ function App() {
   const [moves, setMoves] = useState<string[]>([]);
   const [steps, setSteps] = useState<string[]>([]);
   const [encodedSteps, setEncodedSteps] = useState("");
+  const [solveStats, setSolveStats] = useState<SolveStats | null>(null);
   const [timerRunning, setTimerRunning] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [logs, setLogs] = useState<LogItem[]>([{ time: nowTime(), text: "CubeSolver 已启动。", kind: "info" }]);
@@ -920,7 +939,17 @@ function App() {
     setMoves(result.moves);
     setSteps(result.steps);
     setEncodedSteps(result.encoded_steps);
-    setStatus("已生成步骤");
+    const stats: SolveStats = {
+      searchElapsedMs: result.search_elapsed_ms,
+      mechSteps: result.mech_steps,
+      candidateCount: result.candidate_count,
+      faceMoves: result.moves.length,
+    };
+    setSolveStats(stats);
+    addLog(
+      `解算完成：${stats.faceMoves} 步 Moves → ${result.steps.length} 步机械（mech=${stats.mechSteps}），solver ${stats.searchElapsedMs}ms / ${stats.candidateCount} 候选。`,
+    );
+    setStatus(`已生成步骤（${result.steps.length} 步 / ${stats.searchElapsedMs}ms）`);
   };
 
   const openSerial = async () => {
@@ -1141,12 +1170,10 @@ function App() {
           </button>
           <button
             type="button"
-            className="icon-button"
-            title="动作映射设置"
-            aria-label="动作映射设置"
+            title="编辑步骤映射（M_L1…M_RO → 0-9）"
             onClick={() => setMappingEditorOpen(true)}
           >
-            ⚙
+            步骤映射
           </button>
         </div>
       </header>
@@ -1316,6 +1343,33 @@ function App() {
               </button>
             </div>
             <textarea value={facelets} onChange={(event) => setFacelets(event.target.value)} spellCheck={false} />
+            <div className="solve-overview" aria-label="解算统计总览">
+              {solveStats ? (
+                <>
+                  <div className="solve-stat">
+                    <span className="solve-stat-label">求解耗时</span>
+                    <span className="solve-stat-value">{solveStats.searchElapsedMs} ms</span>
+                  </div>
+                  <div className="solve-stat">
+                    <span className="solve-stat-label">机械步数</span>
+                    <span className="solve-stat-value">
+                      {steps.length}
+                      <span className="solve-stat-sub">mech={solveStats.mechSteps}</span>
+                    </span>
+                  </div>
+                  <div className="solve-stat">
+                    <span className="solve-stat-label">Moves 步数</span>
+                    <span className="solve-stat-value">{solveStats.faceMoves}</span>
+                  </div>
+                  <div className="solve-stat">
+                    <span className="solve-stat-label">候选数</span>
+                    <span className="solve-stat-value">{solveStats.candidateCount}</span>
+                  </div>
+                </>
+              ) : (
+                <div className="solve-overview-empty">尚未解算</div>
+              )}
+            </div>
             <div className="solve-summary">
               <div className="result-box">
                 <label>Moves</label>

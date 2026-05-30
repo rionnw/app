@@ -102,14 +102,15 @@ export function MoveMappingEditor({ open, onClose, onSaved }: Props) {
     <div className="modal-overlay" onMouseDown={onClose}>
       <div className="modal-card" onMouseDown={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <h2>动作-数字映射</h2>
+          <h2>步骤映射</h2>
           <button type="button" className="modal-close" onClick={onClose} aria-label="关闭">
             ×
           </button>
         </div>
 
         <p className="modal-hint">
-          每条助记符（M_L1…M_RO）对应下位机的一个数字字符。10 项必须是 0-9 的一个排列。
+          每条机械步骤助记符（M_L1…M_RO）对应下位机协议里的一个数字字符。
+          10 项必须是 0-9 的一个排列；保存后下次启动自动加载。
         </p>
 
         {loading ? (
