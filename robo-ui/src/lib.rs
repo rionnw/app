@@ -18,10 +18,10 @@ use robo_camera::{
     CameraSlotWorkerEvent, CameraStatusEventKind, FramePacket, MultiCameraCapture,
     MultiCameraSource,
 };
-use robo_core::{CubeFace, Frame, Recognizer, Roi, Steps, Transport};
+use robo_core::{CubeFace, DigitMap, Frame, Recognizer, Roi, Transport};
 use robo_pipeline::multi::translate_optimal;
 use robo_solver::search::{Search, SearchOptions};
-use robo_translator::{default_digit_map, DigitMap, DEFAULT_DIGIT_MAP, MNEMONICS, MOVE_COUNT};
+use robo_translator::{default_digit_map, MNEMONICS, MOVE_COUNT};
 use robo_transport::SerialTransport;
 use robo_vision::ColorClusterRecognizer;
 use serde::{Deserialize, Serialize};
@@ -1517,10 +1517,10 @@ enum SerialRuntime {
 }
 
 impl SerialRuntime {
-    fn send_steps(&mut self, steps: &Steps) -> Result<()> {
+    fn send_steps(&mut self, mnemonics: &[String], digit_map: &DigitMap) -> Result<()> {
         match self {
-            Self::Real(transport) => transport.send_steps(steps),
-            Self::Mock(transport) => transport.send_steps(steps),
+            Self::Real(transport) => transport.send_steps(mnemonics, digit_map),
+            Self::Mock(transport) => transport.send_steps(mnemonics, digit_map),
         }
     }
 
@@ -1550,8 +1550,9 @@ impl MockSerialTransport {
 }
 
 impl Transport for MockSerialTransport {
-    fn send_steps(&mut self, steps: &Steps) -> Result<()> {
-        self.last_payload = Some(steps.encoded.clone());
+    fn send_steps(&mut self, mnemonics: &[String], digit_map: &DigitMap) -> Result<()> {
+        // Mock transport：把发出去的内容存下来供测试断言用，不实际发硬件
+        self.last_payload = Some(robo_transport::encode_mnemonics(mnemonics, digit_map));
         self.responses.push_back(b"OK\n".to_vec());
         self.responses.push_back(b"ND\n".to_vec());
         Ok(())
@@ -2019,7 +2020,7 @@ fn close_serial(state: tauri::State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn send_steps(state: tauri::State<'_, AppState>, encoded_steps: String) -> Result<(), String> {
+fn send_steps(state: tauri::State<'_, AppState>, commands: Vec<String>) -> Result<(), String> {
     let mut serial = state
         .serial
         .lock()
@@ -2027,11 +2028,11 @@ fn send_steps(state: tauri::State<'_, AppState>, encoded_steps: String) -> Resul
     let transport = serial
         .as_mut()
         .ok_or_else(|| "serial port is not open".to_string())?;
-    let steps = Steps {
-        commands: Vec::new(),
-        encoded: encoded_steps,
-    };
-    transport.send_steps(&steps).map_err(|err| err.to_string())
+    // user 当前的 digit_map：transport 用它把 mnemonic 编码成下位机数字字符
+    let digit_map = current_digit_map(&state);
+    transport
+        .send_steps(&commands, &digit_map)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -2068,10 +2069,15 @@ fn solve_face(
     };
     let res = translate_optimal(face.as_str(), opts).map_err(|err| err.to_string())?;
 
-    // res.best.kociemba: "R2 F' D2 ..." (face 序列)
-    // res.best.mech_encoded: "4147094..." (handstep 默认映射下的数字串)
-    // 把 handstep 默认编码 → mnemonic 索引 → user digit_map 重新编码。
-    let (steps, encoded_steps) = remap_handstep_output(&res.best.mech_encoded, &digit_map);
+    // pipeline 输出 mnemonic 列表（语义层），用 user digit_map 编码出"展示串"
+    // 给前端 UI 显示用；真正发到下位机时由 send_steps 重做编码（保证一致）。
+    let steps: Vec<String> = res
+        .best
+        .mech_mnemonics
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let encoded_steps = robo_transport::encode_mnemonics(&steps, &digit_map);
     let moves: Vec<String> = res
         .best
         .kociemba
@@ -2098,32 +2104,6 @@ fn solve_face(
         mech_steps: res.best.mech_steps,
         candidate_count: res.candidates.len(),
     })
-}
-
-/// 把 handstep 输出的"默认 digit_map 编码字符串"翻译成
-/// (mnemonic 助记符列表, user digit_map 编码字符串)。
-///
-/// handstep `MOVE_STR` 与 `robo_translator::DEFAULT_DIGIT_MAP` 字面值
-/// 一致（都是 `["4","3","2","0","1","9","8","7","5","6"]`），所以可以
-/// 用 `DEFAULT_DIGIT_MAP` 反查每个字符对应的 mnemonic 索引。
-fn remap_handstep_output(mech_encoded: &str, digit_map: &DigitMap) -> (Vec<String>, String) {
-    let mut commands: Vec<String> = Vec::with_capacity(mech_encoded.len());
-    let mut encoded = String::with_capacity(mech_encoded.len() * 2);
-    for ch in mech_encoded.chars() {
-        // 跳过空白；正常 handstep 输出全是 0-9
-        if ch.is_whitespace() {
-            continue;
-        }
-        let buf = [ch as u8];
-        let s = std::str::from_utf8(&buf).unwrap_or("");
-        if let Some(idx) = DEFAULT_DIGIT_MAP.iter().position(|d| *d == s) {
-            commands.push(MNEMONICS[idx].to_string());
-            encoded.push_str(&digit_map[idx]);
-        } else {
-            log::warn!("handstep 输出含非法字符 {:?}（来自 {:?}）", ch, mech_encoded);
-        }
-    }
-    (commands, encoded)
 }
 
 fn current_digit_map(state: &AppState) -> DigitMap {
@@ -2462,14 +2442,15 @@ mod tests {
     #[test]
     fn mock_serial_queues_ok_then_motion_done() {
         let mut serial = MockSerialTransport::default();
+        // 用 default digit_map（"4","3","2","0","1","9","8","7","5","6"）
+        // 编码 ["M_L1", "M_LO"] → "41"
+        let digit_map = default_digit_map();
+        let mnemonics = vec!["M_L1".to_string(), "M_LO".to_string()];
         serial
-            .send_steps(&Steps {
-                commands: Vec::new(),
-                encoded: "R U R'".to_string(),
-            })
+            .send_steps(&mnemonics, &digit_map)
             .expect("mock send should succeed");
 
-        assert_eq!(serial.last_payload(), Some("R U R'"));
+        assert_eq!(serial.last_payload(), Some("41"));
         assert_eq!(
             serial.read_available().expect("first read"),
             b"OK\n".to_vec()
@@ -2742,17 +2723,29 @@ pub fn run() {
                 };
             }
 
-            thread::spawn(move || {
-                // 触发 robo-solver 内部 coord/cubie 表的懒加载。
-                // 第一次跑 ~几十 ms（依机器而定），之后 translate_optimal 的
-                // 每次首搜 ~1-50 ms。handstep::Engine 是 per-call 创建（~500 ns），
-                // 其全局 MECH_LIB 也是 OnceLock，第一次 translate_optimal 内会
-                // 触发；这里不显式预热，让首次解算多花 < 1 ms 可接受。
+            // 求解表初始化：在 setup 期间同步完成（spawn + join），
+            // 避免懒加载导致用户第一次解算时多花数十 ms 表生成时间。
+            // join 阻塞 setup 主线程 ~50-100ms（M-series Mac 实测），
+            // 期间 logger / digit_map 加载等其它 setup 已经完成，
+            // 用户感受为"启动多 100ms"，但运行时延迟稳定。
+            //
+            // 用 spawn 而非直接调 Search::init() 是为了：
+            // 1. 不阻塞 main thread 的 panic handler / event loop 注册；
+            // 2. 失败时（极罕见）log 信息仍然完整。
+            let init_handle = thread::spawn(move || {
+                let t0 = Instant::now();
                 Search::init();
                 let _ = solver_lock.set(());
                 let _ = handle.emit("solver-ready", ());
-                log::info!("solver 初始化完成（min2phase Search + handstep 多候选择优）");
+                log::info!(
+                    "solver 初始化完成 ({:?}, min2phase Search + handstep 多候选择优)",
+                    t0.elapsed()
+                );
             });
+            // 同步等待表初始化完成
+            if let Err(e) = init_handle.join() {
+                log::error!("solver init thread panicked: {:?}", e);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

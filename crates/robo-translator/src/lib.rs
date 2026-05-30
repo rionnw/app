@@ -496,8 +496,16 @@ impl HardwareTranslator {
 
 // ===== Public API =====
 
-/// 数字映射表：mnemonic[i] 对应的下位机字符（默认是 0-9 的一个排列）
-pub type DigitMap = [String; MOVE_COUNT];
+/// 数字映射表：mnemonic[i] 对应的下位机字符（默认是 0-9 的一个排列）。
+///
+/// 复用 robo-core 的 `DigitMap` 类型别名（`[String; 10]`），保证与
+/// `Transport::send_steps` 签名一致。`MOVE_COUNT` 等于 `MNEMONIC_COUNT`。
+pub type DigitMap = robo_core::DigitMap;
+
+const _: () = {
+    // 编译期断言：本 crate 的 MOVE_COUNT 与 robo-core 的 MNEMONIC_COUNT 一致
+    assert!(MOVE_COUNT == robo_core::MNEMONIC_COUNT);
+};
 
 pub fn default_digit_map() -> DigitMap {
     let mut out: [String; MOVE_COUNT] = Default::default();

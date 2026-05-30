@@ -10,8 +10,9 @@
 //! ## 与 C 端对应关系
 //! - `Engine` 持有 C 端所有全局变量（避免 Rust 全局可变状态）
 //! - `Engine::all_init()` ≡ `robotstep::allInit()`
-//! - `Engine::search()`   ≡ `robotstep::search()`
-//! - `Engine::get_steps()`≡ `robotstep::getSteps()`
+//! - `Engine::search()`        ≡ `robotstep::search()`
+//! - `Engine::get_mnemonics()` ≡ `robotstep::getSteps()` (但输出 mnemonic 列表
+//!   而非 C 端的数字串拼接——数字编码由上层 transport 用 digit_map 决定)
 //!
 //! ## C 端 bug 修复（§5.1）
 //! `RobotStep.cpp:493-520` `TimeLibInit` 一段 `||`/`&&` 没有加括号，按 C 优先级
@@ -396,17 +397,24 @@ impl Engine {
         self.s_step_num[0] + self.s_step_num[1]
     }
 
-    /// RobotStep.cpp:130 getSteps
-    pub fn get_steps(&self) -> String {
-        let mut robot_steps = String::new();
+    /// 输出搜索结果的机械动作 **mnemonic 列表**（如 `["M_L1", "M_LO", ...]`）。
+    ///
+    /// 对应 C 端 `RobotStep.cpp:130 getSteps`，但 C 端用 `moveStr[10]`
+    /// 直接拼成数字串发给下位机；Rust 移植版把"语义层（mnemonic）"和
+    /// "硬件编码层（digit_map）"解耦：handstep 只输出 mnemonic，由 transport
+    /// 层在发串口前用 digit_map 编码成具体数字字符。
+    ///
+    /// 返回 `Vec<&'static str>`：从 `MNEMONIC_STR` 切片，零拷贝。
+    pub fn get_mnemonics(&self) -> Vec<&'static str> {
+        let mut out = Vec::with_capacity(self.s_step_num[0] as usize);
         for i in 0..self.s_step_num[0] as usize {
             let num = self.s_mov_buff[0][i] as i32;
             if num < 0 || num >= 10 {
                 break;
             }
-            robot_steps.push_str(MOVE_STR[num as usize]);
+            out.push(MNEMONIC_STR[num as usize]);
         }
-        robot_steps
+        out
     }
 
     /// RobotStep.cpp:265 bookInit（lazy reset 版）
@@ -639,6 +647,30 @@ thread_local! {
 mod tests {
     use super::*;
 
+    /// 测试-only：把 mnemonic 列表（如 `["M_LO", "M_L1", ...]`）转回旧
+    /// "数字串"（"4147..."）形式，用于复用 §5.1 修复后捕获的 baseline。
+    /// 数字字符与索引对应见 op_table::OP_TABLE_LEGACY_DIGITS。
+    fn mnemonics_to_legacy_digits(ms: &[&'static str]) -> String {
+        const LEGACY_DIGITS: [&str; 10] = [
+            "4", "3", "2", "0", "1", "9", "8", "7", "5", "6",
+        ];
+        ms.iter()
+            .map(|m| {
+                let idx = MNEMONIC_STR
+                    .iter()
+                    .position(|x| *x == *m)
+                    .expect("non-mnemonic in output");
+                LEGACY_DIGITS[idx]
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// 便利函数：跑一次 search 然后返回 legacy 数字串形式（兼容旧 baseline）。
+    fn legacy_steps(e: &Engine) -> String {
+        mnemonics_to_legacy_digits(&e.get_mnemonics())
+    }
+
     #[test]
     fn engine_constructs() {
         let _e = Engine::new();
@@ -658,7 +690,7 @@ mod tests {
         let mut e = Engine::new();
         let n = e.search("");
         assert_eq!(n, 0);
-        assert_eq!(e.get_steps(), "");
+        assert!(e.get_mnemonics().is_empty());
     }
 
     #[test]
@@ -684,9 +716,10 @@ mod tests {
         // F1 + 末尾必须有空格（C 端按每 3 字符一段切分）
         let n = e.search("F1 ");
         assert!(n > 0);
-        let s = e.get_steps();
-        // 输出全部由 MOVE_STR 字符组成
-        assert!(s.chars().all(|c| MOVE_STR.iter().any(|m| m.starts_with(c))));
+        let mnemonics = e.get_mnemonics();
+        assert!(!mnemonics.is_empty());
+        // 每个输出都来自 MNEMONIC_STR 集合
+        assert!(mnemonics.iter().all(|m| MNEMONIC_STR.contains(m)));
     }
 
     #[test]
@@ -694,8 +727,7 @@ mod tests {
         let mut e = Engine::new();
         let n = e.search("F1 R2 U3 ");
         assert!(n > 0);
-        let s = e.get_steps();
-        assert!(!s.is_empty());
+        assert!(!e.get_mnemonics().is_empty());
     }
 
     /// D1 与 C 端的对齐曾经是 `1906954`（7 步：LO RO LC R3 RO R1 L1）。
@@ -706,8 +738,8 @@ mod tests {
     fn d1_after_time_bug_fix() {
         let mut e = Engine::new();
         let n = e.search("D1 ");
-        let s = e.get_steps();
-        eprintln!("D1: steps={}, output={:?}", n, s);
+        let s = legacy_steps(&e);
+        eprintln!("D1: steps={}, mnemonics={:?}", n, e.get_mnemonics());
         assert_eq!(s, "1406259", "D1（§5.1 修复后的真·时间最短）");
     }
 
@@ -715,8 +747,8 @@ mod tests {
     fn l1_matches_reference() {
         let mut e = Engine::new();
         let n = e.search("L1 ");
-        let s = e.get_steps();
-        eprintln!("L1: steps={}, output={:?}", n, s);
+        let s = legacy_steps(&e);
+        eprintln!("L1: steps={}, mnemonics={:?}", n, e.get_mnemonics());
         assert_eq!(s, "6359", "L1 应当输出 6359（C 端参考）");
     }
 
@@ -739,7 +771,7 @@ mod tests {
         for c in cases {
             let mut e = Engine::new();
             e.search(c);
-            out.push((c, e.get_steps()));
+            out.push((c, legacy_steps(&e)));
         }
         out
     }
@@ -894,7 +926,7 @@ mod tests {
             let n = e.search(&rs);
             let elapsed = start.elapsed();
             let nodes = DFS_NODE_COUNTER.with(|c| c.get());
-            let s = e.get_steps();
+            let s = legacy_steps(&e);
             eprintln!(
                 "[{:2}] {:>2}f mech={:>3} nodes={:>5} t={:>9?} | {}",
                 i, face_count, n, nodes, elapsed, s
@@ -921,12 +953,12 @@ mod tests {
         for (inp, _e_out) in cases {
             let mut e = Engine::new();
             e.search(inp);
-            eprintln!("{} => {}", inp, e.get_steps());
+            eprintln!("{} => {}", inp, legacy_steps(&e));
         }
         for (inp, e_out) in cases {
             let mut e = Engine::new();
             e.search(inp);
-            let actual = e.get_steps();
+            let actual = legacy_steps(&e);
             assert_eq!(&actual, e_out,
                 "多 face baseline 偏移：{:?} 实际 {:?} 期望 {:?}", inp, actual, e_out);
         }

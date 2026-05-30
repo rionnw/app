@@ -24,8 +24,10 @@ pub struct CandidateResult {
     pub kociemba: String,
     /// 翻译后的机械步骤数（mech_steps，越小越优）
     pub mech_steps: i32,
-    /// 机械序列编码字符串（与 robo-handstep::Engine::get_steps() 输出一致）
-    pub mech_encoded: String,
+    /// 机械步骤助记符列表（如 `["M_L1", "M_LO", ...]`），来自
+    /// `robo-handstep::Engine::get_mnemonics()`。最终发到下位机时，
+    /// 由 transport 层用 user `digit_map` 编码成具体数字字符。
+    pub mech_mnemonics: Vec<&'static str>,
 }
 
 /// 端到端多候选择优结果。
@@ -71,11 +73,11 @@ pub fn translate_optimal(
             let robotstep = kociemba_to_robotstep(kociemba);
             let mut engine = HandstepEngine::new();
             let mech_steps = engine.search(&robotstep);
-            let mech_encoded = engine.get_steps();
+            let mech_mnemonics = engine.get_mnemonics();
             CandidateResult {
                 kociemba: kociemba.clone(),
                 mech_steps,
-                mech_encoded,
+                mech_mnemonics,
             }
         })
         .collect();
@@ -145,8 +147,8 @@ mod tests {
         for (i, c) in res.candidates.iter().enumerate() {
             let face_count = c.kociemba.split_whitespace().count();
             eprintln!(
-                "  [{}] {}f → mech={} | {}",
-                i, face_count, c.mech_steps, c.mech_encoded
+                "  [{}] {}f → mech={} | {} mnemonics",
+                i, face_count, c.mech_steps, c.mech_mnemonics.len()
             );
         }
         eprintln!("best: mech={}, kociemba={}", res.best.mech_steps, res.best.kociemba);

@@ -118,8 +118,28 @@ pub trait Translator: Send + Sync {
     fn translate(&self, moves: &Moves) -> Result<Steps>;
 }
 
+/// 下位机数字映射的固定槽位数（与 mnemonic 数量一致）。
+///
+/// 索引顺序与 handstep 的 `MNEMONIC_STR` / robo-translator 的 `MNEMONICS` 一致：
+/// `[M_L1, M_L2, M_L3, M_LC, M_LO, M_R1, M_R2, M_R3, M_RC, M_RO]`
+pub const MNEMONIC_COUNT: usize = 10;
+
+/// 下位机数字映射类型别名（10 个字符串槽位）。
+///
+/// `digit_map[i]` 表示第 i 个 mnemonic（按 `MNEMONIC_COUNT` 注释中的索引顺序）
+/// 在下位机协议里的字符表示，通常是单个数字字符（如 `"4"`），但允许多字符。
+pub type DigitMap = [String; MNEMONIC_COUNT];
+
 pub trait Transport: Send {
-    fn send_steps(&mut self, steps: &Steps) -> Result<()>;
+    /// 发送机械动作序列到下位机。
+    ///
+    /// `mnemonics` 是助记符列表（如 `["M_L1", "M_LO", ...]`，来自 handstep
+    /// 的 `Engine::get_mnemonics()`）。`digit_map` 把每个 mnemonic 翻译成
+    /// 下位机协议里的字符表示——这是设备特有协议参数，由调用方持有。
+    ///
+    /// 实现负责按 `digit_map` 编码后写入硬件。`mnemonics` 中如果包含
+    /// 不在 `MNEMONIC_STR` 集合的项，实现可以选择跳过或返回 Err。
+    fn send_steps(&mut self, mnemonics: &[String], digit_map: &DigitMap) -> Result<()>;
 }
 
 pub fn validate_facelets(facelets: &str) -> Result<()> {

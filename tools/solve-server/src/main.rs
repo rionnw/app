@@ -139,15 +139,20 @@ fn main() {
         ready: AtomicBool::new(false),
     });
 
-    // Init solver tables in background
+    // Init solver tables：用 spawn + join 同步加载，启动时阻塞 ~50-100ms
+    // 完成表生成；之后 health 立即 ready，避免懒加载首次请求多花时间。
     let state_init = Arc::clone(&state);
-    thread::spawn(move || {
+    let init_handle = thread::spawn(move || {
         log::info!("正在初始化 solver 表...");
         let t0 = Instant::now();
         Search::init();
         state_init.ready.store(true, Ordering::Release);
         log::info!("Solver 初始化完成 ({:.2}s)", t0.elapsed().as_secs_f64());
     });
+    if let Err(e) = init_handle.join() {
+        eprintln!("solver init thread panicked: {:?}", e);
+        std::process::exit(1);
+    }
 
     let server = Server::http(&bind).unwrap_or_else(|e| {
         eprintln!("无法绑定 {bind}: {e}");
@@ -348,9 +353,12 @@ fn handle_solve(mut request: Request, state: &AppState, _use_2l: bool) {
             let solution_str = res.best.kociemba.clone();
             let length = solution_str.split_whitespace().count() as i32;
 
-            // mech_encoded 用 handstep 默认 digit map（与 BasicTranslator 默认一致）
-            // 反查得到 mnemonic 列表
-            let hardware_commands = decode_to_mnemonics(&res.best.mech_encoded);
+            // pipeline 已经直接输出 mnemonic 列表，无需反查解码
+            let hardware_commands: Vec<String> =
+                res.best.mech_mnemonics.iter().map(|s| s.to_string()).collect();
+            // server 不持有特定 digit_map，按默认映射给个 encoded 串供客户端展示
+            // （客户端有自定义 digit_map 时可自行重编码 mnemonic 列表）
+            let encoded = encode_with_default_digit_map(&res.best.mech_mnemonics);
 
             let resp = SolveResponse {
                 ok: true,
@@ -360,7 +368,7 @@ fn handle_solve(mut request: Request, state: &AppState, _use_2l: bool) {
                 message: None,
                 facelets: Some(facelets),
                 hardware_commands: Some(hardware_commands),
-                encoded_steps: Some(res.best.mech_encoded.clone()),
+                encoded_steps: Some(encoded),
                 mech_steps: Some(res.best.mech_steps),
                 search_elapsed_ms: Some(res.solver_elapsed.as_millis() as u64),
                 candidate_count: Some(res.candidates.len()),
@@ -386,23 +394,24 @@ fn handle_solve(mut request: Request, state: &AppState, _use_2l: bool) {
     }
 }
 
-/// 把 handstep 输出的"默认 digit map 编码字符串"反查成 mnemonic 列表。
-///
-/// handstep `MOVE_STR = ["4","3","2","0","1","9","8","7","5","6"]` 与
-/// 助记符 `["M_L1","M_L2","M_L3","M_LC","M_LO","M_R1","M_R2","M_R3","M_RC","M_RO"]`
-/// 一一对应（顺序固定，无需引入 robo-translator）。
-const HARDWARE_MNEMONICS: [&str; 10] = [
+/// 用默认 digit map（与 robo-translator::DEFAULT_DIGIT_MAP 一致）把 mnemonic
+/// 列表编码成数字串。Server 不持有客户端自定义 digit_map；客户端如有需要可
+/// 直接根据 hardwareCommands 自行重编码。
+const DEFAULT_DIGIT_MAP_FOR_SERVER: [&str; 10] = [
+    "4", "3", "2", "0", "1", "9", "8", "7", "5", "6",
+];
+const MNEMONICS_FOR_SERVER: [&str; 10] = [
     "M_L1", "M_L2", "M_L3", "M_LC", "M_LO", "M_R1", "M_R2", "M_R3", "M_RC", "M_RO",
 ];
-const HARDWARE_DIGITS: [char; 10] = ['4', '3', '2', '0', '1', '9', '8', '7', '5', '6'];
 
-fn decode_to_mnemonics(encoded: &str) -> Vec<String> {
-    encoded
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .filter_map(|c| HARDWARE_DIGITS.iter().position(|d| *d == c))
-        .map(|i| HARDWARE_MNEMONICS[i].to_string())
-        .collect()
+fn encode_with_default_digit_map(mnemonics: &[&str]) -> String {
+    let mut s = String::with_capacity(mnemonics.len() * 2);
+    for m in mnemonics {
+        if let Some(i) = MNEMONICS_FOR_SERVER.iter().position(|x| x == m) {
+            s.push_str(DEFAULT_DIGIT_MAP_FOR_SERVER[i]);
+        }
+    }
+    s
 }
 
 // ===== Helpers =====

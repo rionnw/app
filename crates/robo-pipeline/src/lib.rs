@@ -1,8 +1,10 @@
 use anyhow::Result;
-use robo_core::{CameraSource, Recognizer, Roi, SolveReport, Solver, Translator, Transport};
+use robo_core::{CameraSource, DigitMap, Recognizer, Roi, SolveReport, Solver, Translator, Transport};
 
 pub mod multi;
 
+/// 旧版同步流水线（按 `Solver` + `Translator` trait 拼装）。新代码应优先用
+/// `multi::translate_optimal`（多候选 + handstep 择优）。本结构保留向后兼容。
 pub struct SolvePipeline<C, R, S, T> {
     camera: C,
     recognizer: R,
@@ -40,6 +42,12 @@ where
     }
 }
 
-pub fn send_report<T: Transport>(transport: &mut T, report: &SolveReport) -> Result<()> {
-    transport.send_steps(&report.steps)
+/// 把 `SolveReport.steps.commands` 当作 mnemonic 列表发到 transport。
+/// 调用方需要传入 `digit_map`（编码用）。
+pub fn send_report<T: Transport>(
+    transport: &mut T,
+    report: &SolveReport,
+    digit_map: &DigitMap,
+) -> Result<()> {
+    transport.send_steps(&report.steps.commands, digit_map)
 }
