@@ -455,16 +455,30 @@ impl HardwareTranslator {
         self.claw_r(true);
     }
 
-    /// 把内部状态强制对齐到括号 (z1s0) 等描述的姿态。
-    /// 不发任何硬件指令；累积器复位到当前角度，避免 finalize 选错回正方向。
-    /// 同时把合并屏障推到当前末尾，禁止后续与 sync 之前的指令合并。
+    /// 把内部状态对齐到括号 (z1s0) 等描述的姿态。
+    ///
+    /// 移植自 firmware `EcmCtrl`（motorControl/Device/MotorControl.c:148）：
+    /// 按目标 jaw 状态做差分调整，**先关再开**以维持"至少一爪闭合"不变量；
+    /// 角度仍走软同步（信任 solver 声明，不补回正旋转），并把合并屏障推到
+    /// 末尾，禁止后续指令跨过 sync 与之前合并。
     fn sync_state(&mut self, sync: StateSync) {
+        // 进入 sync 前先冻结，防止 sync 内发的 claw 指令与 sync 之前的合并。
+        self.frontier = self.moves.len();
+
+        // 1) 需要关的先关（保证后续 open 时另一爪已闭）。
+        if sync.l_claw && !self.l_claw { self.claw_l(true); }
+        if sync.r_claw && !self.r_claw { self.claw_r(true); }
+        // 2) 再开需要开的。
+        if !sync.l_claw && self.l_claw { self.claw_l(false); }
+        if !sync.r_claw && self.r_claw { self.claw_r(false); }
+
+        // 角度软同步：信任 solver。
         self.l_angle = normalize_angle(sync.l_angle);
         self.r_angle = normalize_angle(sync.r_angle);
-        self.l_claw = sync.l_claw;
-        self.r_claw = sync.r_claw;
         self.l_accum = self.l_angle;
         self.r_accum = self.r_angle;
+
+        // sync 出口再次冻结，禁止之后的旋转/夹爪与本次 sync 内发的 claw 合并。
         self.frontier = self.moves.len();
     }
 
@@ -585,34 +599,34 @@ mod tests {
 
     #[test]
     fn whole_x_then_l() {
-        // (s0z1)：L 开@0°，R 闭@+90°
-        //   x = whole_x(-90) → 仅 R3（L 已开/已平，R 由 +90 转 0）
-        // (z1z0)：sync 强制 L 闭@+90°，R 闭@0°
-        //   U = L(-90) → 仅 L3（双爪已闭，L 直接转回 0）
+        // (s0z1)：L 开@0°，R 闭@+90°。从默认双闭出发，sync 需 LO（先关已关，再开 L）。
+        //   x = whole_x(-90) → R3（L 已开/已平，R 由 +90 转 0）
+        // (z1z0)：sync 需 LC（关回 L；R 本就闭）。
+        //   U = L(-90) → L3（双爪已闭，L 由 +90 转 0；frontier 阻止与 LC 合并）
         let moves = Moves::from_solution_string("(s0z1) x  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
-        assert_eq!(steps.commands, vec![mn(Move::R3), mn(Move::L3)]);
+        assert_eq!(steps.commands, vec![mn(Move::LO), mn(Move::R3), mn(Move::LC), mn(Move::L3)]);
     }
 
     #[test]
     fn whole_y_then_l() {
-        // (z1s0)：L 闭@+90°，R 开@0°
+        // (z1s0)：L 闭@+90°，R 开@0°。从默认双闭出发，sync 需 RO。
         //   y = whole_y(-90) → L3（R 已开，L 由 +90 转 0）
-        // (z1z0)：sync 强制 L 闭@+90°，R 闭@0°
-        //   U = L(-90) → L3（双爪闭，L 由 +90 转 0；frontier 阻止与上条 L3 合并）
+        // (z1z0)：sync 需 RC（关回 R）。
+        //   U = L(-90) → L3（双爪闭，L 由 +90 转 0；frontier 阻止合并）
         let moves = Moves::from_solution_string("(z1s0) y  (z1z0) U");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
-        assert_eq!(steps.commands, vec![mn(Move::L3), mn(Move::L3)]);
+        assert_eq!(steps.commands, vec![mn(Move::RO), mn(Move::L3), mn(Move::RC), mn(Move::L3)]);
     }
 
     #[test]
     fn whole_y2_no_reset() {
-        // (z2s0)：L 闭@180°，R 开@0°
+        // (z2s0)：L 闭@180°，R 开@0°。从默认双闭出发，sync 需 RO。
         //   y2 = whole_y(180) → L2（R 已开，L 由 180 翻 180 落到 0=平放）
         // finalize：L 平、R 平开，需要把 R 夹回 → RC
         let moves = Moves::from_solution_string("(z2s0) y2");
         let steps = BasicTranslator::new().translate(&moves).unwrap();
-        assert_eq!(steps.commands, vec![mn(Move::L2), mn(Move::RC)]);
+        assert_eq!(steps.commands, vec![mn(Move::RO), mn(Move::L2), mn(Move::RC)]);
     }
 
     #[test]
@@ -771,17 +785,18 @@ mod tests {
         }
     }
 
-    /// 注意（已知 trade-off）：
-    /// 当前以括号 (z1s0) 等为权威同步内部状态、不补任何回正硬件指令。
-    /// 若括号声明的状态与上一段指令累计后的物理状态不一致（典型场景：
-    /// 求解器在两个动作之间隐含了 regrab/reorient），那么纯按 commands
-    /// 重放会得到与括号不一致的物理状态，进而可能在某一步触发
-    /// 「两臂同时非平放」的硬件约束违反。
-    /// 这是用户显式选择的语义（option A：以括号为准、不回正）。
-    /// 后续如果想恢复硬件级安全检查，需要在每个 sync 处比较内部累计
-    /// 状态与括号宣称状态，差异部分用回正/regrab 指令补齐。
+    /// 硬件约束（移植自 firmware EcmCtrl 不变量）：
+    ///   1. 任何时刻至少一爪闭合
+    ///   2. 任何时刻不允许两爪同时竖起（其中一爪必须平放）
+    ///
+    /// sync_state 已经按 EcmCtrl 差分主动发 claw 指令，**夹爪侧约束**完全成立；
+    /// 但 **角度声明** 仍是软同步（信任 solver 的 bracket 数字、不发回正旋转）。
+    /// 当 solver 在两个动作之间隐含 regrab/reorient 时，bracket 角度会与上一段
+    /// 指令累计的物理角度产生分歧，从而导致下一步旋转把双臂同时立起 → 违约 2。
+    /// 这是已知 trade-off：要根除需要在 sync_state 里比较内部累计与 bracket
+    /// 声明，差异部分用 KZ-mode（爪开空转）的旋转指令补齐——属独立修复点。
     #[test]
-    #[ignore = "信任括号同步语义会导致中间步骤的物理状态偏离括号声明，硬件约束可能违反；属预期 trade-off"]
+    #[ignore = "夹爪约束已修复；角度软同步仍可能让某些组合违约 2，需独立增补 KZ 回正逻辑"]
     fn full_solve_respects_both_constraints() {
         let raw = "(z1s0) y  (z1z0) U  (s1z2) x2 (z3z0) U' (z0z3) R' (z2s1) y2 (z0z2) R2 (z1z0) U  (z1s1) y  (z0z1) R  (z3z0) U' (s1z3) x' (z0z1) R  (z2z0) U2 (z0z1) R  (z2s0) y2 (z0z3) R' (z3z0) U' (s1z3) x' (z0z2) R2 (z2s0) y2 (z0z2) R2 (z1s1) y  (z1z0) U  (z0z2) R2 (s1z2) x2 (z1z0) U  (z0z2) R2 (s1z0)    (z1s0) y  (z0z2) R2";
         let moves = Moves::from_solution_string(raw);
@@ -791,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "同 full_solve_respects_both_constraints：信任括号会让物理累计与括号声明产生分歧"]
+    #[ignore = "同 full_solve_respects_both_constraints：角度软同步引发偶发违约 2"]
     fn single_combos_respect_constraints() {
         let cases = [
             "(z1z0) U (z1z0) R (z1z0) U' (z1z0) R'",
@@ -803,6 +818,31 @@ mod tests {
             let steps = BasicTranslator::new().translate(&moves).unwrap();
             simulate_and_check(&steps.commands, first_bracket_state(raw));
         }
+    }
+
+    /// 用户报告场景：`(z0s1) (s0z1) x (z1z0) U` 的 4 条括号变更必须把
+    /// 对应的夹爪开合指令真正发出去（之前 sync_state 静默吞了夹爪变化）。
+    #[test]
+    fn brackets_emit_claw_transitions() {
+        let moves = Moves::from_solution_string("(z0s1) (s0z1) x (z1z0) U");
+        let steps = BasicTranslator::new().translate(&moves).unwrap();
+        // 期望流程（与 firmware EcmCtrl 差分语义一致）：
+        //   (z0s1)  R 闭→开 → RO
+        //   (s0z1)  R 开→闭、L 闭→开（先关再开）→ RC, LO
+        //   x       whole_x(-90) → R3
+        //   (z1z0)  L 开→闭 → LC
+        //   U       L(-90) → L3
+        assert_eq!(
+            steps.commands,
+            vec![
+                mn(Move::RO),
+                mn(Move::RC),
+                mn(Move::LO),
+                mn(Move::R3),
+                mn(Move::LC),
+                mn(Move::L3),
+            ]
+        );
     }
 
     #[test]
