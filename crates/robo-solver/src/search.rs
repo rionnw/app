@@ -1,6 +1,8 @@
 //! Search - Two-phase IDA* Rubik's Cube solver.
 //! Ported from Search.java.
 
+use std::time::{Duration, Instant};
+
 use crate::util;
 use crate::cubie_cube::{self, CubieCube, URF_MOVE};
 use crate::coord_cube::{self, CoordCubeNode};
@@ -9,6 +11,49 @@ pub const USE_SEPARATOR: i32 = 0x1;
 pub const INVERSE_SOLUTION: i32 = 0x2;
 pub const APPEND_LENGTH: i32 = 0x4;
 pub const OPTIMAL_SOLUTION: i32 = 0x8;
+
+/// 多解搜索参数。
+#[derive(Clone, Copy, Debug)]
+pub struct SearchOptions {
+    /// 总超时（涵盖所有 IDA* 探索 + next() 推进）。达到后立即返回已收集的解。
+    pub timeout: Duration,
+    /// 最多收集几条候选；先到先停。
+    ///
+    /// **注意**：底层 `next()` 只产出"严格更短"的解，所以 N 条候选的
+    /// 长度必然递减。一个典型 cube 的最短解空间有限，往往只能拿到 2-3 条
+    /// （第 1 条快速找到，后续 IDA* 难以在 timeout 内找到更短的）。
+    /// 实际产出可能少于该值。
+    pub max_solutions: usize,
+    /// 单条解的最大 face 数（同 `solution()` 的 `max_depth`）。
+    pub max_depth: i32,
+    /// IDA* 内部 probe 上限（影响搜索强度），通常用 10_000_000。
+    pub probe_max: i64,
+    /// IDA* 内部 probe 下限。
+    pub probe_min: i64,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_millis(500),
+            max_solutions: 5,
+            max_depth: 21,
+            probe_max: 10_000_000,
+            probe_min: 100,
+        }
+    }
+}
+
+/// 多解搜索结果。
+#[derive(Clone, Debug)]
+pub struct SolverResult {
+    /// 候选解列表，按发现顺序（同长度或递减长度）。
+    pub solutions: Vec<String>,
+    /// 总耗时。
+    pub elapsed: Duration,
+    /// 是否因超时而提前返回（true 表示候选可能少于 `max_solutions`）。
+    pub timed_out: bool,
+}
 
 const MAX_PRE_MOVES: usize = 20;
 const TRY_INVERSE: bool = true;
@@ -50,6 +95,9 @@ pub struct Search {
     phase2_cubie: CubieCube,
 
     is_rec: bool,
+
+    /// 超时截止点；None 表示无超时。被 IDA* 检查（伪装成 probe 耗尽）。
+    deadline: Option<Instant>,
 }
 
 impl Default for Search {
@@ -84,6 +132,7 @@ impl Default for Search {
             max_pre_moves: 0,
             phase2_cubie: CubieCube::default(),
             is_rec: false,
+            deadline: None,
         }
     }
 }
@@ -127,6 +176,56 @@ impl Search {
             self.search()
         } else {
             self.searchopt()
+        }
+    }
+
+    /// 多解搜索：在超时或达到 `max_solutions` 之前，反复用 `next()` 推进
+    /// IDA* 找更短的解，全部收集起来返回。
+    ///
+    /// 注：当前 `next()` 只产出"严格更短"的解，所以 N 条候选的长度递减；
+    /// 如果 cube 一开始就接近最短，可能只产出 1-2 条。要追求更大的结构
+    /// 多样性，未来可以扰动 `urf_idx` 起点重新搜（暂不做）。
+    pub fn solutions(&mut self, facelets: &str, opts: SearchOptions) -> SolverResult {
+        let start = Instant::now();
+        self.deadline = Some(start + opts.timeout);
+
+        let mut out: Vec<String> = Vec::with_capacity(opts.max_solutions);
+        let mut timed_out = false;
+
+        // 第 1 条：走标准 solution() 路径
+        let s = self.solution(facelets, opts.max_depth, opts.probe_max, opts.probe_min, 0);
+        if s.starts_with("Error") {
+            self.deadline = None;
+            return SolverResult {
+                solutions: out,
+                elapsed: start.elapsed(),
+                timed_out: Instant::now() >= start + opts.timeout,
+            };
+        }
+        out.push(s.trim().to_string());
+
+        // 后续：next() 反复推进，每次给一条更短的；直到 Error 7（无更短）/超时/数量达标
+        while out.len() < opts.max_solutions {
+            if Instant::now() >= start + opts.timeout {
+                timed_out = true;
+                break;
+            }
+            let s = self.next(opts.probe_max, opts.probe_min, 0);
+            if s.starts_with("Error") {
+                // Error 7 = 无更短解；Error 8 = 探针耗尽（含我们的伪装超时）
+                if s.starts_with("Error 8") && Instant::now() >= start + opts.timeout {
+                    timed_out = true;
+                }
+                break;
+            }
+            out.push(s.trim().to_string());
+        }
+
+        self.deadline = None;
+        SolverResult {
+            solutions: out,
+            elapsed: start.elapsed(),
+            timed_out,
         }
     }
 
@@ -349,6 +448,13 @@ impl Search {
 
     fn init_phase2_pre(&mut self) -> i32 {
         self.is_rec = false;
+        // 超时检查：伪装 probe 耗尽，让 IDA* 自然退栈
+        if let Some(d) = self.deadline {
+            if Instant::now() >= d {
+                self.probe = self.probe_max + 1;
+                return 0;
+            }
+        }
         if self.probe >= if self.solution.is_none() { self.probe_max } else { self.probe_min } {
             return 0;
         }
@@ -739,6 +845,75 @@ mod tests {
         let invalid = "UUUUUUUUUUUUUUUUUUFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB";
         let sol = search.solution(invalid, 21, 1000, 0, 0);
         assert!(sol.starts_with("Error"));
+    }
+
+    /// 多解 API 基础测试：默认参数（500ms / 5 条）能产出至少 1 条解。
+    #[test]
+    fn test_solutions_basic() {
+        Search::init();
+        let cube = "UDFUURRLDBFLURRDRUUFLLFRFDBRBRLDBUDLRBBFLBBUDDFFDBUFLL";
+        let mut s = Search::new();
+        let res = s.solutions(cube, SearchOptions::default());
+        eprintln!(
+            "solutions: {} 条, 耗时 {:?}, timed_out={}",
+            res.solutions.len(), res.elapsed, res.timed_out
+        );
+        for (i, sol) in res.solutions.iter().enumerate() {
+            let n = sol.split_whitespace().count();
+            eprintln!("  [{}] {}f: {}", i, n, sol);
+        }
+        assert!(!res.solutions.is_empty(), "至少应产出 1 条解");
+        // 后续候选必须严格更短（next() 语义）
+        for w in res.solutions.windows(2) {
+            let a = w[0].split_whitespace().count();
+            let b = w[1].split_whitespace().count();
+            assert!(b < a, "next() 产出的解必须严格更短：{} → {}", a, b);
+        }
+    }
+
+    /// 超时测试：极短 timeout 时 timed_out=true 且不会 panic。
+    /// 注意：超时检查也作用于第 1 条 solution()，所以 1ms 可能连 1 条都拿不到——
+    /// 这是预期行为（IDA* 第 1 条 phase2 入口就被超时拦下）。
+    #[test]
+    fn test_solutions_timeout_fallback() {
+        Search::init();
+        let cube = "UDFUURRLDBFLURRDRUUFLLFRFDBRBRLDBUDLRBBFLBBUDDFFDBUFLL";
+        let mut s = Search::new();
+        let res = s.solutions(cube, SearchOptions {
+            timeout: Duration::from_millis(1),
+            max_solutions: 5,
+            ..Default::default()
+        });
+        eprintln!(
+            "timeout=1ms: {} 条, 耗时 {:?}, timed_out={}",
+            res.solutions.len(), res.elapsed, res.timed_out
+        );
+        // 1ms 太短，可能拿不到任何解；至少应该被标记为 timed_out。
+        assert!(res.timed_out, "1ms timeout 必须被检测到");
+        // 耗时不应过分超过 timeout（允许少量调度抖动）
+        assert!(res.elapsed < Duration::from_millis(50),
+            "elapsed {:?} 远超 1ms timeout", res.elapsed);
+    }
+
+    /// 较合理的 timeout 应当能拿到至少 1 条解。
+    #[test]
+    fn test_solutions_with_reasonable_timeout() {
+        Search::init();
+        let cube = "UDFUURRLDBFLURRDRUUFLLFRFDBRBRLDBUDLRBBFLBBUDDFFDBUFLL";
+        let mut s = Search::new();
+        let res = s.solutions(cube, SearchOptions {
+            timeout: Duration::from_millis(200),
+            max_solutions: 5,
+            ..Default::default()
+        });
+        eprintln!(
+            "timeout=200ms: {} 条, 耗时 {:?}, timed_out={}",
+            res.solutions.len(), res.elapsed, res.timed_out
+        );
+        for (i, sol) in res.solutions.iter().enumerate() {
+            eprintln!("  [{}] {}f", i, sol.split_whitespace().count());
+        }
+        assert!(!res.solutions.is_empty(), "200ms 应当至少产出 1 条解");
     }
 }
 

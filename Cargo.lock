@@ -4253,7 +4253,10 @@ name = "robo-pipeline"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rayon",
  "robo-core",
+ "robo-handstep",
+ "robo-solver",
 ]
 
 [[package]]

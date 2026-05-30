@@ -17,7 +17,7 @@ mod coord_cube;
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::new_without_default)]
 #[allow(clippy::needless_range_loop)]
-mod search;
+pub mod search;
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::new_without_default)]

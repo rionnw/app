@@ -1,6 +1,8 @@
 use anyhow::Result;
 use robo_core::{CameraSource, Recognizer, Roi, SolveReport, Solver, Translator, Transport};
 
+pub mod multi;
+
 pub struct SolvePipeline<C, R, S, T> {
     camera: C,
     recognizer: R,

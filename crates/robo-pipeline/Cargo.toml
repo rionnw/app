@@ -7,3 +7,6 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 robo-core = { path = "../robo-core" }
+robo-solver = { path = "../robo-solver" }
+robo-handstep = { path = "../robo-handstep" }
+rayon = "1"
