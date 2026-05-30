@@ -150,10 +150,9 @@ struct CameraStreamRuntime {
     grid_timer_stop: Arc<AtomicBool>,
 }
 
-/// grid 编码节流：20fps（50ms）。多数 USB 相机在 4 路并发 + MJPEG 软解码下
-/// 只能稳定跑到 20fps 左右（capture_ms ~45ms），把 grid 编码也卡在同一节奏，
-/// CPU 占用减半且不会掉帧——再快也只是把同一张源帧重复编码。
-const GRID_ENCODE_INTERVAL: Duration = Duration::from_millis(50);
+/// grid 拼接 + JPEG 编码的固定周期：33ms（≈30Hz），与 RobotApp 的
+/// `camTimer->start(33)` 一致。grid encode 实测 ~10ms，足够留出余量。
+const GRID_ENCODE_INTERVAL: Duration = Duration::from_millis(33);
 const DIAGNOSTIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const DIAGNOSTIC_WARN_THRESHOLD: Duration = Duration::from_millis(200);
 const BACKEND_DIAGNOSTIC_PREFIX: &str = "[backend-diagnostic]";
@@ -914,12 +913,12 @@ fn spawn_camera_stream_aggregator(
 /// 定时拼接 grid + 编码 JPEG 写回 hub.grid 的后台线程。
 ///
 /// 与 worker 完全解耦：worker 只负责覆盖式更新各槽位的最新一帧；这里每隔
-/// `GRID_ENCODE_INTERVAL`（默认 50ms / 20Hz）拉一次 4 路最新 RGB 进行拼接 +
-/// 编码。这样：
-/// - grid 的输出帧率严格固定（20Hz），不受 worker 产帧速率波动影响；
+/// `GRID_ENCODE_INTERVAL`（33ms / ≈30Hz，与 RobotApp camTimer 一致）拉一次
+/// 4 路最新 RGB 进行拼接 + 编码：
+/// - grid 输出帧率稳定 30Hz，不受 worker 产帧速率波动影响；
 /// - 不会因 4 路 worker 并发产帧而把 aggregator 单线程打满；
 /// - driver 即使吐出旧帧 / 速率失控（500fps）也只是不停覆盖槽位最新一帧，
-///   timer 永远拼"当下最新"，UI 看到的延迟最差就是 50ms（一个 timer 周期）。
+///   timer 永远拼"当下最新"，UI 延迟上限 = 一个 timer 周期 ≈ 33ms。
 fn spawn_grid_timer(
     hub: Arc<FrameHub>,
     session_id: u64,
@@ -986,8 +985,8 @@ fn spawn_grid_timer(
                 }
             }
 
-            // 节流到 GRID_ENCODE_INTERVAL：本次循环耗时不足时 sleep 补足；
-            // 用 stop flag 提前退出，避免 close 时还要等满一拍。
+            // sleep 补足到 GRID_ENCODE_INTERVAL，让本拍周期固定为 33ms。
+            // 用 stop flag 分段轮询，避免 close 时还要等满一拍。
             let elapsed = cycle_started.elapsed();
             if elapsed < GRID_ENCODE_INTERVAL {
                 let mut remain = GRID_ENCODE_INTERVAL - elapsed;
