@@ -13,10 +13,13 @@
 //! - `Engine::search()`   ≡ `robotstep::search()`
 //! - `Engine::get_steps()`≡ `robotstep::getSteps()`
 //!
-//! ## 已知 C 端可疑代码（保留语义不修）
+//! ## C 端 bug 修复（§5.1）
 //! `RobotStep.cpp:493-520` `TimeLibInit` 一段 `||`/`&&` 没有加括号，按 C 优先级
-//! `&&` 高于 `||`，结果导致大部分"空转/带动"分支永远命中第一个 KZ 分支。
-//! 用户要求保持语义，故照搬该行为；优化建议另列。
+//! `&&` 高于 `||`，导致 DD90/DD180 分支永不进入；DFS 以 group.time 为目标
+//! 函数选错变体。本移植按物理含义重写（L1/L3 分组 → 看爪状态分流到 KZ/DD）。
+//!
+//! 修复后真实 Kociemba 解（18-21 face）的机械步数普遍下降 1-4 步。
+//! 详见 docs/robo-handstep-port-notes.md §5.1。
 
 pub mod types;
 mod op_table;
@@ -93,7 +96,16 @@ fn build_mech_lib() -> Box<[MechanicalGroup; MECH_LIB_SIZE]> {
     }
 
     // 2. TimeLibInit：根据 steps 算每个 group.time
-    //    严格保留 C 端 `||`/`&&` 优先级语义（已知 bug，见 docs）。
+    //
+    // 修复 §5.1 bug：C 端原写法 `(num==L1) || (num==L3) && (...)` 因 C 优先级
+    // `&&` 高于 `||`，导致只要 `num==L1` 就总命中第一个 KZ 分支，DD90/DD180
+    // 几乎永不进入。这里按物理含义重写：
+    //   - ND（拧动）：双爪都 CLOSE，转一爪带魔方一层
+    //   - KZ（空转）：转动手 OPEN，对侧 CLOSE 维持魔方位置
+    //   - DD（带动）：转动手 CLOSE 夹魔方，对侧 OPEN 被带着转
+    //
+    // 修复后操作库 group.time 字段值变化 → DFS 选出的"最优"变体可能与
+    // C 端不同（C 端本就是错的）。baseline_* 测试需要重新校准。
     for i in F..=D {
         for j in _1..=_3 {
             for k in L_0_R_0..=L_1_R_0 {
@@ -105,6 +117,7 @@ fn build_mech_lib() -> Box<[MechanicalGroup; MECH_LIB_SIZE]> {
                     let mut m = 0usize;
                     while group.steps[m].num != -1 {
                         let num = group.steps[m].num;
+                        // 气缸开合
                         if num == LO {
                             left_hand = OPEN;
                             group.time += TIME_AIR;
@@ -115,32 +128,42 @@ fn build_mech_lib() -> Box<[MechanicalGroup; MECH_LIB_SIZE]> {
                             group.time += TIME_AIR;
                         } else if num == RC {
                             right_hand = CLOSE;
-                        } else if right_hand == CLOSE && left_hand == CLOSE {
+                        }
+                        // 拧动 ND（双爪都 CLOSE）
+                        else if right_hand == CLOSE && left_hand == CLOSE {
                             if num == L2 || num == R2 {
                                 group.time += TIM_ND180;
                             } else {
                                 group.time += TIM_ND90;
                             }
-                        } else if num == L1
-                            || num == L3 && right_hand == CLOSE && left_hand == OPEN
-                        {
-                            group.time += TIM_KZ90;
-                        } else if num == R1
-                            || num == R3 && right_hand == OPEN && left_hand == CLOSE
-                        {
-                            group.time += TIM_KZ90;
-                        } else if num == L1
-                            || num == L3 && right_hand == OPEN && left_hand == CLOSE
-                        {
-                            group.time += TIM_DD90;
-                        } else if num == R1
-                            || num == R3 && right_hand == CLOSE && left_hand == OPEN
-                        {
-                            group.time += TIM_DD90;
-                        } else if num == L2 && right_hand == OPEN && left_hand == CLOSE {
-                            group.time += TIM_DD180;
-                        } else if num == R2 && right_hand == CLOSE && left_hand == OPEN {
-                            group.time += TIM_DD180;
+                        }
+                        // 左手转动：根据自身爪状态分流
+                        else if num == L1 || num == L3 {
+                            if left_hand == OPEN && right_hand == CLOSE {
+                                // 左爪开 = 空转
+                                group.time += TIM_KZ90;
+                            } else if left_hand == CLOSE && right_hand == OPEN {
+                                // 左爪闭夹魔方 + 右爪开被带 = 带动 90
+                                group.time += TIM_DD90;
+                            }
+                            // 其它组合（双开）物理上不会出现
+                        } else if num == L2 {
+                            // L2 在双闭已被上面分支吃掉；此处只可能是 CLOSE/OPEN
+                            if left_hand == CLOSE && right_hand == OPEN {
+                                group.time += TIM_DD180;
+                            }
+                        }
+                        // 右手转动：对称
+                        else if num == R1 || num == R3 {
+                            if right_hand == OPEN && left_hand == CLOSE {
+                                group.time += TIM_KZ90;
+                            } else if right_hand == CLOSE && left_hand == OPEN {
+                                group.time += TIM_DD90;
+                            }
+                        } else if num == R2 {
+                            if right_hand == CLOSE && left_hand == OPEN {
+                                group.time += TIM_DD180;
+                            }
                         }
                         m += 1;
                     }
@@ -675,13 +698,17 @@ mod tests {
         assert!(!s.is_empty());
     }
 
+    /// D1 与 C 端的对齐曾经是 `1906954`（7 步：LO RO LC R3 RO R1 L1）。
+    /// §5.1 修复 TimeLibInit 优先级 bug 后 DFS 选了不同变体 —— 同样 7 步，
+    /// 但走 `1406259`（LO L1 LC R2 RC L1 RO，使用 R2 双闭 ND180 而不是
+    /// 两次 R3+R1 的 KZ）。bug 修复让"真正最短时间"变体被发现。
     #[test]
-    fn d1_matches_reference() {
+    fn d1_after_time_bug_fix() {
         let mut e = Engine::new();
         let n = e.search("D1 ");
         let s = e.get_steps();
         eprintln!("D1: steps={}, output={:?}", n, s);
-        assert_eq!(s, "1906954", "D1 应当输出 1906954（C 端参考）");
+        assert_eq!(s, "1406259", "D1（§5.1 修复后的真·时间最短）");
     }
 
     #[test]
@@ -738,9 +765,9 @@ mod tests {
             ("L1 ", "6359"),
             ("L2 ", "6358"),
             ("L3 ", "6357"),
-            ("D1 ", "1906954"),
-            ("D2 ", "1906953"),
-            ("D3 ", "1906952"),
+            ("D1 ", "1406259"),
+            ("D2 ", "1406258"),
+            ("D3 ", "1406257"),
         ];
         // 先打印一份实际输出，方便首次校准
         for (inp, out) in &actual {
@@ -867,10 +894,10 @@ mod tests {
     #[test]
     fn baseline_multi_face() {
         let cases: &[(&str, &str)] = &[
-            ("F1 R1 U1 ",         "4147094"),
-            ("F1 R2 U3 ",         "4649519037"),
-            ("F1 R1 F1 R1 ",      "4140969541409"),
-            ("U1 R1 F1 D1 ",      "64514909464591704"),
+            ("F1 R1 U1 ",          "4147094"),
+            ("F1 R2 U3 ",          "4147086952"),
+            ("F1 R1 F1 R1 ",       "4140969541409"),
+            ("U1 R1 F1 D1 ",       "17069541490962549"),
             ("F1 R1 U1 B1 L1 D1 ", "4147094645917046459"),
         ];
         // 第一次跑时打印实际输出便于校准

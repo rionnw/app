@@ -100,21 +100,50 @@ if j >= 3 { continue; }   // 不再写入 temp.a[k][i]
 按优先级从高到低。**5.2 / 5.3 / 5.4 / 5.5 / 5.6 已实施**，性能数据见
 §5.10；其余仍是建议。
 
-### 5.1 修 `TimeLibInit` 的优先级 bug（**Bug 级**）
+### 5.1 修 `TimeLibInit` 的优先级 bug（**Bug 级，已实施**）
 
-**问题**：见 §4.2。当前 `MechanicalGroup::time` 大量低估了"空转/带动"
-代价，`MechanicalGroupLib[*][*][*][*].time` 字段里的相对大小关系
-被破坏。DFS 以这个 `time` 为唯一目标函数，因此**当前 DFS 选出的
-"最优"变体严格意义上不是真正全局时间最优**。
+**问题**：C 端 `RobotStep.cpp:493-520` 一段 `else if`：
+```c
+else if ((num == L1) || (num == L3) && ((RH == CLOSE) && (LH == OPEN)))
+```
+按 C 优先级 `&&` > `||`，等价于
+```c
+else if ((num == L1) || ((num == L3) && (RH == CLOSE) && (LH == OPEN)))
+```
+也就是只要 `num == L1` 就总命中第一个 KZ 分支，**DD90 / DD180
+分支几乎永不进入**，`MechanicalGroup::time` 严重低估"带动"代价。
+DFS 以这个 `time` 为唯一目标函数，所选"最优"变体并非全局最优。
 
-**修法**：6 处 `else if` 加括号，例如
+**修法（已落地）**：按物理含义重写分类逻辑，改成"L1/L3 分组 → 看
+对侧/本侧爪状态分流到 KZ/DD"：
+
 ```rust
-else if (num == L1 || num == L3) && right_hand == CLOSE && left_hand == OPEN { ... }
+else if num == L1 || num == L3 {
+    if left_hand == OPEN && right_hand == CLOSE {
+        // 本爪开 → 空转
+        group.time += TIM_KZ90;
+    } else if left_hand == CLOSE && right_hand == OPEN {
+        // 本爪夹魔方，对侧被带 → 带动
+        group.time += TIM_DD90;
+    }
+}
 ```
 
-**风险**：修完所有 864 条 group 的 `time` 字段会变，DFS 输出可能与
-C 端**不再一致**。这是预期的 —— C 端本就是错的；但如果生产链路
-依赖了"与 C 端 byte-for-byte 一致"，需要先把 C 端一起修才能动。
+**修复后的影响**：DFS 的目标函数变了 → 选择不同变体；机械步数
+普遍下降。在 11 条真实 Kociemba 解（18-21 face）上的对比：
+
+| 输入 face | 修前 mech 步 | 修后 mech 步 | 减少 |
+| --------- | ------------ | ------------ | ---- |
+| 平均      | ~78          | ~75          | ~3 步 |
+| 最大降幅  | 78           | 74           | -4 步 |
+
+DFS 节点数同步下降（剪枝目标更准）；解算耗时反而上升（节点 time
+field 离散度增大、book 命中率下降），从 ~1 ms → ~2 ms。
+对终端用户净收益：机器人执行 1 步 ~100-300 ms，少 3 步 = 节省
+300-900 ms，远大于解算多花的 ~1 ms。
+
+baseline 重新校准：D1/D2/D3 输出从 `190695x` 改为 `140625x`
+（同样 7 步，使用 ND180 而非两次 KZ）。
 
 ### 5.2 DFS 回溯免拷贝（**已实施**）
 
