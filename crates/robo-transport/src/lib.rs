@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use robo_core::{DigitMap, Transport};
+use robo_core::{DigitMap, Transport, MNEMONIC_COUNT};
 use serialport::{ClearBuffer, DataBits, FlowControl, Parity, SerialPort, StopBits};
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -7,6 +7,30 @@ use std::time::Duration;
 pub const FRAME_HEAD: u8 = 0xAA;
 pub const FRAME_TAIL: u8 = 0xBB;
 pub const FRAME_SIZE: usize = 150;
+
+/// mnemonic 助记符表（与 robo-handstep `MNEMONIC_STR` / robo-core `MNEMONIC_COUNT` 顺序一致）
+pub const MNEMONICS: [&str; MNEMONIC_COUNT] = [
+    "M_L1", "M_L2", "M_L3", "M_LC", "M_LO",
+    "M_R1", "M_R2", "M_R3", "M_RC", "M_RO",
+];
+
+/// mnemonic 槽位数量；从 robo-core 转出便于上层直接 use。
+pub const MOVE_COUNT: usize = MNEMONIC_COUNT;
+
+/// 默认数字映射（与硬件出厂约定一致，用户未自定义时使用）
+pub const DEFAULT_DIGIT_MAP: [&str; MOVE_COUNT] = [
+    "4", "3", "2", "0", "1",
+    "9", "8", "7", "5", "6",
+];
+
+/// 构造默认 `DigitMap`。
+pub fn default_digit_map() -> DigitMap {
+    let mut out: DigitMap = Default::default();
+    for (i, s) in DEFAULT_DIGIT_MAP.iter().enumerate() {
+        out[i] = (*s).to_string();
+    }
+    out
+}
 
 pub struct SerialTransport {
     port: Box<dyn SerialPort>,
@@ -38,15 +62,13 @@ impl SerialTransport {
             Err(err) => Err(err).context("failed to read serial port"),
         }
     }
-}
 
-impl Transport for SerialTransport {
-    fn send_steps(&mut self, mnemonics: &[String], digit_map: &DigitMap) -> Result<()> {
-        let encoded = encode_mnemonics(mnemonics, digit_map);
+    /// 发送已编码的下位机数字串（不再做 mnemonic→digit 转换）。
+    /// 调用方自己用 `encode_mnemonics` 把 mnemonic 列表转成数字串。
+    pub fn send_encoded(&mut self, encoded: &str) -> Result<()> {
         let frame = encode_motion_frame(encoded.as_bytes())?;
         // 与桌面端 sendMsg 第 227 行 serialPort->clear() 对齐：
         // 发送前清空收发缓冲，避免上一次未读完的回包干扰本帧。
-        // 清缓冲失败不致命（部分驱动可能不支持），降级为警告。
         if let Err(err) = self.port.clear(ClearBuffer::All) {
             log::warn!("clear serial buffer before send failed: {err}");
         }
@@ -58,16 +80,19 @@ impl Transport for SerialTransport {
     }
 }
 
+impl Transport for SerialTransport {
+    fn send_steps(&mut self, mnemonics: &[String], digit_map: &DigitMap) -> Result<()> {
+        let encoded = encode_mnemonics(mnemonics, digit_map);
+        self.send_encoded(&encoded)
+    }
+}
+
 /// 把 mnemonic 序列按 digit_map 编码成下位机字符串。
 ///
 /// `digit_map` 索引顺序与 robo-handstep 的 `MNEMONIC_STR` 一致：
 /// `[M_L1, M_L2, M_L3, M_LC, M_LO, M_R1, M_R2, M_R3, M_RC, M_RO]`。
 /// 不在该集合的 mnemonic 会被跳过并打 warn 日志（不应正常发生）。
 pub fn encode_mnemonics(mnemonics: &[String], digit_map: &DigitMap) -> String {
-    const MNEMONICS: [&str; 10] = [
-        "M_L1", "M_L2", "M_L3", "M_LC", "M_LO",
-        "M_R1", "M_R2", "M_R3", "M_RC", "M_RO",
-    ];
     let mut out = String::with_capacity(mnemonics.len() * 2);
     for m in mnemonics {
         match MNEMONICS.iter().position(|x| *x == m.as_str()) {

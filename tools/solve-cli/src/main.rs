@@ -5,12 +5,13 @@
 //!   solve-cli --image <image> --roi <roi.json>
 
 use anyhow::{Context, Result};
-use robo_core::{CubeFace, Frame, Recognizer, Roi, Solver, Translator};
-use robo_solver::Min2PhaseSolver;
-use robo_translator::BasicTranslator;
+use robo_core::{CubeFace, Frame, Recognizer, Roi};
+use robo_pipeline::multi::translate_optimal;
+use robo_solver::search::{Search, SearchOptions};
+use robo_transport::{default_digit_map, encode_mnemonics};
 use robo_vision::ColorClusterRecognizer;
 use serde::Deserialize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Deserialize)]
 struct RoiFile {
@@ -40,7 +41,9 @@ fn main() -> Result<()> {
         }
         "--image" | "-i" => {
             let image_path = args.get(2).context("缺少图片路径")?;
-            let roi_idx = args.iter().position(|a| a == "--roi" || a == "-r")
+            let roi_idx = args
+                .iter()
+                .position(|a| a == "--roi" || a == "-r")
                 .context("使用 --image 时需要 --roi 参数")?;
             let roi_path = args.get(roi_idx + 1).context("缺少 ROI 文件路径")?;
             recognize_from_file(image_path, roi_path)?
@@ -58,26 +61,32 @@ fn main() -> Result<()> {
 
     println!("Facelets: {}", face.as_str());
 
-    // 求解
+    // 求解 + 翻译（多候选择优 → 机械步数最少）
     eprintln!("正在初始化 solver...");
     let t0 = Instant::now();
-    let solver = Min2PhaseSolver::new();
+    Search::init();
     eprintln!("Solver 初始化完成 ({:.2}s)", t0.elapsed().as_secs_f64());
 
-    let t1 = Instant::now();
-    let moves = solver.solve(&face)?;
-    let solve_ms = t1.elapsed().as_millis();
-    println!("Solution: {}", moves.to_solution_string());
-    println!("Solve time: {solve_ms} ms");
+    let opts = SearchOptions {
+        timeout: Duration::from_millis(100),
+        max_solutions: usize::MAX,
+        length_slack: 0,
+        ..Default::default()
+    };
+    let res = translate_optimal(face.as_str(), opts).context("解算失败")?;
+    println!("Solution: {}", res.best.kociemba);
+    println!("Solver time: {} ms", res.solver_elapsed.as_millis());
 
-    // 翻译为硬件指令
-    let translator = BasicTranslator::new();
-    let steps = translator.translate(&moves)?;
-    println!("\nHardware commands ({} ops):", steps.commands.len());
-    for cmd in &steps.commands {
+    // 用默认 digit_map 把 mnemonic 序列编码成下位机字符串
+    let digit_map = default_digit_map();
+    let mnemonics: Vec<String> = res.best.mech_mnemonics.iter().map(|s| s.to_string()).collect();
+    let encoded = encode_mnemonics(&mnemonics, &digit_map);
+    println!("\nHardware commands ({} ops):", mnemonics.len());
+    for cmd in &mnemonics {
         println!("  {cmd}");
     }
-    println!("\nEncoded: {}", steps.encoded);
+    println!("\nEncoded (default digit map): {encoded}");
+    println!("Mech steps: {}", res.best.mech_steps);
 
     Ok(())
 }
@@ -90,9 +99,16 @@ fn recognize_from_file(image_path: &str, roi_path: &str) -> Result<CubeFace> {
 
     let roi_content = std::fs::read_to_string(roi_path).context("无法读取 ROI 文件")?;
     let roi_file: RoiFile = serde_json::from_str(&roi_content)?;
-    let rois: Vec<Roi> = roi_file.rois.iter().map(|r| Roi {
-        x: r.x, y: r.y, width: r.width, height: r.height,
-    }).collect();
+    let rois: Vec<Roi> = roi_file
+        .rois
+        .iter()
+        .map(|r| Roi {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+        })
+        .collect();
 
     let recognizer = ColorClusterRecognizer;
     recognizer.recognize(&frame, &rois).context("识别失败")

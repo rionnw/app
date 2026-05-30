@@ -89,7 +89,7 @@ type CameraPreset = { label: string; width: number; height: number; fps: number;
 
 const solvedFacelets = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB";
 const firstRoiRegionId = getRoiIndexView(0).label;
-const panelVisibilityStorageKey = "robo-ui.panel-visibility";
+const panelVisibilityStorageKey = "cubesolver.panel-visibility";
 const imageLayoutDiagnosticThrottleMs = 3_000;
 const cameraGapDiagnosticThrottleMs = 5_000;
 const canvasFrameDiagnosticThrottleMs = 3_000;
@@ -236,7 +236,7 @@ function App() {
   const [encodedSteps, setEncodedSteps] = useState("");
   const [timerRunning, setTimerRunning] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
-  const [logs, setLogs] = useState<LogItem[]>([{ time: nowTime(), text: "robo-ui 已启动。", kind: "info" }]);
+  const [logs, setLogs] = useState<LogItem[]>([{ time: nowTime(), text: "CubeSolver 已启动。", kind: "info" }]);
 
   const markedCount = regions.filter((region) => region.rect).length;
   const elapsedText = useMemo(() => {
@@ -287,7 +287,7 @@ function App() {
       return normalized.includes("readonly") || normalized.includes("disabled");
     });
 
-  const cameraControlStorageKey = (slot = controlSlot) => `robo-ui.camera-controls.slot-${slot}`;
+  const cameraControlStorageKey = (slot = controlSlot) => `cubesolver.camera-controls.slot-${slot}`;
 
   const saveCameraControls = () => {
     const values = cameraControls.map((control) => ({ id: control.id, value: control.value }));

@@ -1,17 +1,15 @@
 [workspace]
 members = [
-    "robo-ui",
+    "robo-app",
     "crates/robo-core",
     "crates/robo-camera",
     "crates/robo-vision",
     "crates/robo-solver",
-    "crates/robo-translator",
     "crates/robo-handstep",
     "crates/robo-transport",
     "crates/robo-pipeline",
     "tools/recognize-cli",
     "tools/solve-cli",
-    "tools/translate-cli",
     "tools/solve-server",
 ]
 resolver = "2"

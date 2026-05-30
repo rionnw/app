@@ -34,3 +34,7 @@ logs/
 .vscode
 .idea
 .cursor
+
+motorControl
+roboapp
+RobotApp

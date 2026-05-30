@@ -4,8 +4,10 @@
 //!     例如 `"F1 R2 U3 "`。
 //! 输出：10-mnemonic 数字串（与 C 端 moveStr 一致）。
 //!
-//! 本 crate 与 `robo-translator` 是**两条独立的技术路线**（search vs search2l），
-//! 互不替代。这里完全按 C 端语义复刻：操作库 + DFS + book 剪枝表 + 时间最优。
+//! 本 crate 是 search（一阶段 Kociemba）→ 机械步骤的翻译路径。历史上还存在
+//! 一条 search2l（2L 解法 → 硬件指令）的独立路线（旧 `robo-translator` crate），
+//! 现已与之解耦：handstep 不依赖任何翻译 crate，按 C 端语义复刻：
+//! 操作库 + DFS + book 剪枝表 + 时间最优。
 //!
 //! ## 与 C 端对应关系
 //! - `Engine` 持有 C 端所有全局变量（避免 Rust 全局可变状态）

@@ -26,7 +26,7 @@ export default defineConfig(async () => ({
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching the Rust backend workspace
-      ignored: ["**/robo-ui/**", "**/crates/**"],
+      ignored: ["**/robo-app/**", "**/crates/**"],
     },
   },
 }));

@@ -4222,6 +4222,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "robo-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "fern",
+ "image",
+ "log",
+ "robo-camera",
+ "robo-core",
+ "robo-pipeline",
+ "robo-solver",
+ "robo-transport",
+ "robo-vision",
+ "serde",
+ "serde_json",
+ "serialport",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tiny_http",
+]
+
+[[package]]
 name = "robo-camera"
 version = "0.1.0"
 dependencies = [
@@ -4270,15 +4295,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "robo-translator"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "log",
- "robo-core",
-]
-
-[[package]]
 name = "robo-transport"
 version = "0.1.0"
 dependencies = [
@@ -4286,32 +4302,6 @@ dependencies = [
  "log",
  "robo-core",
  "serialport",
-]
-
-[[package]]
-name = "robo-ui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "fern",
- "image",
- "log",
- "robo-camera",
- "robo-core",
- "robo-pipeline",
- "robo-solver",
- "robo-translator",
- "robo-transport",
- "robo-vision",
- "serde",
- "serde_json",
- "serialport",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tiny_http",
 ]
 
 [[package]]
@@ -4795,8 +4785,9 @@ dependencies = [
  "anyhow",
  "image",
  "robo-core",
+ "robo-pipeline",
  "robo-solver",
- "robo-translator",
+ "robo-transport",
  "robo-vision",
  "serde",
  "serde_json",
@@ -5633,15 +5624,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
-]
-
-[[package]]
-name = "translate-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "robo-core",
- "robo-translator",
 ]
 
 [[package]]

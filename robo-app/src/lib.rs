@@ -18,11 +18,10 @@ use robo_camera::{
     CameraSlotWorkerEvent, CameraStatusEventKind, FramePacket, MultiCameraCapture,
     MultiCameraSource,
 };
-use robo_core::{CubeFace, DigitMap, Frame, Recognizer, Roi, Transport};
+use robo_core::{CubeFace, DigitMap, Frame, Recognizer, Roi};
 use robo_pipeline::multi::translate_optimal;
 use robo_solver::search::{Search, SearchOptions};
-use robo_translator::{default_digit_map, MNEMONICS, MOVE_COUNT};
-use robo_transport::SerialTransport;
+use robo_transport::{default_digit_map, SerialTransport, MNEMONICS, MOVE_COUNT};
 use robo_vision::ColorClusterRecognizer;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
@@ -43,6 +42,8 @@ struct AppState {
     solver: Arc<std::sync::OnceLock<()>>,
     /// 动作 → 下位机数字映射（commands 用 mnemonic，encoded 用此映射）
     digit_map: Mutex<DigitMap>,
+    /// 应用配置（持久化到 `app-config.json`）
+    config: Mutex<AppConfig>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,8 +55,8 @@ struct RuntimeMode {
 impl RuntimeMode {
     fn from_env() -> Self {
         Self::from_env_values(
-            std::env::var("ROBO_UI_MOCK_CAMERA").ok().as_deref(),
-            std::env::var("ROBO_UI_MOCK_SERIAL").ok().as_deref(),
+            std::env::var("CUBESOLVER_MOCK_CAMERA").ok().as_deref(),
+            std::env::var("CUBESOLVER_MOCK_SERIAL").ok().as_deref(),
         )
     }
 
@@ -163,6 +164,7 @@ impl Default for AppState {
             mode: RuntimeMode::from_env(),
             solver: Arc::new(std::sync::OnceLock::new()),
             digit_map: Mutex::new(default_digit_map()),
+            config: Mutex::new(AppConfig::default()),
         }
     }
 }
@@ -1517,10 +1519,11 @@ enum SerialRuntime {
 }
 
 impl SerialRuntime {
-    fn send_steps(&mut self, mnemonics: &[String], digit_map: &DigitMap) -> Result<()> {
+    /// 直接发送已编码的下位机字符串（前端已用 user digit_map 编码好）。
+    fn send_encoded(&mut self, encoded: &str) -> Result<()> {
         match self {
-            Self::Real(transport) => transport.send_steps(mnemonics, digit_map),
-            Self::Mock(transport) => transport.send_steps(mnemonics, digit_map),
+            Self::Real(transport) => transport.send_encoded(encoded),
+            Self::Mock(transport) => transport.send_encoded(encoded),
         }
     }
 
@@ -1543,19 +1546,17 @@ impl MockSerialTransport {
         Ok(self.responses.pop_front().unwrap_or_default())
     }
 
-    #[cfg(test)]
-    fn last_payload(&self) -> Option<&str> {
-        self.last_payload.as_deref()
-    }
-}
-
-impl Transport for MockSerialTransport {
-    fn send_steps(&mut self, mnemonics: &[String], digit_map: &DigitMap) -> Result<()> {
+    fn send_encoded(&mut self, encoded: &str) -> Result<()> {
         // Mock transport：把发出去的内容存下来供测试断言用，不实际发硬件
-        self.last_payload = Some(robo_transport::encode_mnemonics(mnemonics, digit_map));
+        self.last_payload = Some(encoded.to_string());
         self.responses.push_back(b"OK\n".to_vec());
         self.responses.push_back(b"ND\n".to_vec());
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn last_payload(&self) -> Option<&str> {
+        self.last_payload.as_deref()
     }
 }
 
@@ -1591,6 +1592,11 @@ fn diagnostic_log(message: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 把 ROI 等用户配置文件写入 `app_install_dir/<filename>`。
+///
+/// 历史上写到 cwd（开发时是 robo-app/，打包后路径不确定），
+/// 现统一到与 `app-config.json` / `move_mapping.json` 相同的安装目录，
+/// 启动时 `load_default_roi` 也优先从该目录读，确保保存→重启可见。
 #[tauri::command]
 fn save_text_file(
     filename: String,
@@ -1601,9 +1607,11 @@ fn save_text_file(
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "文件名无效。".to_string())?;
-    let path = Path::new(safe_filename);
+    let dir = app_install_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let path = dir.join(safe_filename);
 
-    std::fs::write(path, contents).map_err(|err| err.to_string())?;
+    std::fs::write(&path, contents).map_err(|err| err.to_string())?;
     log::info!("文件已保存: {}", path.display());
     Ok(path.display().to_string())
 }
@@ -1923,7 +1931,7 @@ fn solve_current_frame(
     let face = recognizer
         .recognize(&capture.frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face, current_digit_map(&state))
+    solve_face(face, current_digit_map(&state), current_solver_timeout_ms(&state))
 }
 
 #[tauri::command]
@@ -1941,7 +1949,7 @@ fn solve_latest_frame(
     let face = recognizer
         .recognize(&frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face, current_digit_map(&state))
+    solve_face(face, current_digit_map(&state), current_solver_timeout_ms(&state))
 }
 
 #[tauri::command]
@@ -1957,14 +1965,14 @@ fn solve_image_file(
     let face = recognizer
         .recognize(&frame, &rois)
         .map_err(|err| err.to_string())?;
-    solve_face(face, current_digit_map(&state))
+    solve_face(face, current_digit_map(&state), current_solver_timeout_ms(&state))
 }
 
 #[tauri::command]
 fn solve_facelets(state: tauri::State<'_, AppState>, facelets: String) -> Result<SolveFaceletsResponse, String> {
     state.solver.get().ok_or("solver 尚未初始化完成")?;
     let face = CubeFace::new(facelets).map_err(|err| err.to_string())?;
-    solve_face(face, current_digit_map(&state))
+    solve_face(face, current_digit_map(&state), current_solver_timeout_ms(&state))
 }
 
 #[tauri::command]
@@ -2019,8 +2027,16 @@ fn close_serial(state: tauri::State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// 把已编码的下位机数字串（前端用 user digit_map 编码好）写到串口。
+///
+/// 历史上本命令叫 `commands` 收 mnemonic 列表，内部再用 digit_map 重新编码；
+/// 现统一让前端把 `encoded_steps` 直接传过来——避免一处映射两处转换的对账风险，
+/// 修复 `invalid args 'commands' for command 'send_steps'` 的不匹配问题。
 #[tauri::command]
-fn send_steps(state: tauri::State<'_, AppState>, commands: Vec<String>) -> Result<(), String> {
+fn send_steps(
+    state: tauri::State<'_, AppState>,
+    encoded_steps: String,
+) -> Result<(), String> {
     let mut serial = state
         .serial
         .lock()
@@ -2028,10 +2044,8 @@ fn send_steps(state: tauri::State<'_, AppState>, commands: Vec<String>) -> Resul
     let transport = serial
         .as_mut()
         .ok_or_else(|| "serial port is not open".to_string())?;
-    // user 当前的 digit_map：transport 用它把 mnemonic 编码成下位机数字字符
-    let digit_map = current_digit_map(&state);
     transport
-        .send_steps(&commands, &digit_map)
+        .send_encoded(&encoded_steps)
         .map_err(|err| err.to_string())
 }
 
@@ -2057,12 +2071,14 @@ fn read_serial(state: tauri::State<'_, AppState>) -> Result<SerialReadResponse, 
 fn solve_face(
     face: CubeFace,
     digit_map: DigitMap,
+    timeout_ms: u64,
 ) -> Result<SolveFaceletsResponse, String> {
-    // 求解参数：100ms / max=∞ / slack=0
+    // 求解参数：solver_timeout_ms / max=∞ / slack=0
     // 实测 50 cube benchmark：mech 平均 68.9，solver 100ms 严格用满，
-    // 比旧 300ms/max=8 配置 mech 持平且延迟降到 1/3。
+    // 比旧 300ms/max=8 配置 mech 持平且延迟降到 1/3；
+    // timeout 由 app-config.json 提供（默认 100ms），可由前端 set_app_config 调整。
     let opts = SearchOptions {
-        timeout: Duration::from_millis(100),
+        timeout: Duration::from_millis(timeout_ms.max(1)),
         max_solutions: usize::MAX,
         length_slack: 0,
         ..Default::default()
@@ -2112,6 +2128,101 @@ fn current_digit_map(state: &AppState) -> DigitMap {
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_else(|_| default_digit_map())
+}
+
+fn current_solver_timeout_ms(state: &AppState) -> u64 {
+    state
+        .config
+        .lock()
+        .map(|guard| guard.solver_timeout_ms)
+        .unwrap_or(DEFAULT_SOLVER_TIMEOUT_MS)
+}
+
+// ===== 应用配置：持久化 + Tauri 命令 =====
+
+const APP_CONFIG_FILENAME: &str = "app-config.json";
+/// solver 超时默认值；与历史硬编码保持一致（100ms）。
+/// 写入 `app-config.json` 后由用户覆盖；不存在或解析失败时回退到此默认值。
+const DEFAULT_SOLVER_TIMEOUT_MS: u64 = 100;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AppConfig {
+    /// solver 单次求解的超时时间（毫秒）
+    #[serde(default = "default_solver_timeout_ms_value")]
+    solver_timeout_ms: u64,
+}
+
+fn default_solver_timeout_ms_value() -> u64 {
+    DEFAULT_SOLVER_TIMEOUT_MS
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            solver_timeout_ms: DEFAULT_SOLVER_TIMEOUT_MS,
+        }
+    }
+}
+
+fn app_config_path() -> Result<std::path::PathBuf, String> {
+    let dir = app_install_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join(APP_CONFIG_FILENAME))
+}
+
+fn load_app_config_from_disk() -> Option<AppConfig> {
+    let path = app_config_path().ok()?;
+    if !path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<AppConfig>(&content) {
+        Ok(cfg) => {
+            log::info!("已加载应用配置: {}", path.display());
+            Some(cfg)
+        }
+        Err(e) => {
+            log::warn!("应用配置解析失败 ({}), 使用默认值", e);
+            None
+        }
+    }
+}
+
+fn save_app_config_to_disk(cfg: &AppConfig) -> Result<std::path::PathBuf, String> {
+    let path = app_config_path()?;
+    let payload = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    std::fs::write(&path, payload).map_err(|e| e.to_string())?;
+    log::info!("应用配置已保存: {}", path.display());
+    Ok(path)
+}
+
+#[tauri::command]
+fn get_app_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, String> {
+    Ok(state
+        .config
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+fn set_app_config(
+    state: tauri::State<'_, AppState>,
+    config: AppConfig,
+) -> Result<AppConfig, String> {
+    let mut sanitized = config;
+    if sanitized.solver_timeout_ms == 0 {
+        sanitized.solver_timeout_ms = DEFAULT_SOLVER_TIMEOUT_MS;
+    }
+    {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| "app config state is poisoned".to_string())?;
+        *guard = sanitized.clone();
+    }
+    save_app_config_to_disk(&sanitized)?;
+    Ok(sanitized)
 }
 
 // ===== 动作 → 数字映射：持久化 + Tauri 命令 =====
@@ -2442,12 +2553,9 @@ mod tests {
     #[test]
     fn mock_serial_queues_ok_then_motion_done() {
         let mut serial = MockSerialTransport::default();
-        // 用 default digit_map（"4","3","2","0","1","9","8","7","5","6"）
-        // 编码 ["M_L1", "M_LO"] → "41"
-        let digit_map = default_digit_map();
-        let mnemonics = vec!["M_L1".to_string(), "M_LO".to_string()];
+        // 直接发送已编码的下位机字符串（前端用 user digit_map 编码好后传过来）
         serial
-            .send_steps(&mnemonics, &digit_map)
+            .send_encoded("41")
             .expect("mock send should succeed");
 
         assert_eq!(serial.last_payload(), Some("41"));
@@ -2678,25 +2786,42 @@ fn check_solver_ready(state: tauri::State<'_, AppState>) -> Result<bool, String>
     Ok(state.solver.get().is_some())
 }
 
+const DEFAULT_ROI_FILENAME: &str = "robot-roi.json";
+
+/// 候选 ROI 路径（按优先级）：
+/// 1. `app_install_dir/robot-roi.json`：保存 ROI 时的目标位置（用户改动持久化）
+/// 2. cwd 下 `robot-roi.json`：开发模式从 robo-app/ 启动、或打包时随包附带的默认值
+fn roi_candidate_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(dir) = app_install_dir() {
+        paths.push(dir.join(DEFAULT_ROI_FILENAME));
+    }
+    paths.push(std::path::PathBuf::from(DEFAULT_ROI_FILENAME));
+    paths
+}
+
 /// 启动时尝试读取默认 ROI 文件 (robot-roi.json)，不存在则返回 null。
+///
+/// 修改后保存到 `app_install_dir/robot-roi.json`（见 `save_text_file`），
+/// 因此读取优先看那里；若没有再 fallback 到 cwd（兼容默认带的 ROI）。
 #[tauri::command]
 fn load_default_roi() -> Option<String> {
-    let roi_path = Path::new("robot-roi.json");
-    if roi_path.is_file() {
-        match std::fs::read_to_string(roi_path) {
-            Ok(content) => {
-                log::info!("已加载默认 ROI: {}", roi_path.display());
-                Some(content)
+    for path in roi_candidate_paths() {
+        if path.is_file() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    log::info!("已加载默认 ROI: {}", path.display());
+                    return Some(content);
+                }
+                Err(e) => {
+                    log::warn!("读取 ROI 失败 ({}): {}", path.display(), e);
+                }
             }
-            Err(e) => {
-                log::warn!("读取默认 ROI 失败: {}", e);
-                None
-            }
+        } else {
+            log::debug!("ROI 文件不存在: {}", path.display());
         }
-    } else {
-        log::debug!("默认 ROI 文件不存在: {}", roi_path.display());
-        None
     }
+    None
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2715,10 +2840,18 @@ pub fn run() {
             };
             let handle = app.handle().clone();
 
-            // 启动时尝试从 app_config_dir 读取保存的动作映射
+            // 启动时尝试从 app_install_dir 读取保存的动作映射
             if let Some(loaded) = load_move_mapping_from_disk(&handle) {
                 let state: tauri::State<'_, AppState> = app.state();
                 if let Ok(mut guard) = state.digit_map.lock() {
+                    *guard = loaded;
+                };
+            }
+
+            // 启动时尝试从 app_install_dir 读取应用配置（solver_timeout_ms 等）
+            if let Some(loaded) = load_app_config_from_disk() {
+                let state: tauri::State<'_, AppState> = app.state();
+                if let Ok(mut guard) = state.config.lock() {
                     *guard = loaded;
                 };
             }
@@ -2777,7 +2910,9 @@ pub fn run() {
             send_steps,
             get_move_mapping,
             set_move_mapping,
-            reset_move_mapping
+            reset_move_mapping,
+            get_app_config,
+            set_app_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

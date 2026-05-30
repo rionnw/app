@@ -26,8 +26,8 @@ fn main() -> Result<()> {
     println!("Backend real camera diagnostic");
     println!("frames={frame_count} warmup={WARMUP_FRAMES} jpeg_quality={JPEG_QUALITY}");
     println!(
-        "ROBO_UI_MOCK_CAMERA={}",
-        env::var("ROBO_UI_MOCK_CAMERA").unwrap_or_else(|_| "<unset>".to_string())
+        "CUBESOLVER_MOCK_CAMERA={}",
+        env::var("CUBESOLVER_MOCK_CAMERA").unwrap_or_else(|_| "<unset>".to_string())
     );
 
     let cameras = list_cameras().context("failed to list cameras")?;

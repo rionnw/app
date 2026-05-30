@@ -1,7 +1,7 @@
 [package]
-name = "robo-ui"
+name = "robo-app"
 version = "0.1.0"
-description = "Robo cube solver UI"
+description = "CubeSolver desktop app"
 authors = ["wa"]
 edition = "2021"
 
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "robo_ui_lib"
+name = "robo_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -32,7 +32,6 @@ tiny_http = "0.12"
 robo-core = { path = "../crates/robo-core" }
 robo-camera = { path = "../crates/robo-camera" }
 robo-solver = { path = "../crates/robo-solver" }
-robo-translator = { path = "../crates/robo-translator" }
 robo-transport = { path = "../crates/robo-transport" }
 robo-vision = { path = "../crates/robo-vision" }
 robo-pipeline = { path = "../crates/robo-pipeline" }

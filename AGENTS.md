@@ -6,8 +6,8 @@
 - For image-display lag diagnostics, prefer lightweight throttled logs in the existing app log panel and terminal/stdout with stable prefixes rather than noisy per-frame console logging.
 
 ## Learned Workspace Facts
-- The app is a Tauri project with a React frontend in `src/` and the main Rust backend in `robo-ui/src/lib.rs`.
+- The app's product name is **CubeSolver** (window title / UI). It is a Tauri project with a React frontend in `src/` and the main Rust backend in `robo-app/src/lib.rs` (crate name `robo-app`, lib name `robo_app_lib`).
 - Camera streams are displayed in the frontend as one backend-composed grid image, not four separate images; ROI coordinates apply to that composed image.
 - The backend supports both camera and file image sources: camera solving uses the latest frame path, while file solving uses a `solve_image_file` flow that decodes a data URL.
-- Device mocks use `ROBO_UI_MOCK_CAMERA=1` and `ROBO_UI_MOCK_SERIAL=1`; default startup without those variables uses real hardware such as the Mac camera.
+- Device mocks use `CUBESOLVER_MOCK_CAMERA=1` and `CUBESOLVER_MOCK_SERIAL=1`; default startup without those variables uses real hardware such as the Mac camera.
 - Real camera diagnostics should not persist numeric camera indices blindly; AVFoundation/nokhwa can reorder Mac and USB camera indices between enumerations.

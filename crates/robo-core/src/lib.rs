@@ -120,7 +120,7 @@ pub trait Translator: Send + Sync {
 
 /// 下位机数字映射的固定槽位数（与 mnemonic 数量一致）。
 ///
-/// 索引顺序与 handstep 的 `MNEMONIC_STR` / robo-translator 的 `MNEMONICS` 一致：
+/// 索引顺序与 robo-handstep 的 `MNEMONIC_STR` / robo-transport 的 `MNEMONICS` 一致：
 /// `[M_L1, M_L2, M_L3, M_LC, M_LO, M_R1, M_R2, M_R3, M_RC, M_RO]`
 pub const MNEMONIC_COUNT: usize = 10;
 

@@ -41,8 +41,8 @@ pub const OPEN: i32 = 1;
 ///
 /// 这是 handstep 输出层的"语义"表示——上层用 `M_LC` 等语义标识，
 /// 真正发到下位机时再由 transport 层用 digit_map 编码成数字字符。
-/// 与 `robo_translator::MNEMONICS` 字面值一致，但 handstep 不依赖
-/// translator crate，自带一份独立常量。
+/// 与 `robo_transport::MNEMONICS` 字面值一致，handstep 不依赖
+/// transport crate，自带一份独立常量。
 pub const MNEMONIC_STR: [&str; 10] = [
     "M_L1", "M_L2", "M_L3", "M_LC", "M_LO",
     "M_R1", "M_R2", "M_R3", "M_RC", "M_RO",

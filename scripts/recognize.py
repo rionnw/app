@@ -1,7 +1,7 @@
 """
 魔方颜色识别脚本 (Python 调试版)
 
-使用 robo-ui/robot-roi.json 中的 54 个 ROI，对图片进行 LAB 颜色空间
+使用 robo-app/robot-roi.json 中的 54 个 ROI，对图片进行 LAB 颜色空间
 聚类识别，将识别结果用色块标注在原图 ROI 位置上另存。
 
 使用方法：
@@ -62,7 +62,7 @@ FACE_COLORS_BGR = [
 
 
 def load_rois(roi_file):
-    """加载 robo-ui 格式的 ROI 文件: {"rois": [{x, y, width, height}, ...]}"""
+    """加载 robo-app 格式的 ROI 文件: {"rois": [{x, y, width, height}, ...]}"""
     with open(roi_file, "r") as f:
         data = json.load(f)
     rois = data["rois"]
@@ -258,7 +258,7 @@ def process_image(image_path, rois, output_dir):
 
 def main():
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    roi_file = os.path.join(base_dir, "robo-ui", "robot-roi.json")
+    roi_file = os.path.join(base_dir, "robo-app", "robot-roi.json")
     output_dir = os.path.join(base_dir, "scripts", "output")
 
     if not os.path.exists(roi_file):

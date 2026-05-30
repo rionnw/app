@@ -5,7 +5,7 @@
 当前相机预览链路表面上是“后台推送”，实际实现是前端定时轮询：
 
 1. `src/App.tsx` 通过 `setInterval` 调用 `capture_frame`。
-2. `robo-ui/src/lib.rs` 在 Tauri command 中同步等待后端抓取一整帧拼接图。
+2. `robo-app/src/lib.rs` 在 Tauri command 中同步等待后端抓取一整帧拼接图。
 3. `crates/robo-camera/src/lib.rs` 对多个相机槽位串行 `capture_slot`。
 4. 后端把 RGB 拼接图重新编码成 JPEG，写入 `latest_frame`。
 5. 前端再通过本地 HTTP URL 拉取 JPEG；失败时降级为 `latest_frame_data_url`，用 base64 通过 IPC 传大 payload。
@@ -161,7 +161,7 @@ WebSocket 二进制帧会让前端承担 blob URL 管理、背压和生命周期
   - 新增 `FramePacket`、`CameraSlotWorkerEvent`、`CameraSlotWorker`。
   - 每路相机 worker 独立采集并上报帧/状态。
 
-- `robo-ui/src/lib.rs`
+- `robo-app/src/lib.rs`
   - 新增 `CameraStreamRuntime`、`FrameHub`、`MjpegStreamReader`。
   - 新增 `open_camera_stream`、`close_camera_stream`、`camera_stream_info`、`snapshot_frame`、`solve_latest_frame`。
   - 新增 `/grid.mjpeg` 和 `/slot/{slot}.mjpeg`。
