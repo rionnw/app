@@ -858,21 +858,35 @@ mod tests {
     /// 不做正确性断言（没有 reference 真值），只验证不 panic 且输出非空。
     #[test]
     fn user_provided_sequences() {
-        let cases = [
-            "R2 F' D2 F' U2 R2 F  R2 U2 F' D  L  F2 D' B' R' B  R2 F  U'",
-            "L2 U' B2 R2 D' B2 L2 D' B2 R2 D  R2 L' D2 U' B' F  R  D2 B' L'",
-            "U  B' D  L  U2 F' U  L2 U' L  B2 U2 B2 D2 R  F2 B2 D2 R2 D",
-            "F2 R  U  R  B  R  D2 F2 U' B  D  L2 F2 D  B2 U  R2 D  L2",
-            "U' L' U' L' B' R  U  D' L  B2 R2 U  L2 U  R2 D' L2 U2 L2 D' B'",
-            "L2 F  B2 U2 L2 D  R2 B2 F2 D' L2 B2 U' R' B2 R  D  L  B2 F'",
-            "F  D  R2 L2 B2 D' F  D2 F2 U2 D' F2 B2 R2 D2 R2 L2 F  R  D",
-            "R  L  B2 R' D' R  D  B' U' R2 D2 L2 F' D2 F2 B' L2 R",
-            "L  D  B  L' F  R2 B' U  L2 F2 U' F2 R2 U' L2 U' R2 U2 R2 F' L2",
-            "R2 D2 B2 F2 R2 B2 U' B2 F2 L2 U  B  L2 F  R  U' R2 D  B' U2",
-            "R  D2 R' D2 B2 U2 F2 R2 U2 L2 R  B2 U' R  B' L2 B' L' R2 U' B",
+        // (Kociemba 串, 期望机械步数, 期望完整输出)
+        // 期望值是 §5.1 修复后的版本（"真正时间最优"，与 §5.3 删
+        // MechanicalStep::time 重构前后 byte-equivalent）。
+        let cases: &[(&str, i32, &str)] = &[
+            ("R2 F' D2 F' U2 R2 F  R2 U2 F' D  L  F2 D' B' R' B  R2 F  U'",
+             72, "862528264951703869519404814064582649517041490931706945271740296935391902"),
+            ("L2 U' B2 R2 D' B2 L2 D' B2 R2 D  R2 L' D2 U' B' F  R  D2 B' L'",
+             87, "635819069252819069253147073170695371903190695396953184028635717026451840491903625149072"),
+            ("U  B' D  L  U2 F' U  L2 U' L  B2 U2 B2 D2 R  F2 B2 D2 R2 D",
+             75, "170694547174064959464951703769254821409692514083818036451470931803170695384"),
+            ("F2 R  U  R  B  R  D2 F2 U' B  D  L2 F2 D  B2 U  R2 D  L2",
+             74, "39170414709414709317069531706945291740649593170695391806935391703639591803"),
+            ("U' L' U' L' B' R  U  D' L  B2 R2 U  L2 U  R2 D' L2 U2 L2 D' B'",
+             85, "1406457174027694527194062959414802629519041480831706945484635148082635148083818026457"),
+            ("L2 F  B2 U2 L2 D  R2 B2 F2 D' L2 B2 U' R' B2 R  D  L  B2 F'",
+             80, "63584148031706953818404635814062586358264581706945314707625284149069254917031802"),
+            ("F  D  R2 L2 B2 D' F  D2 F2 U2 D' F2 B2 R2 D2 R2 L2 F  R  D",
+             71, "62549170318031906953769518404836358639573180319069538318031706945491904"),
+            ("R  L  B2 R' D' R  D  B' U' R2 D2 L2 F' D2 F2 B' L2 R",
+             67, "9693591806935371740296925471740645769353818036951740283180264586359"),
+            ("L  D  B  L' F  R2 B' U  L2 F2 U' F2 R2 U' L2 U' R2 U2 R2 F' L2",
+             84, "635917046459692514907463514808625291903190695376925314086451470737180695383170694528"),
+            ("R2 D2 B2 F2 R2 B2 U' B2 F2 L2 U  B  L2 F  R  U' R2 D  B' U2",
+             81, "819069531906953180381840362957318031706953170962548180462951940476935396945147073"),
+            ("R  D2 R' D2 B2 U2 F2 R2 U2 L2 R  B2 U' R  B' L2 B' L' R2 U' B",
+             75, "919037692531480836358140645836358635917036951940296945147073769252180371904"),
         ];
         let mut e = Engine::new();
-        for (i, kc) in cases.iter().enumerate() {
+        for (i, (kc, exp_n, exp_s)) in cases.iter().enumerate() {
             let face_count = kc.split_whitespace().count();
             let rs = kociemba_to_robotstep(kc).expect("Kociemba 解析失败");
             DFS_NODE_COUNTER.with(|c| c.set(0));
@@ -882,10 +896,13 @@ mod tests {
             let nodes = DFS_NODE_COUNTER.with(|c| c.get());
             let s = e.get_steps();
             eprintln!(
-                "[{:2}] {:>2} face → mech_steps={:>3}, dfs_nodes={:>5}, time={:>8?}, output={}",
-                i, face_count, n, nodes, elapsed,
-                if s.len() > 60 { format!("{}...({} chars)", &s[..40], s.len()) } else { s.clone() }
+                "[{:2}] {:>2}f mech={:>3} nodes={:>5} t={:>9?} | {}",
+                i, face_count, n, nodes, elapsed, s
             );
+            assert_eq!(n, *exp_n,
+                "[{}] 机械步数偏移：实际 {} 期望 {}", i, n, exp_n);
+            assert_eq!(&s, exp_s,
+                "[{}] 输出偏移：\n  实际 {}\n  期望 {}", i, s, exp_s);
         }
     }
 
