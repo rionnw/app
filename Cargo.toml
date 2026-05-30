@@ -26,6 +26,25 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
-# robo-solver 的 pruning 表生成在无优化模式下极慢，dev 模式也开 opt
+# dev 模式下对热路径开优化，避免界面卡顿；保留主 crate 不优化以加快迭代编译
 [profile.dev.package.robo-solver]
 opt-level = 3
+
+[profile.dev.package.robo-vision]
+opt-level = 3
+
+[profile.dev.package.robo-camera]
+opt-level = 3
+
+[profile.dev.package.robo-handstep]
+opt-level = 3
+
+# 所有第三方依赖在 dev 模式也使用 release 级优化（image/nokhwa/turbojpeg 等）
+[profile.dev.package."*"]
+opt-level = 3
+
+# release 模式额外开启 LTO + 单 codegen unit，进一步榨干性能
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

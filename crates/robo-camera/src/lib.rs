@@ -22,6 +22,12 @@ use std::{
 
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// 拼接画布的固定单格尺寸，与 robo-app 中 GRID_TILE_WIDTH/HEIGHT 保持一致。
+/// 各路相机的实际分辨率/比例在 blit 时直接拉伸到 (TILE_WIDTH, TILE_HEIGHT)，
+/// 让最终 grid 永远是 1280x960，识别端的 ROI 坐标系稳定。
+pub const TILE_WIDTH: u32 = 640;
+pub const TILE_HEIGHT: u32 = 480;
+
 #[derive(Clone, Debug)]
 pub struct CameraConfig {
     pub index: u32,
@@ -335,16 +341,9 @@ impl MultiCameraSource {
     pub fn open(configs: Vec<CameraConfig>, columns: u32) -> Result<Self> {
         anyhow::ensure!(!configs.is_empty(), "at least one camera is required");
         anyhow::ensure!(columns > 0, "columns must be greater than zero");
-        let tile_width = configs
-            .iter()
-            .map(|config| config.width)
-            .max()
-            .unwrap_or(640);
-        let tile_height = configs
-            .iter()
-            .map(|config| config.height)
-            .max()
-            .unwrap_or(480);
+        // 固定 tile 尺寸 → grid 永远是 1280x960，识别 / ROI 始终对齐。
+        let tile_width = TILE_WIDTH;
+        let tile_height = TILE_HEIGHT;
         let slots = configs
             .into_iter()
             .map(|config| CameraSlot {
@@ -850,32 +849,30 @@ fn blit_fit_rgb(
     dst_x: u32,
     dst_y: u32,
 ) {
-    fill_tile(dst, dst_width, tile_width, tile_height, dst_x, dst_y, 12);
-
+    // 与 RobotApp 一致：直接拉伸到 tile 尺寸，**允许变形**，不做 letterbox。
     if src.width == tile_width && src.height == tile_height {
         blit_rgb(src, dst, dst_width, dst_x, dst_y);
         return;
     }
 
-    let scale = (tile_width as f32 / src.width as f32).min(tile_height as f32 / src.height as f32);
-    let fit_width = ((src.width as f32 * scale).round() as u32).clamp(1, tile_width);
-    let fit_height = ((src.height as f32 * scale).round() as u32).clamp(1, tile_height);
     let Some(image) = RgbImage::from_raw(src.width, src.height, src.rgb.clone()) else {
+        fill_tile(dst, dst_width, tile_width, tile_height, dst_x, dst_y, 12);
         return;
     };
     let resized = imageops::resize(
         &image,
-        fit_width,
-        fit_height,
+        tile_width,
+        tile_height,
         imageops::FilterType::Triangle,
     );
-    let frame = match Frame::new_rgb(fit_width, fit_height, resized.into_raw()) {
+    let frame = match Frame::new_rgb(tile_width, tile_height, resized.into_raw()) {
         Ok(frame) => frame,
-        Err(_) => return,
+        Err(_) => {
+            fill_tile(dst, dst_width, tile_width, tile_height, dst_x, dst_y, 12);
+            return;
+        }
     };
-    let offset_x = dst_x + (tile_width - fit_width) / 2;
-    let offset_y = dst_y + (tile_height - fit_height) / 2;
-    blit_rgb(&frame, dst, dst_width, offset_x, offset_y);
+    blit_rgb(&frame, dst, dst_width, dst_x, dst_y);
 }
 
 fn fill_placeholder(

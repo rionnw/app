@@ -196,6 +196,11 @@ const nowTime = () =>
     hour12: false,
   }).format(new Date());
 
+/// 给 MJPEG URL 拼一个时间戳查询参数，强制 webview 丢弃旧的 multipart 连接、
+/// 重新发起请求拿新的 stream session（reopen / restore 时必须，否则浏览器会
+/// 复用挂在旧 session 上的 TCP，画面像被卡住一样延迟）。
+const withCacheBust = (url: string) => `${url}${url.includes("?") ? "&" : "?"}t=${Date.now()}`;
+
 function App() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const roiInputRef = useRef<HTMLInputElement>(null);
@@ -294,7 +299,10 @@ function App() {
   const currentRegionIndex = regions.findIndex((region) => region.id === currentRegionId);
   const currentRegion = regions[currentRegionIndex] ?? regions[0];
   const visibleRegions = focusCurrentRoi ? regions.filter((region) => region.id === currentRegionId) : regions;
-  const showCanvasPreview = cameraOpen && imageSource === "camera";
+  /// 相机模式不再走 canvas + invoke 拉帧（每帧大 JPEG 经 Tauri IPC 延迟很高）。
+  /// 直接用 <img> 加载后端的 MJPEG endpoint，由 webview 原生消化 multipart 流，
+  /// 延迟从 80~150ms 降到接近实时。canvas 通路完全保留以便后续诊断需要时再启用。
+  const showCanvasPreview = false;
 
   const addLog = (text: string, kind: LogItem["kind"] = "info") => {
     setLogs((items) => [{ time: nowTime(), text, kind }, ...items].slice(0, 120));
@@ -481,7 +489,7 @@ function App() {
       imageLoadTimingRef.current = null;
       lastImageSrcRef.current = imageSrc;
       lastLoggedImageBoxRef.current = { box: null, loggedAtMs: null };
-      addLog(`图像源切换：camera ${imageName}，使用画布拉取最新帧。`);
+      addLog(`图像源切换：camera ${imageName}，MJPEG 直连。`);
       return;
     }
 
@@ -692,7 +700,7 @@ function App() {
     });
   };
 
-  const reopenIfNeeded = async (configs: CameraConfig[]) => {
+  const reopenIfNeeded = async (configs: CameraConfig[], refreshSlot?: number) => {
     if (!cameraOpen) return;
     try {
       // 显式先 close → 短暂等待 → 再 open。后端 open_camera_stream 内部虽然也会
@@ -709,17 +717,20 @@ function App() {
       lastCameraFrameAtBySlotRef.current = {};
       lastCameraFrameGapLogAtBySlotRef.current = {};
       lastCanvasFrameLogAtRef.current = null;
-      setImageSrc(stream.gridUrl);
+      // 给 MJPEG URL 加时间戳，强制 webview 重连新的 stream session，
+      // 否则换分辨率后 <img> 仍挂在旧 multipart 连接上、新帧迟迟不显示。
+      setImageSrc(withCacheBust(stream.gridUrl));
       setImageSource("camera");
       setCameraStreamUrl(stream.gridUrl);
       setCameraStreamSize({ width: stream.width, height: stream.height });
       setNaturalSize({ width: stream.width, height: stream.height });
       setCameraStatuses(stream.statuses);
       setFrameStats("stream restarting");
-      addLog(`相机流已按新配置重启，画布预览目标 ${canvasPreviewFps} FPS。`);
+      addLog("相机流已按新配置重启。");
       // 把 next configs 显式传给 refresh，避免 React state 异步导致 closure
       // 里读到旧 index → 控件面板里"Index"显示对，但分辨率/格式列表却是旧设备的。
-      refreshCameraControls(controlSlot, configs);
+      // refreshSlot 显式覆盖时（例如 swap 后 controlSlot 跟着移动），用新的槽位号。
+      refreshCameraControls(refreshSlot ?? controlSlot, configs);
     } catch (error) {
       addLog(String(error), "error");
     }
@@ -739,14 +750,22 @@ function App() {
     [next[swapSlot], next[slot]] = [next[slot], next[swapSlot]];
     setCameraConfigs(next);
     setSwapSlot(null);
-    // 配置交换后流会被重启 → 当前展开的参数面板基于的是旧 slot 索引，
-    // 折叠面板让用户看到"重新读取"提示，避免误以为还在调旧设备。
-    if (loadedControlSlot !== null) {
-      setLoadedControlSlot(null);
-      setCameraControls([]);
-      setCameraFormats([]);
+
+    // 互换后下拉框选中的"参数面板槽"要跟着设备走：
+    // - 如果用户当前在看 swapSlot 上的设备，那台设备现在跑到 slot 上 → controlSlot 跟着到 slot
+    // - 反之亦然
+    // 这样交换 1↔3 后，下拉框自动停在新位置，不会出现"只能看到槽 1 参数"的错觉。
+    let nextControlSlot = controlSlot;
+    if (controlSlot === swapSlot) nextControlSlot = slot;
+    else if (controlSlot === slot) nextControlSlot = swapSlot;
+    if (nextControlSlot !== controlSlot) {
+      setControlSlot(nextControlSlot);
     }
-    await reopenIfNeeded(next);
+    // 折叠旧参数面板，reopenIfNeeded 内部会按新的 controlSlot 自动重新加载。
+    setLoadedControlSlot(null);
+    setCameraControls([]);
+    setCameraFormats([]);
+    await reopenIfNeeded(next, nextControlSlot);
   };
 
   const openCamera = async () => {
@@ -755,7 +774,7 @@ function App() {
       lastCameraFrameAtBySlotRef.current = {};
       lastCameraFrameGapLogAtBySlotRef.current = {};
       lastCanvasFrameLogAtRef.current = null;
-      setImageSrc(stream.gridUrl);
+      setImageSrc(withCacheBust(stream.gridUrl));
       setImageSource("camera");
       setCameraStreamUrl(stream.gridUrl);
       setCameraStreamSize({ width: stream.width, height: stream.height });
@@ -765,7 +784,7 @@ function App() {
       setFrameStats("stream starting");
       setCameraOpen(true);
       setStatus("相机预览中");
-      addLog(`相机流已启动。图像通过画布拉取最新合成帧，目标 ${canvasPreviewFps} FPS。`);
+      addLog("相机流已启动，使用 MJPEG 直连。");
     } catch (error) {
       addLog(String(error), "error");
     }
@@ -1104,7 +1123,7 @@ function App() {
       addLog("相机未开启，无法切回相机视图。", "warn");
       return;
     }
-    setImageSrc(cameraStreamUrl);
+    setImageSrc(withCacheBust(cameraStreamUrl));
     setImageSource("camera");
     if (cameraStreamSize) {
       setNaturalSize(cameraStreamSize);

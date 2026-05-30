@@ -145,6 +145,13 @@ const DIAGNOSTIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const DIAGNOSTIC_WARN_THRESHOLD: Duration = Duration::from_millis(200);
 const BACKEND_DIAGNOSTIC_PREFIX: &str = "[backend-diagnostic]";
 
+/// 拼接画布的单格尺寸固定为 640x480，2x2 布局合成 1280x960 总画布——与
+/// RobotApp 历史约定一致，ROI 坐标基于这一固定画布编辑/保存，切换源相机
+/// 分辨率时画布尺寸不变，ROI 永远对得上。
+/// 单格内部直接 resize 到 (640, 480)，**允许变形**，不做 letterbox。
+const GRID_TILE_WIDTH: u32 = 640;
+const GRID_TILE_HEIGHT: u32 = 480;
+
 impl Default for AppState {
     fn default() -> Self {
         let latest_frame = Arc::new(Mutex::new(None));
@@ -335,19 +342,9 @@ impl MockCameraWorker {
                     .map(Some)
             })
             .collect::<Result<Vec<_>>>()?;
-        let tile_width = self
-            .configs
-            .iter()
-            .map(|config| config.width)
-            .max()
-            .unwrap_or(640);
-        let tile_height = self
-            .configs
-            .iter()
-            .map(|config| config.height)
-            .max()
-            .unwrap_or(480);
-        let frame = compose_grid_frame(frames, tile_width, tile_height, 2)?
+        // mock 路径同样使用全局固定的 grid tile 尺寸，让识别端拿到的帧
+        // 永远是 1280x960，与 ROI 坐标系对齐。
+        let frame = compose_grid_frame(frames, GRID_TILE_WIDTH, GRID_TILE_HEIGHT, 2)?
             .context("failed to compose mock camera capture")?;
         Ok(MultiCameraCapture {
             frame,
@@ -876,16 +873,10 @@ fn spawn_camera_stream_aggregator(
 impl FrameHub {
     fn configure(&self, configs: &[CameraConfig]) -> Result<u64> {
         anyhow::ensure!(!configs.is_empty(), "at least one camera is required");
-        let tile_width = configs
-            .iter()
-            .map(|config| config.width)
-            .max()
-            .unwrap_or(640);
-        let tile_height = configs
-            .iter()
-            .map(|config| config.height)
-            .max()
-            .unwrap_or(480);
+        // 固定 tile 尺寸，使 grid 总分辨率与各路相机的实际分辨率解耦。
+        // 单格内部由 compose_grid_frame letterbox 适配源尺寸。
+        let tile_width = GRID_TILE_WIDTH;
+        let tile_height = GRID_TILE_HEIGHT;
         let slots = configs
             .iter()
             .cloned()
@@ -1477,30 +1468,29 @@ fn blit_fit_rgb(
     dst_x: u32,
     dst_y: u32,
 ) {
-    fill_tile(dst, dst_width, tile_width, tile_height, dst_x, dst_y, 12);
+    // 与 RobotApp 一致：直接拉伸到 tile 尺寸，**允许变形**，不做 letterbox。
+    // 这样无论各路相机原生分辨率/比例如何，拼接画布始终是固定布局，
+    // ROI 坐标永远对得上。
     if src.width == tile_width && src.height == tile_height {
         blit_rgb(src, dst, dst_width, dst_x, dst_y);
         return;
     }
 
-    let scale = (tile_width as f32 / src.width as f32).min(tile_height as f32 / src.height as f32);
-    let fit_width = ((src.width as f32 * scale).round() as u32).clamp(1, tile_width);
-    let fit_height = ((src.height as f32 * scale).round() as u32).clamp(1, tile_height);
     let Some(image) = RgbImage::from_raw(src.width, src.height, src.rgb.clone()) else {
+        fill_tile(dst, dst_width, tile_width, tile_height, dst_x, dst_y, 12);
         return;
     };
     let resized = imageops::resize(
         &image,
-        fit_width,
-        fit_height,
+        tile_width,
+        tile_height,
         imageops::FilterType::Triangle,
     );
-    let Ok(frame) = Frame::new_rgb(fit_width, fit_height, resized.into_raw()) else {
+    let Ok(frame) = Frame::new_rgb(tile_width, tile_height, resized.into_raw()) else {
+        fill_tile(dst, dst_width, tile_width, tile_height, dst_x, dst_y, 12);
         return;
     };
-    let offset_x = dst_x + (tile_width - fit_width) / 2;
-    let offset_y = dst_y + (tile_height - fit_height) / 2;
-    blit_rgb(&frame, dst, dst_width, offset_x, offset_y);
+    blit_rgb(&frame, dst, dst_width, dst_x, dst_y);
 }
 
 fn blit_rgb(src: &Frame, dst: &mut [u8], dst_width: u32, dst_x: u32, dst_y: u32) {
@@ -2516,8 +2506,24 @@ fn decode_image_data_url(data_url: &str) -> Result<Frame> {
     let image = image::load_from_memory(&bytes)
         .context("failed to decode image file")?
         .to_rgb8();
-    let (width, height) = image.dimensions();
-    Frame::new_rgb(width, height, image.into_raw()).context("failed to build frame from image file")
+
+    // 与相机拼接画布同尺寸。任意输入图片都强制拉伸到 1280x960（允许变形），
+    // 让识别端的 ROI 坐标系与"实时相机帧"一致——保存的 robot-roi.json
+    // 既适用于相机直出，也适用于回放任意分辨率的快照。
+    let target_width = GRID_TILE_WIDTH * 2;
+    let target_height = GRID_TILE_HEIGHT * 2;
+    let normalized = if image.width() == target_width && image.height() == target_height {
+        image
+    } else {
+        imageops::resize(
+            &image,
+            target_width,
+            target_height,
+            imageops::FilterType::Triangle,
+        )
+    };
+    Frame::new_rgb(target_width, target_height, normalized.into_raw())
+        .context("failed to build frame from image file")
 }
 
 fn capture_from_state(state: &AppState) -> Result<MultiCameraCapture> {
@@ -2617,9 +2623,16 @@ mod tests {
         );
         let frame = decode_image_data_url(&data_url).expect("data URL should decode");
 
-        assert_eq!(frame.width, 2);
-        assert_eq!(frame.height, 1);
-        assert_eq!(frame.rgb.len(), 6);
+        // decode_image_data_url 强制 resize 到 grid 画布尺寸（1280x960），
+        // 让 ROI 坐标系无论图源是相机还是任意分辨率快照都保持一致。
+        let expected_width = GRID_TILE_WIDTH * 2;
+        let expected_height = GRID_TILE_HEIGHT * 2;
+        assert_eq!(frame.width, expected_width);
+        assert_eq!(frame.height, expected_height);
+        assert_eq!(
+            frame.rgb.len(),
+            (expected_width * expected_height * 3) as usize
+        );
     }
 
     #[test]
