@@ -3823,11 +3823,94 @@ fn load_default_roi() -> Option<String> {
     None
 }
 
+/// 软件使用期限：本地时区 2026-08-31 23:59:59 整天可用，
+/// 跨过 00:00 进入 2026-09-01 即视为过期，启动期直接退出，不打开窗口。
+///
+/// 设计取舍（用户确认）：
+/// - 仅启动时检查一次，不做运行中轮询；用户挂着开 24h 跨过期限不会被踢
+/// - 仅依赖 std/chrono 的本地系统时间，用户回拨系统时钟即可绕过——
+///   定位为内部交付物的"温和过期标记"，不做防绕过
+/// - 边界精确到秒：截止日期当天可用，2026-09-01 00:00:00 起拒绝
+const LICENSE_EXPIRY_LOCAL: &str = "2026-09-01 00:00:00";
+
+fn enforce_license_expiry() {
+    use chrono::{Local, NaiveDateTime, TimeZone};
+    let parsed = NaiveDateTime::parse_from_str(LICENSE_EXPIRY_LOCAL, "%Y-%m-%d %H:%M:%S")
+        .expect("LICENSE_EXPIRY_LOCAL must be a valid local datetime literal");
+    let expiry = match Local.from_local_datetime(&parsed).single() {
+        Some(dt) => dt,
+        None => {
+            // 本地时间在该常量上有歧义（DST 跳变）的极小概率分支：
+            // 取最早可解析时刻，宁可早过期也不错放
+            Local
+                .from_local_datetime(&parsed)
+                .earliest()
+                .expect("LICENSE_EXPIRY_LOCAL ambiguous and unresolvable in local time zone")
+        }
+    };
+    let now = Local::now();
+    if now >= expiry {
+        let msg = format!(
+            "CubeSolver 已超过使用期限 (截止 2026-08-31 23:59:59)。\n当前时间: {}",
+            now.format("%Y-%m-%d %H:%M:%S %z"),
+        );
+        // 写日志 + stderr + 弹一个 native messagebox（macOS 上用 osascript，
+        // Windows 上 cmd msgbox；前端窗口不会创建，只能借助系统弹窗告知）
+        log::error!("{msg}");
+        eprintln!("{msg}");
+        show_native_expiry_dialog(&msg);
+        std::process::exit(1);
+    }
+    log::info!(
+        "license check ok, now={}, expiry={}",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        expiry.format("%Y-%m-%d %H:%M:%S"),
+    );
+}
+
+/// 在尚未拉起 Tauri webview 时弹出系统原生提示框；失败则忽略
+/// （日志和 stderr 已经写过一份，主目的是阻止用户继续，而不是必须 GUI 提示）。
+fn show_native_expiry_dialog(message: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        // osascript 简单可靠，避免引入额外 GUI 依赖
+        let script = format!(
+            "display dialog \"{}\" with title \"CubeSolver\" buttons {{\"OK\"}} default button 1 with icon stop",
+            message.replace('\\', "\\\\").replace('"', "\\\""),
+        );
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // mshta vbscript 弹框，避免拉 winapi 依赖
+        let safe = message.replace('"', "'").replace('\n', " ");
+        let vb = format!(
+            "vbscript:Execute(\"MsgBox \"\"{}\"\", 16, \"\"CubeSolver\"\":close\")",
+            safe,
+        );
+        let _ = std::process::Command::new("mshta").arg(vb).status();
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        // Linux 等环境：尝试 zenity / kdialog，都不可用就只能靠 stderr
+        let _ = std::process::Command::new("zenity")
+            .args(["--error", "--title=CubeSolver", "--text"])
+            .arg(message)
+            .status();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     setup_logging();
 
     log::info!("CubeSolver starting");
+
+    // 使用期限校验：超过 2026-08-31 当天即退出，不创建任何窗口/状态。
+    enforce_license_expiry();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
