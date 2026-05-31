@@ -21,20 +21,9 @@ type ThrottledDiagnosticInput = {
   intervalMs: number;
 };
 
-type CameraFrameGapInput = {
-  gapMs: number;
-  fps: number | null;
-};
-
-type CameraFrameGapDiagnosticInput = CameraFrameGapInput & {
-  slot: number;
-};
-
 type DiagnosticLogInvoke = (command: string, args: { message: string }) => Promise<unknown>;
 
 const imageBoxMaterialChangePx = 2;
-const minimumCameraFrameGapWarningMs = 1_000;
-const cameraFrameGapWarningFrameCount = 6;
 
 const roundedMs = (value: number) => Math.round(value);
 
@@ -64,15 +53,11 @@ export const hasMaterialImageBoxChange = (
 export const shouldLogThrottledDiagnostic = ({ nowMs, lastLoggedAtMs, intervalMs }: ThrottledDiagnosticInput) =>
   lastLoggedAtMs === null || nowMs - lastLoggedAtMs >= intervalMs;
 
-export const isCameraFrameGapAbnormal = ({ gapMs, fps }: CameraFrameGapInput) => {
-  const expectedFrameMs = 1_000 / Math.max(1, fps ?? 1);
-  return gapMs >= Math.max(minimumCameraFrameGapWarningMs, expectedFrameMs * cameraFrameGapWarningFrameCount);
-};
-
-export const createCameraFrameGapDiagnostic = ({ slot, gapMs, fps }: CameraFrameGapDiagnosticInput) => {
-  const fpsLabel = fps === null ? "-" : fps.toFixed(1);
-  return `相机帧间隔偏大：槽 ${slot + 1} 间隔 ${roundedMs(gapMs)} ms，事件 FPS ${fpsLabel}。`;
-};
+// 旧的 isCameraFrameGapAbnormal / createCameraFrameGapDiagnostic 已移除：
+// 它们基于"前端事件 timestamp"算 gap，但后端把 camera-stream-event(frame)
+// 节流到 1Hz 给前端，前端测出来的 gap 永远是 ~1000ms，必然误报。
+// 现在改由后端 worker 真实 capture-to-capture 间隔触发 camera-frame-gap-warning
+// 事件，前端在 App.tsx 里直接 listen 后写入日志。
 
 export const sendDiagnosticLog = async (message: string, invokeCommand: DiagnosticLogInvoke) => {
   try {

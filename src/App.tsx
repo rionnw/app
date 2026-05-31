@@ -5,11 +5,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { resolveCanvasPreviewFps, shouldRequestCanvasFrame } from "./canvasPreview";
 import {
-  createCameraFrameGapDiagnostic,
   createImageBoxDiagnostic,
   createImageLoadDiagnostic,
   hasMaterialImageBoxChange,
-  isCameraFrameGapAbnormal,
   sendDiagnosticLog,
   shouldLogThrottledDiagnostic,
 } from "./imageDiagnostics";
@@ -124,7 +122,6 @@ const solvedFacelets = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB";
 const firstRoiRegionId = getRoiIndexView(0).label;
 const panelVisibilityStorageKey = "cubesolver.panel-visibility";
 const imageLayoutDiagnosticThrottleMs = 3_000;
-const cameraGapDiagnosticThrottleMs = 5_000;
 const canvasFrameDiagnosticThrottleMs = 3_000;
 /// 滑块拖动写硬件的 debounce 窗口；80ms 在视觉跟手和减少 IPC 之间折中。
 const controlWriteDebounceMs = 80;
@@ -229,8 +226,6 @@ function App() {
     box: null,
     loggedAtMs: null,
   });
-  const lastCameraFrameAtBySlotRef = useRef<Record<number, number>>({});
-  const lastCameraFrameGapLogAtBySlotRef = useRef<Record<number, number>>({});
   const lastCanvasFrameLogAtRef = useRef<number | null>(null);
   /// 控件 id → setTimeout handle，用于滑块连拖时合并 IPC 写硬件
   const pendingControlWriteRef = useRef<Map<string, number>>(new Map());
@@ -462,6 +457,19 @@ function App() {
         }
       },
     );
+    // 后端真实 capture-to-capture 间隔超过 200ms 时 emit（每槽 1Hz 节流）。
+    // 取代历史前端基于 1Hz 节流后事件 timestamp 自算 gap 的逻辑（误报源）。
+    const unlistenFrameGapWarning = listen<{ slot: number; gapMs: number }>(
+      "camera-frame-gap-warning",
+      (event) => {
+        const payload = event.payload;
+        if (!payload || typeof payload.gapMs !== "number") return;
+        addLog(
+          `相机帧间隔偏大：槽 ${payload.slot + 1} 实测间隔 ${payload.gapMs} ms（worker 抓帧侧测量）。`,
+          "warn",
+        );
+      },
+    );
     // 尝试加载默认 ROI 文件
     // 注意：这里走 ROI_REFERENCE_SIZE=1280×960，而非依赖 naturalSize。
     // 挂载期相机/图片都未 ready，naturalSize={0,0} 会让像素坐标分支
@@ -483,6 +491,7 @@ function App() {
       unlisten.then((f) => f());
       unlistenStartupWarning.then((f) => f());
       unlistenRecognitionTrace.then((f) => f());
+      unlistenFrameGapWarning.then((f) => f());
       clearInterval(pollReady);
     };
   }, []);
@@ -703,24 +712,10 @@ function App() {
         );
       }
       if (payload.kind === "frame" && payload.slot !== null) {
-        const nowMs = performance.now();
-        const previousFrameAtMs = lastCameraFrameAtBySlotRef.current[payload.slot] ?? null;
-        lastCameraFrameAtBySlotRef.current[payload.slot] = nowMs;
-        if (previousFrameAtMs !== null) {
-          const gapMs = nowMs - previousFrameAtMs;
-          const lastGapLoggedAtMs = lastCameraFrameGapLogAtBySlotRef.current[payload.slot] ?? null;
-          if (
-            isCameraFrameGapAbnormal({ gapMs, fps: payload.fps }) &&
-            shouldLogThrottledDiagnostic({
-              nowMs,
-              lastLoggedAtMs: lastGapLoggedAtMs,
-              intervalMs: cameraGapDiagnosticThrottleMs,
-            })
-          ) {
-            lastCameraFrameGapLogAtBySlotRef.current[payload.slot] = nowMs;
-            addDiagnosticLog(createCameraFrameGapDiagnostic({ slot: payload.slot, gapMs, fps: payload.fps }), "warn");
-          }
-        }
+        // 注意：相机 frame_gap 检测不再在前端进行——后端把 frame 事件节流到
+        // 1Hz 给前端，前端基于事件 timestamp 算 gap 只会得到 ~1000ms 的恒定值，
+        // 必然误报。真实的"相机卡顿"由后端 capture-to-capture 间隔触发，
+        // 通过 camera-frame-gap-warning 事件（下方独立 listen）写入日志。
         const fps = payload.fps === null ? "-" : payload.fps.toFixed(1);
         const captureMs = payload.captureMs === null ? "-" : payload.captureMs.toString();
         const encodeMs = payload.encodeMs === null ? "-" : payload.encodeMs.toString();
@@ -865,8 +860,6 @@ function App() {
       }
       await new Promise((resolve) => setTimeout(resolve, 120));
       const stream = await invoke<CameraStreamInfo>("open_camera_stream", { configs });
-      lastCameraFrameAtBySlotRef.current = {};
-      lastCameraFrameGapLogAtBySlotRef.current = {};
       lastCanvasFrameLogAtRef.current = null;
       // 给 MJPEG URL 加时间戳，强制 webview 重连新的 stream session，
       // 否则换分辨率后 <img> 仍挂在旧 multipart 连接上、新帧迟迟不显示。
@@ -922,8 +915,6 @@ function App() {
   const openCamera = async () => {
     try {
       const stream = await invoke<CameraStreamInfo>("open_camera_stream", { configs: cameraConfigs });
-      lastCameraFrameAtBySlotRef.current = {};
-      lastCameraFrameGapLogAtBySlotRef.current = {};
       lastCanvasFrameLogAtRef.current = null;
       setImageSrc(withCacheBust(stream.gridUrl));
       setImageSource("camera");
@@ -955,8 +946,6 @@ function App() {
       }
       setCameraStreamUrl(null);
       setCameraStreamSize(null);
-      lastCameraFrameAtBySlotRef.current = {};
-      lastCameraFrameGapLogAtBySlotRef.current = {};
       lastCanvasFrameLogAtRef.current = null;
       setNaturalSize({ width: 0, height: 0 });
       setFrameStats("stream idle");

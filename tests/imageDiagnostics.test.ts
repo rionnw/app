@@ -1,11 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  createCameraFrameGapDiagnostic,
   createImageBoxDiagnostic,
   createImageLoadDiagnostic,
   hasMaterialImageBoxChange,
-  isCameraFrameGapAbnormal,
   sendDiagnosticLog,
   shouldLogThrottledDiagnostic,
 } from "../src/imageDiagnostics";
@@ -42,18 +40,10 @@ describe("image diagnostics helpers", () => {
     expect(shouldLogThrottledDiagnostic({ nowMs: 6_100, lastLoggedAtMs: 1_000, intervalMs: 5_000 })).toBe(true);
   });
 
-  test("reports abnormal camera frame gaps relative to configured fps", () => {
-    expect(isCameraFrameGapAbnormal({ gapMs: 180, fps: 30 })).toBe(false);
-    expect(isCameraFrameGapAbnormal({ gapMs: 1_250, fps: 30 })).toBe(true);
-
-    expect(
-      createCameraFrameGapDiagnostic({
-        slot: 1,
-        gapMs: 1_250,
-        fps: 30,
-      }),
-    ).toBe("相机帧间隔偏大：槽 2 间隔 1250 ms，事件 FPS 30.0。");
-  });
+  // 旧测试 "reports abnormal camera frame gaps relative to configured fps" 已删除。
+  // 原因：相机帧间隔诊断已从前端移至后端 worker 侧（capture-to-capture 真实间隔），
+  // 不再在前端基于 1Hz 节流后的 frame 事件 timestamp 自算 gap。后端通过
+  // camera-frame-gap-warning 事件推送，前端 listen 即可，无需本地阈值算法。
 
   test("forwards diagnostics to the backend command", async () => {
     const calls: Array<{ command: string; args: unknown }> = [];

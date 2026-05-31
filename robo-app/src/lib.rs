@@ -132,6 +132,17 @@ struct SlotStreamState {
     last_diagnostic_log_at: Option<Instant>,
 }
 
+/// `publish_slot_frame` 的返回值：包含写入成功的 stream_frame，以及一个
+/// "本次间隔超出诊断阈值"的可选告警。caller 拿到 `gap_warning_ms` 即可
+/// emit 给前端日志，避免前端基于 1Hz 节流后的事件 timestamp 误算 gap。
+struct PublishedSlotFrame {
+    frame: StreamFrame,
+    slot: usize,
+    /// 本次相邻帧间隔（capture-to-capture）超过 200ms 时为 `Some(ms)`，
+    /// 否则 `None`。仅在异常时填充，避免 caller 多做条件判断。
+    gap_warning_ms: Option<u128>,
+}
+
 #[derive(Default)]
 struct FrameHub {
     inner: Mutex<FrameHubInner>,
@@ -1184,7 +1195,7 @@ impl FrameHub {
         packet: FramePacket,
         jpeg: Vec<u8>,
         encode_ms: u128,
-    ) -> Result<Option<StreamFrame>> {
+    ) -> Result<Option<PublishedSlotFrame>> {
         let FramePacket {
             slot,
             index,
@@ -1222,11 +1233,14 @@ impl FrameHub {
         let slot_warning = slot_interval
             .map(|interval| interval > DIAGNOSTIC_WARN_THRESHOLD)
             .unwrap_or(false);
-        if should_log_diagnostic(
+        // 是否本拍真的写了诊断 log；与 emit 给前端的 gap_warning_ms 共用
+        // 同一道 1Hz 节流闸（warning + cooldown），避免抖动时段刷屏。
+        let logged_this_tick = should_log_diagnostic(
             &mut slot_state.last_diagnostic_log_at,
             created_at,
             slot_warning,
-        ) {
+        );
+        if logged_this_tick {
             log::info!(
                 "{BACKEND_DIAGNOSTIC_PREFIX} category=slot_frame level={} slot={} packet_seq={} capture_ms={} encode_ms={} interval_ms={}",
                 diagnostic_level(slot_warning),
@@ -1247,7 +1261,20 @@ impl FrameHub {
         // 仅唤醒 /slot/N.mjpeg 这种慢消费者的 wait_slot_frame；
         // grid 由 timer 自行调度，无需在这里 notify。
         self.changed.notify_all();
-        Ok(Some(stream_frame))
+        // 仅在本拍 (1) 真的触发 warning 且 (2) 通过了 1Hz 节流真的写了 stdout log
+        // 时才回传 gap_warning_ms，让 caller emit 给前端日志。这样在持续抖动
+        // 时段每槽最多 1Hz 出现一条，与现有 stdout 诊断 log 节奏一致，
+        // 不会刷屏。
+        let gap_warning_ms = if slot_warning && logged_this_tick {
+            slot_interval.map(|d| d.as_millis())
+        } else {
+            None
+        };
+        Ok(Some(PublishedSlotFrame {
+            frame: stream_frame,
+            slot,
+            gap_warning_ms,
+        }))
     }
 
     /// 在锁内只 clone Arc<Frame> 引用 + 读 tile 配置，立刻释放锁；
@@ -1479,6 +1506,18 @@ struct CameraStatusDto {
     index: u32,
     connected: bool,
     message: String,
+}
+
+/// 单路相机相邻帧间隔异常告警；后端 worker 真实 capture-to-capture 间隔
+/// 超过 200ms 时 emit 一次（每槽 1Hz 节流），前端 listen 后写入日志面板。
+/// 取代历史前端基于"camera-stream-event(frame)"事件 timestamp 自算 gap
+/// 的逻辑——后者会把后端的 1Hz emit 节流误判成相机卡顿。
+#[derive(Clone, Debug, Serialize)]
+struct CameraFrameGapWarningDto {
+    slot: usize,
+    /// 本次相邻帧间隔（毫秒）
+    #[serde(rename = "gapMs")]
+    gap_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1849,9 +1888,23 @@ fn publish_stream_packet(
     let slot = packet.slot;
     let index = packet.index;
     let seq = packet.seq;
-    let Some(frame) = hub.publish_slot_frame(session_id, packet, Vec::new(), 0)? else {
+    let Some(published) = hub.publish_slot_frame(session_id, packet, Vec::new(), 0)? else {
         return Ok(());
     };
+    let frame = published.frame;
+    // 真实相邻帧间隔异常（>200ms）时 emit 一条 camera-frame-gap-warning 给前端，
+    // 不再依赖前端基于 1Hz 节流后的事件 timestamp 自己算 gap（那种算法
+    // 永远会把节流间隔本身当成 gap 误报）。本通道由 worker 真实抓帧间隔驱动，
+    // 一秒最多触发一次（受 hub 内 last_diagnostic_log_at 已有 1Hz 节流规约）。
+    if let Some(gap_ms) = published.gap_warning_ms {
+        let _ = app.emit(
+            "camera-frame-gap-warning",
+            CameraFrameGapWarningDto {
+                slot: published.slot,
+                gap_ms: gap_ms as u64,
+            },
+        );
+    }
     // 把"frame"事件 emit 到前端的频率限制到 1Hz：
     // 4 路 worker 并发产帧时，每帧都 emit 会让前端 React 状态栏触发整个 App
     // 重渲染（包括 ROI SVG 等无关内容）；MJPEG <img> 显示和 setFrameStats
