@@ -22,7 +22,7 @@ use robo_core::{CubeFace, DigitMap, Frame, Recognizer, Roi};
 use robo_pipeline::multi::translate_optimal;
 use robo_solver::search::{Search, SearchOptions};
 use robo_transport::{default_digit_map, SerialTransport, MNEMONICS, MOVE_COUNT};
-use robo_vision::ColorClusterRecognizer;
+use robo_vision::{ColorClassifierKind, ColorClusterRecognizer};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tiny_http::{Header, Response, Server};
@@ -60,6 +60,9 @@ struct RoiOverlayState {
     /// 是否启用 overlay 绘制。文件模式 / 关闭相机时前端会传 false 关掉，
     /// 避免 grid_timer 多做无用功。
     enabled: bool,
+    /// 是否只画当前选中的 ROI（"只看当前"模式）。前端按钮控制。
+    /// 取代旧前端 SVG 的 focusCurrentRoi 行为，让相机/图片两种模式同样支持。
+    focus_only: bool,
 }
 
 #[derive(Default, Clone)]
@@ -1551,6 +1554,10 @@ fn draw_overlay_rois(frame: &mut Frame, overlay: &RoiOverlayState) {
 
     for (idx, opt_roi) in overlay.rois.iter().enumerate() {
         let Some(roi) = opt_roi else { continue };
+        // focus_only 时仅绘制当前选中那一个；与前端 "只看当前" 按钮联动
+        if overlay.focus_only && Some(idx) != overlay.current {
+            continue;
+        }
         let x0 = (roi.x * width as f32).round() as i32;
         let y0 = (roi.y * height as f32).round() as i32;
         let x1 = ((roi.x + roi.w) * width as f32).round() as i32;
@@ -2492,21 +2499,25 @@ fn set_camera_control(
 
 #[tauri::command]
 fn solve_current_frame(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     rois: Vec<RoiDto>,
 ) -> Result<SolveFaceletsResponse, String> {
     state.solver.get().ok_or("solver 尚未初始化完成")?;
     let capture = capture_from_state(&state).map_err(|err| err.to_string())?;
     let rois = rois.into_iter().map(Roi::from).collect::<Vec<_>>();
-    let recognizer = ColorClusterRecognizer;
-    let face = recognizer
-        .recognize(&capture.frame, &rois)
-        .map_err(|err| err.to_string())?;
-    solve_face(face, current_digit_map(&state), current_solver_timeout_ms(&state))
+    race_recognize_and_solve(
+        &app,
+        Arc::new(capture.frame),
+        rois,
+        current_digit_map(&state),
+        current_solver_timeout_ms(&state),
+    )
 }
 
 #[tauri::command]
 fn solve_latest_frame(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     rois: Vec<RoiDto>,
 ) -> Result<SolveFaceletsResponse, String> {
@@ -2516,15 +2527,18 @@ fn solve_latest_frame(
         .latest_grid_rgb()
         .map_err(|err| err.to_string())?;
     let rois = rois.into_iter().map(Roi::from).collect::<Vec<_>>();
-    let recognizer = ColorClusterRecognizer;
-    let face = recognizer
-        .recognize(&frame, &rois)
-        .map_err(|err| err.to_string())?;
-    solve_face(face, current_digit_map(&state), current_solver_timeout_ms(&state))
+    race_recognize_and_solve(
+        &app,
+        Arc::new(frame),
+        rois,
+        current_digit_map(&state),
+        current_solver_timeout_ms(&state),
+    )
 }
 
 #[tauri::command]
 fn solve_image_file(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     image_data_url: String,
     rois: Vec<RoiDto>,
@@ -2532,11 +2546,13 @@ fn solve_image_file(
     state.solver.get().ok_or("solver 尚未初始化完成")?;
     let frame = decode_image_data_url(&image_data_url).map_err(|err| err.to_string())?;
     let rois = rois.into_iter().map(Roi::from).collect::<Vec<_>>();
-    let recognizer = ColorClusterRecognizer;
-    let face = recognizer
-        .recognize(&frame, &rois)
-        .map_err(|err| err.to_string())?;
-    solve_face(face, current_digit_map(&state), current_solver_timeout_ms(&state))
+    race_recognize_and_solve(
+        &app,
+        Arc::new(frame),
+        rois,
+        current_digit_map(&state),
+        current_solver_timeout_ms(&state),
+    )
 }
 
 #[tauri::command]
@@ -2711,6 +2727,214 @@ fn current_solver_timeout_ms(state: &AppState) -> u64 {
         .unwrap_or(DEFAULT_SOLVER_TIMEOUT_MS)
 }
 
+// ===== 三种颜色聚类算法并行竞速 =====
+//
+// 取消"前端选择 color_classifier"的设计：每次解算自动并行启动 Rgb/Cpp/Lab
+// 三个分类器，谁先 (1) 产出合法 facelets 串 (2) Kociemba 解算非 Error，谁就赢。
+// 主线程拿到第一个 winner 立即返回；落后的两个线程结果由后台 collector 收集，
+// 全部完成后通过 `recognition-trace` 事件把三条耗时 / 状态 / facelets 发到前端
+// 调试日志，方便横向对比算法效果。
+//
+// 实现要点：
+// - 没有 task 取消能力（min2phase Search2L 内部 Mutex 不可中断），落后线程会
+//   跑完整条 recognize+solve；不过 solve 的 mutex 串行让 CPU 不会被三个 IDA*
+//   同时压满，整体 wall clock 仍 ≈ max(算法时间)。
+// - 用 `mpsc::channel` 多生产者 + 单消费者，主线程 recv 第一个 Ok 即返回；
+//   collector 是另一个单独线程，持有 rx 的 second wave（通过 broadcaster 把
+//   每条结果同时发给主 recv + collector recv）—— 实现上更简单的做法是只用
+//   一条 channel：主线程拿到 winner 后把 rx 转给 collector 线程继续 recv 剩余
+//   两条消息并 emit 事件，避免双 channel 复杂度。
+// - winner 在 `solve_face` 之后才确认（`translate_optimal` 内部 `Min2PhaseSolver`
+//   返回非 Error），避免选到"facelet 合法但魔方不可解"的状态。
+
+#[derive(Clone, Debug)]
+struct RecognitionTraceEntry {
+    algo: ColorClassifierKind,
+    success: bool,
+    elapsed_ms: u64,
+    facelets: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct RecognitionTracePayload {
+    algo: String,
+    success: bool,
+    elapsed_ms: u64,
+    facelets: Option<String>,
+    error: Option<String>,
+    /// 是否本轮赢家。前端拿来给日志加个标记。
+    winner: bool,
+}
+
+fn classifier_label(kind: ColorClassifierKind) -> &'static str {
+    match kind {
+        ColorClassifierKind::Rgb => "rgb",
+        ColorClassifierKind::Cpp => "cpp",
+        ColorClassifierKind::Lab => "lab",
+    }
+}
+
+/// 并行竞速：三种分类器跑 recognize → solve_face，谁先成功谁返回。
+///
+/// 返回 winner 的 `SolveFaceletsResponse`；若三个都失败，返回组合的错误信息
+/// （三条 algo + error 拼起来），方便前端定位是哪一步崩了。
+///
+/// `frame` 用 `Arc<Frame>` 共享，避免在三个线程间深拷贝 ~3.5MB RGB buffer。
+/// `rois` 也只在 spawn 前 clone 三份（54×16B 可忽略）。
+fn race_recognize_and_solve(
+    app: &tauri::AppHandle,
+    frame: Arc<Frame>,
+    rois: Vec<Roi>,
+    digit_map: DigitMap,
+    timeout_ms: u64,
+) -> Result<SolveFaceletsResponse, String> {
+    let kinds = [
+        ColorClassifierKind::Rgb,
+        ColorClassifierKind::Cpp,
+        ColorClassifierKind::Lab,
+    ];
+    let started = Instant::now();
+    let (tx, rx) = mpsc::channel::<(ColorClassifierKind, RecognitionTraceEntry, Option<CubeFace>)>();
+
+    for kind in kinds {
+        let frame = Arc::clone(&frame);
+        let rois = rois.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let local_started = Instant::now();
+            let recognizer = ColorClusterRecognizer { kind };
+            let result = recognizer.recognize(&frame, &rois);
+            let elapsed_ms = local_started.elapsed().as_millis() as u64;
+            let (entry, face) = match result {
+                Ok(face) => {
+                    let facelets = face.as_str().to_string();
+                    (
+                        RecognitionTraceEntry {
+                            algo: kind,
+                            success: true,
+                            elapsed_ms,
+                            facelets: Some(facelets),
+                            error: None,
+                        },
+                        Some(face),
+                    )
+                }
+                Err(err) => (
+                    RecognitionTraceEntry {
+                        algo: kind,
+                        success: false,
+                        elapsed_ms,
+                        facelets: None,
+                        error: Some(err.to_string()),
+                    },
+                    None,
+                ),
+            };
+            let _ = tx.send((kind, entry, face));
+        });
+    }
+    drop(tx);
+
+    // 主循环：依次 recv 直到拿到第一个 (success && solve OK)。
+    // Solve 失败的也算未通过验证，继续等下一个候选。
+    // 收集已到达但失败的 entry 给 collector 用。
+    let mut collected: Vec<RecognitionTraceEntry> = Vec::with_capacity(3);
+    let mut winner: Option<(RecognitionTraceEntry, SolveFaceletsResponse)> = None;
+
+    for _ in 0..3 {
+        let (_kind, entry, face) = match rx.recv() {
+            Ok(msg) => msg,
+            Err(_) => break,
+        };
+        if !entry.success {
+            collected.push(entry);
+            continue;
+        }
+        let face = match face {
+            Some(f) => f,
+            None => {
+                // 不应该发生：success=true 时 face 一定 Some
+                collected.push(entry);
+                continue;
+            }
+        };
+        match solve_face(face, digit_map.clone(), timeout_ms) {
+            Ok(response) => {
+                winner = Some((entry, response));
+                break;
+            }
+            Err(err) => {
+                let mut failed_entry = entry;
+                failed_entry.success = false;
+                failed_entry.error = Some(format!("solve failed: {err}"));
+                collected.push(failed_entry);
+            }
+        }
+    }
+
+    // 启动 collector 线程把剩余消息收完 → emit recognition-trace。
+    // 拿到 winner 立即派发；没拿到 winner 则等三条都收到再派发并返回错。
+    let app_clone = app.clone();
+    let winner_kind = winner.as_ref().map(|(e, _)| e.algo);
+    let already_collected = collected.clone();
+    let already_winner = winner.as_ref().map(|(e, _)| e.clone());
+    thread::spawn(move || {
+        let mut traces = already_collected;
+        if let Some(w) = already_winner {
+            traces.push(w);
+        }
+        // 把 rx 里剩余的（最多 3 - traces.len() 条）拉完。
+        while traces.len() < 3 {
+            match rx.recv() {
+                Ok((_, entry, _)) => traces.push(entry),
+                Err(_) => break,
+            }
+        }
+        // 按算法名排序，前端日志稳定（rgb / cpp / lab 顺序）。
+        traces.sort_by_key(|e| match e.algo {
+            ColorClassifierKind::Rgb => 0,
+            ColorClassifierKind::Cpp => 1,
+            ColorClassifierKind::Lab => 2,
+        });
+        let payloads: Vec<RecognitionTracePayload> = traces
+            .into_iter()
+            .map(|e| RecognitionTracePayload {
+                algo: classifier_label(e.algo).to_string(),
+                success: e.success,
+                elapsed_ms: e.elapsed_ms,
+                facelets: e.facelets,
+                error: e.error,
+                winner: winner_kind == Some(e.algo),
+            })
+            .collect();
+        let _ = app_clone.emit("recognition-trace", &payloads);
+        log::info!(
+            "race_recognize total wall={}ms, winner={:?}",
+            started.elapsed().as_millis(),
+            winner_kind.map(classifier_label),
+        );
+    });
+
+    match winner {
+        Some((_, response)) => Ok(response),
+        None => {
+            let summary = collected
+                .iter()
+                .map(|e| {
+                    format!(
+                        "[{}] {}",
+                        classifier_label(e.algo),
+                        e.error.as_deref().unwrap_or("unknown error"),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            Err(format!("三种颜色识别算法均失败: {summary}"))
+        }
+    }
+}
+
 // ===== 应用配置：持久化 + Tauri 命令 =====
 
 const APP_CONFIG_FILENAME: &str = "app-config.json";
@@ -2719,14 +2943,10 @@ const APP_CONFIG_FILENAME: &str = "app-config.json";
 const DEFAULT_SOLVER_TIMEOUT_MS: u64 = 100;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 struct AppConfig {
     /// solver 单次求解的超时时间（毫秒）
-    #[serde(default = "default_solver_timeout_ms_value")]
     solver_timeout_ms: u64,
-}
-
-fn default_solver_timeout_ms_value() -> u64 {
-    DEFAULT_SOLVER_TIMEOUT_MS
 }
 
 impl Default for AppConfig {
@@ -2798,6 +3018,49 @@ struct OverlayRoisDto {
     current: Option<usize>,
     /// 是否启用 overlay；文件模式 / 关闭相机时前端传 false。
     enabled: bool,
+    /// 是否只画当前选中那一个 ROI；前端 "只看当前" 按钮触发。缺省 false。
+    #[serde(default)]
+    focus_only: bool,
+}
+
+/// 把"读取图片"模式下的图片与 ROI 框合成成单张带框 JPEG（base64 data URL）。
+/// 前端图片加载 / ROI 变更后调用一次，把返回值当 `<img>` 的 src，让"图片模式"和
+/// "相机模式"使用同一条后端绘制路径，避免前端 54 个 SVG 矩形 + 文字重排的开销。
+///
+/// payload 与 `set_overlay_rois` 的 `OverlayRoisDto` 复用同一类型；这里 enabled
+/// 字段无意义（一定要画框，否则前端就不需要调用此命令），统一忽略。
+#[tauri::command]
+fn compose_image_overlay(
+    image_data_url: String,
+    payload: OverlayRoisDto,
+) -> Result<String, String> {
+    // 1) decode 到 1280x960（decode_image_data_url 已强制 resize）
+    let mut frame = decode_image_data_url(&image_data_url).map_err(|err| err.to_string())?;
+    // 2) 构建临时 overlay state（不写入 AppState）
+    let mut rois: Vec<Option<NormRoi>> = vec![None; 54];
+    for item in payload.rois {
+        if item.index < 54 {
+            rois[item.index] = Some(NormRoi {
+                x: item.x.clamp(0.0, 1.0),
+                y: item.y.clamp(0.0, 1.0),
+                w: item.w.clamp(0.0, 1.0),
+                h: item.h.clamp(0.0, 1.0),
+                label: item.label,
+            });
+        }
+    }
+    let overlay = RoiOverlayState {
+        rois,
+        current: payload.current.filter(|i| *i < 54),
+        enabled: true,
+        focus_only: payload.focus_only,
+    };
+    // 3) 画框
+    draw_overlay_rois(&mut frame, &overlay);
+    // 4) encode 回 JPEG → base64 data URL
+    let jpeg = encode_frame_jpeg(&frame).map_err(|err| err.to_string())?;
+    let b64 = STANDARD.encode(&jpeg);
+    Ok(format!("data:image/jpeg;base64,{}", b64))
 }
 
 /// 由前端在 ROI 状态变更时（标注 / 翻页 / 删除 / 重置 / 启用关闭）调用，
@@ -2827,6 +3090,7 @@ fn set_overlay_rois(
         rois,
         current: payload.current.filter(|i| *i < 54),
         enabled: payload.enabled,
+        focus_only: payload.focus_only,
     };
     Ok(())
 }
@@ -2940,23 +3204,86 @@ fn validate_digit_map(digits: &[String]) -> Result<DigitMap, String> {
     Ok(out)
 }
 
-fn load_move_mapping_from_disk(app: &tauri::AppHandle) -> Option<DigitMap> {
-    let path = move_mapping_path(app).ok()?;
+/// 启动期 `move_mapping.json` 加载结果分类。
+///
+/// 历史实现把所有失败 silent `.ok()?`（IO/JSON），用户从未感知到下位机
+/// 默认编码与磁盘期望编码不一致。新版本明确区分四种 outcome，setup 中
+/// 对 IoError/ParseError/ValidationError 三类 emit `startup-warning`。
+enum MoveMappingLoadOutcome {
+    NotFound,
+    Loaded(DigitMap),
+    IoError(String),
+    ParseError(String),
+    ValidationError(String),
+}
+
+fn load_move_mapping_outcome(app: &tauri::AppHandle) -> MoveMappingLoadOutcome {
+    let path = match move_mapping_path(app) {
+        Ok(path) => path,
+        Err(e) => return MoveMappingLoadOutcome::IoError(format!("无法定位文件路径：{e}")),
+    };
     if !path.is_file() {
-        return None;
+        return MoveMappingLoadOutcome::NotFound;
     }
-    let content = std::fs::read_to_string(&path).ok()?;
-    let dto: MoveMappingDto = serde_json::from_str(&content).ok()?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) => return MoveMappingLoadOutcome::IoError(format!("{}: {e}", path.display())),
+    };
+    let dto: MoveMappingDto = match serde_json::from_str(&content) {
+        Ok(dto) => dto,
+        Err(e) => return MoveMappingLoadOutcome::ParseError(format!("{}: {e}", path.display())),
+    };
     match validate_digit_map(&dto.digits) {
         Ok(m) => {
             log::info!("已加载动作映射: {}", path.display());
-            Some(m)
+            MoveMappingLoadOutcome::Loaded(m)
         }
-        Err(e) => {
-            log::warn!("动作映射文件校验失败 ({})，使用默认映射", e);
-            None
-        }
+        Err(e) => MoveMappingLoadOutcome::ValidationError(format!("{}: {e}", path.display())),
     }
+}
+
+/// 兼容包装，仅在不需要区分失败类型的调用点使用（目前 setup 已直接用 outcome）。
+#[allow(dead_code)]
+fn load_move_mapping_from_disk(app: &tauri::AppHandle) -> Option<DigitMap> {
+    if let MoveMappingLoadOutcome::Loaded(m) = load_move_mapping_outcome(app) {
+        Some(m)
+    } else {
+        None
+    }
+}
+
+/// 启动期警告事件载荷。前端在 `App.tsx` 通过 `listen("startup-warning")` 接收，
+/// 写入日志面板并显示顶部 banner。结构稳定，便于其它启动期失败（cube.json /
+/// camera 探测等）将来接入同一通道。
+#[derive(Clone, Serialize)]
+struct StartupWarning {
+    /// 失败来源："move_mapping" / "cube_json" / "camera" / ...
+    source: String,
+    /// 严重等级："warn" | "error"
+    level: String,
+    /// 用户可读消息（中文，已含失败子类）
+    message: String,
+}
+
+/// 把 move_mapping outcome 中需要警告的三类（Io/Parse/Validation）通过 emit 推到前端，
+/// 同时 `[backend-diagnostic]` 前缀 log warn 供终端排查。NotFound 视为首次启动正常。
+fn handle_move_mapping_outcome(app: &tauri::AppHandle, outcome: &MoveMappingLoadOutcome) {
+    let (kind, detail) = match outcome {
+        MoveMappingLoadOutcome::Loaded(_) | MoveMappingLoadOutcome::NotFound => return,
+        MoveMappingLoadOutcome::IoError(detail) => ("读取失败", detail.as_str()),
+        MoveMappingLoadOutcome::ParseError(detail) => ("JSON 解析失败", detail.as_str()),
+        MoveMappingLoadOutcome::ValidationError(detail) => ("内容校验失败", detail.as_str()),
+    };
+    let message = format!("动作映射 {kind}（{detail}），已回退默认编码");
+    log::warn!("[backend-diagnostic] move_mapping {}: {}; 已回退默认编码", kind, detail);
+    let _ = app.emit(
+        "startup-warning",
+        StartupWarning {
+            source: "move_mapping".to_string(),
+            level: "warn".to_string(),
+            message,
+        },
+    );
 }
 
 #[tauri::command]
@@ -3513,13 +3840,17 @@ pub fn run() {
             };
             let handle = app.handle().clone();
 
-            // 启动时尝试从 app_install_dir 读取保存的动作映射
-            if let Some(loaded) = load_move_mapping_from_disk(&handle) {
+            // 启动时尝试从 app_install_dir 读取保存的动作映射；
+            // 区分 NotFound / Loaded / IoError / ParseError / ValidationError 五种结局，
+            // 前三种通过 startup-warning 事件推到前端，让用户在 banner / 日志面板看见。
+            let mapping_outcome = load_move_mapping_outcome(&handle);
+            if let MoveMappingLoadOutcome::Loaded(ref loaded) = mapping_outcome {
                 let state: tauri::State<'_, AppState> = app.state();
                 if let Ok(mut guard) = state.digit_map.lock() {
-                    *guard = loaded;
+                    *guard = loaded.clone();
                 };
             }
+            handle_move_mapping_outcome(&handle, &mapping_outcome);
 
             // 启动时尝试从 app_install_dir 读取应用配置（solver_timeout_ms 等）
             if let Some(loaded) = load_app_config_from_disk() {
@@ -3588,7 +3919,8 @@ pub fn run() {
             reset_move_mapping,
             get_app_config,
             set_app_config,
-            set_overlay_rois
+            set_overlay_rois,
+            compose_image_overlay
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

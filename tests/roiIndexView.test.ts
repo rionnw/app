@@ -112,6 +112,25 @@ describe("ROI index view mapping", () => {
     expect(regions[33]).toMatchObject({ id: "F9", rect: { x: 0.33, y: 0.33, w: 0.01, h: 0.02 } });
   });
 
+  test("falls back to ROI_REFERENCE_SIZE=1280x960 when naturalSize is omitted on pixel rois", () => {
+    // 模拟挂载期 load_default_roi：像素坐标 + 不传 naturalSize（=undefined）。
+    // 历史 bug：此时所有 rect 被丢成 null。修复后回退到 1280×960 反归一化。
+    const rois = [
+      { x: 640, y: 480, width: 64, height: 48 },
+      { x: 0, y: 0, width: 1280, height: 960 },
+    ];
+
+    const regions = normalizeLoadedRoiRegions({
+      rois: [
+        ...rois,
+        ...Array.from({ length: 52 }, () => ({ x: 0, y: 0, width: 10, height: 10 })),
+      ],
+    });
+
+    expect(regions[0].rect).toEqual({ x: 0.5, y: 0.5, w: 0.05, h: 0.05 });
+    expect(regions[1].rect).toEqual({ x: 0, y: 0, w: 1, h: 1 });
+  });
+
   test("exports RobotApp pixel rectangles in original ROI array order", () => {
     const regions = createDefaultRoiRegions().map((region) => ({
       ...region,

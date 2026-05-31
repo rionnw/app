@@ -1,4 +1,4 @@
-import type { NaturalSize, RoiRect } from "./roiAnnotation";
+import { ROI_REFERENCE_SIZE, type NaturalSize, type RoiRect } from "./roiAnnotation";
 
 export type RoiFace = "U" | "R" | "F" | "D" | "L" | "B";
 
@@ -110,13 +110,19 @@ const normalizeRect = (value: unknown, naturalSize?: NaturalSize): RoiRect | nul
 
   if (x === null || y === null || w === null || h === null) return null;
   if (x <= 1 && y <= 1 && w <= 1 && h <= 1) return { x, y, w, h };
-  if (!naturalSize?.width || !naturalSize.height) return null;
+
+  // 像素坐标分支：调用方未指定 naturalSize（启动期默认 ROI 加载时
+  // <img>/相机均尚未 ready）时，回退到 ROI_REFERENCE_SIZE=1280×960。
+  // 这与相机 grid 尺寸、文件模式后端 resize 目标尺寸保持一致，避免
+  // 启动加载像素 ROI 因 naturalSize=0 被丢成 null 的回归 bug。
+  const reference =
+    naturalSize?.width && naturalSize.height ? naturalSize : ROI_REFERENCE_SIZE;
 
   return {
-    x: x / naturalSize.width,
-    y: y / naturalSize.height,
-    w: w / naturalSize.width,
-    h: h / naturalSize.height,
+    x: x / reference.width,
+    y: y / reference.height,
+    w: w / reference.width,
+    h: h / reference.height,
   };
 };
 
@@ -152,7 +158,10 @@ export const normalizeLoadedRoiRegions = (input: unknown, naturalSize?: NaturalS
   return regions;
 };
 
-export const createRobotAppRoiExport = (regions: RoiRegion[], naturalSize: NaturalSize): RobotAppRoiExport => ({
+export const createRobotAppRoiExport = (
+  regions: RoiRegion[],
+  naturalSize: NaturalSize = ROI_REFERENCE_SIZE,
+): RobotAppRoiExport => ({
   rois: [...regions].sort((left, right) => left.index - right.index).map((region) => ({
     x: Math.round((region.rect?.x || 0) * naturalSize.width),
     y: Math.round((region.rect?.y || 0) * naturalSize.height),

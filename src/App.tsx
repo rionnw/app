@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save as dialogSave } from "@tauri-apps/plugin-dialog";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { resolveCanvasPreviewFps, shouldRequestCanvasFrame } from "./canvasPreview";
 import {
@@ -26,7 +26,7 @@ import {
   type ViewPreset,
 } from "./panelView";
 import { getLoadedImageSize, updateImageSize } from "./imageLayout";
-import { createFixedPixelRoi } from "./roiAnnotation";
+import { createFixedPixelRoi, ROI_REFERENCE_SIZE } from "./roiAnnotation";
 import {
   createDefaultRoiRegions,
   createRobotAppRoiExport,
@@ -73,6 +73,21 @@ type CameraStreamEvent = {
   statuses: CameraStatus[];
 };
 type SerialPort = { name: string; port_type: string };
+type AppConfig = {
+  solver_timeout_ms: number;
+};
+
+/// 后端三种颜色聚类算法并行竞速结束后 emit 的单条 trace。
+/// 数组顺序固定为 rgb / cpp / lab，每条带耗时与状态。
+type RecognitionTraceItem = {
+  algo: "rgb" | "cpp" | "lab";
+  success: boolean;
+  elapsed_ms: number;
+  facelets: string | null;
+  error: string | null;
+  winner: boolean;
+};
+
 type SerialReadResponse = {
   text: string;
   motion_finished: boolean;
@@ -113,18 +128,6 @@ const cameraGapDiagnosticThrottleMs = 5_000;
 const canvasFrameDiagnosticThrottleMs = 3_000;
 /// 滑块拖动写硬件的 debounce 窗口；80ms 在视觉跟手和减少 IPC 之间折中。
 const controlWriteDebounceMs = 80;
-const roiLabelOffset = 0.006;
-const roiLabelInset = 0.012;
-
-const clampUnit = (value: number) => Math.min(1 - roiLabelInset, Math.max(roiLabelInset, value));
-
-const getRoiLabelPosition = (rect: RoiRegion["rect"]) => {
-  if (!rect) return { x: roiLabelInset, y: roiLabelInset };
-  return {
-    x: clampUnit(rect.x + rect.w / 2),
-    y: clampUnit(rect.y + rect.h + roiLabelOffset),
-  };
-};
 
 const defaultCameraConfigs = (): CameraConfig[] =>
   Array.from({ length: 4 }, (_, index) => ({ index, width: 640, height: 480, fps: 30, frameFormat: "MJPEG" }));
@@ -201,68 +204,11 @@ const nowTime = () =>
 /// 复用挂在旧 session 上的 TCP，画面像被卡住一样延迟）。
 const withCacheBust = (url: string) => `${url}${url.includes("?") ? "&" : "?"}t=${Date.now()}`;
 
-/// ROI overlay 单独 memo 化：54 个 region 全部 render 比较重，又频繁随
-/// `frameStats` 等无关状态变化跟着 App 重渲染。Memo 后只有 regions /
-/// currentRegionId / focus / imageBox 真变化时才会重画。
-type RoiOverlayProps = {
-  regions: RoiRegion[];
-  currentRegionId: string;
-  focusCurrentRoi: boolean;
-  imageBox: ImageBox;
-  onSelectRegion: (id: string) => void;
-};
-
-const RoiOverlay = memo(function RoiOverlay({
-  regions,
-  currentRegionId,
-  focusCurrentRoi,
-  imageBox,
-  onSelectRegion,
-}: RoiOverlayProps) {
-  const visible = focusCurrentRoi
-    ? regions.filter((region) => region.id === currentRegionId)
-    : regions;
-
-  return (
-    <svg
-      className="roi-layer"
-      style={{
-        left: imageBox.left,
-        top: imageBox.top,
-        width: imageBox.width,
-        height: imageBox.height,
-      }}
-      viewBox="0 0 1 1"
-      preserveAspectRatio="none"
-    >
-      {visible.map((region) => {
-        if (!region.rect) return null;
-        const labelPosition = getRoiLabelPosition(region.rect);
-        return (
-          <g key={region.id} onClick={() => onSelectRegion(region.id)}>
-            <rect
-              className={region.id === currentRegionId ? "roi-rect is-active" : "roi-rect"}
-              x={region.rect.x}
-              y={region.rect.y}
-              width={region.rect.w}
-              height={region.rect.h}
-              vectorEffect="non-scaling-stroke"
-            />
-            <text
-              className="roi-label"
-              x={labelPosition.x}
-              y={labelPosition.y}
-              textAnchor="middle"
-              dominantBaseline="hanging"
-            >
-              {region.id}
-            </text>
-          </g>
-        );
-      })}
-    </svg>
-  );
-});
+/// 历史的前端 SVG <RoiOverlay> 组件已移除。ROI 框统一由后端绘制：
+/// - 相机模式：grid_timer 在 grid JPEG 上画矩形（draw_overlay_rois）
+/// - 图片模式：上层 effect 调 compose_image_overlay 合成带框 JPEG
+/// 这样两种模式的几何对齐 / 标签字体 / 选中色完全一致，避免 SVG 与
+/// 后端绘制各自一套规则带来的视觉漂移。
 
 function App() {
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -271,6 +217,14 @@ function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageLoadTimingRef = useRef<{ src: string; startedAtMs: number } | null>(null);
   const lastImageSrcRef = useRef<string | null>(null);
+  /// 文件模式下的"原图 data URL"（未叠加 ROI 框），跟 `imageSrc` 区分：
+  /// - `imageSrc` 是 `<img>` 实际展示的内容，可能是合成后带 ROI 框的图；
+  /// - `fileOriginalSrcRef` 保留 reader.readAsDataURL 出来的原始图，
+  ///   `solve_image_file` 必须用原图（带框图色彩会被绿色 / 蓝色描边污染）。
+  const fileOriginalSrcRef = useRef<string | null>(null);
+  /// 防止 ROI 标注期间高频触发 compose IPC（每点击一次 setRegions 都会跑后端
+  /// 1280×960 jpeg 编解码，~10ms 起步），用 timer debounce 200ms。
+  const composeOverlayTimerRef = useRef<number | null>(null);
   const lastLoggedImageBoxRef = useRef<{ box: ImageBox | null; loggedAtMs: number | null }>({
     box: null,
     loggedAtMs: null,
@@ -307,6 +261,9 @@ function App() {
   const [focusCurrentRoi, setFocusCurrentRoi] = useState(false);
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
   const [mappingEditorOpen, setMappingEditorOpen] = useState(false);
+  const [startupWarnings, setStartupWarnings] = useState<
+    Array<{ id: number; source: string; level: "warn" | "error"; message: string }>
+  >([]);
   const [panelVisibility, setPanelVisibility] = useState<PanelVisibility>(() => {
     try {
       return createSavedPanelVisibility(JSON.parse(localStorage.getItem(panelVisibilityStorageKey) || "null"));
@@ -469,14 +426,54 @@ function App() {
     };
     checkReady();
     const pollReady = setInterval(checkReady, 500);
+    // 监听后端启动期警告（move_mapping 加载失败等），写入日志面板
+    // 并以 banner 形式显示在顶部，关闭后本会话不再重显。
+    const unlistenStartupWarning = listen<{
+      source: string;
+      level: "warn" | "error";
+      message: string;
+    }>("startup-warning", (event) => {
+      const payload = event.payload;
+      if (!payload?.message) return;
+      const level: "warn" | "error" = payload.level === "error" ? "error" : "warn";
+      addLog(payload.message, level);
+      setStartupWarnings((prev) => [
+        ...prev,
+        { id: Date.now() + Math.random(), source: payload.source, level, message: payload.message },
+      ]);
+    });
+    // 监听三种颜色识别算法并行竞速的结果 trace（每次解算结束后 emit 一次，
+    // 数组长度恒为 3）。日志面板按 [rgb] 38ms ✓ facelets=...UF... 形式输出，
+    // 失败的那条带上 error 信息，赢家附 ★ 标记。
+    const unlistenRecognitionTrace = listen<RecognitionTraceItem[]>(
+      "recognition-trace",
+      (event) => {
+        const items = event.payload;
+        if (!Array.isArray(items)) return;
+        for (const item of items) {
+          const mark = item.winner ? "★" : item.success ? "✓" : "✗";
+          const tail = item.success
+            ? `facelets=${item.facelets ?? "?"}`
+            : `error=${item.error ?? "unknown"}`;
+          addLog(
+            `[${item.algo}] ${item.elapsed_ms}ms ${mark} ${tail}`,
+            item.success ? "info" : "warn",
+          );
+        }
+      },
+    );
     // 尝试加载默认 ROI 文件
+    // 注意：这里走 ROI_REFERENCE_SIZE=1280×960，而非依赖 naturalSize。
+    // 挂载期相机/图片都未 ready，naturalSize={0,0} 会让像素坐标分支
+    // 全部退化成 null（=overlay 不显示，历史 bug）。统一基准后启动即正常。
     invoke<string | null>("load_default_roi").then((content) => {
       if (content) {
         try {
-          const data = normalizeLoadedRoiRegions(JSON.parse(content), naturalSize);
+          const data = normalizeLoadedRoiRegions(JSON.parse(content), ROI_REFERENCE_SIZE);
           setRegions(data);
           setCurrentRegionId(data.find((region) => !region.rect)?.id ?? data[0].id);
-          addLog("已自动加载默认 ROI: robot-roi.json");
+          const validCount = data.filter((region) => region.rect).length;
+          addLog(`已自动加载默认 ROI: robot-roi.json，${validCount}/54 个 ROI 有效`);
         } catch (e) {
           addLog(`默认 ROI 解析失败: ${String(e)}`, "warn");
         }
@@ -484,6 +481,8 @@ function App() {
     }).catch(() => {});
     return () => {
       unlisten.then((f) => f());
+      unlistenStartupWarning.then((f) => f());
+      unlistenRecognitionTrace.then((f) => f());
       clearInterval(pollReady);
     };
   }, []);
@@ -513,12 +512,74 @@ function App() {
           ? regions.findIndex((region) => region.id === currentRegionId)
           : null,
         enabled,
+        focus_only: focusCurrentRoi,
       },
     };
     void invoke("set_overlay_rois", payload).catch(() => {
       // 静默——后端没就绪 / 命令未注册时不影响 UI 行为
     });
-  }, [regions, currentRegionId, imageSource, showRoi]);
+  }, [regions, currentRegionId, imageSource, showRoi, focusCurrentRoi]);
+
+  /// 文件模式下：把"原图 + ROI 框"合成的带框图覆盖到 `<img>` 的 src，
+  /// 保证图片模式与相机模式都走"后端绘制"统一渲染路径，前端不再用 SVG 画框。
+  /// 200ms debounce 避免连续标注时频繁触发 1280×960 jpeg 编解码。
+  useEffect(() => {
+    if (imageSource !== "file") {
+      // 切回相机或卸载图片：清掉 timer，原图 ref 也释放（避免 stale）
+      if (composeOverlayTimerRef.current !== null) {
+        window.clearTimeout(composeOverlayTimerRef.current);
+        composeOverlayTimerRef.current = null;
+      }
+      return;
+    }
+    const original = fileOriginalSrcRef.current;
+    if (!original) return;
+    if (composeOverlayTimerRef.current !== null) {
+      window.clearTimeout(composeOverlayTimerRef.current);
+    }
+    composeOverlayTimerRef.current = window.setTimeout(() => {
+      composeOverlayTimerRef.current = null;
+      if (!showRoi) {
+        // 关闭 ROI 显示时，还原成原图（带框 → 不带框无需后端调用）
+        setImageSrc(original);
+        return;
+      }
+      const overlayPayload = {
+        rois: regions
+          .filter((region) => region.rect)
+          .map((region) => ({
+            index: region.index,
+            x: region.rect!.x,
+            y: region.rect!.y,
+            w: region.rect!.w,
+            h: region.rect!.h,
+            label: region.label,
+          })),
+        current: regions.findIndex((region) => region.id === currentRegionId),
+        enabled: true,
+        focus_only: focusCurrentRoi,
+      };
+      invoke<string>("compose_image_overlay", {
+        imageDataUrl: original,
+        payload: overlayPayload,
+      })
+        .then((composed) => {
+          // 切回相机后再到达的过期回调要丢弃（避免覆盖 MJPEG URL）
+          if (fileOriginalSrcRef.current === original) {
+            setImageSrc(composed);
+          }
+        })
+        .catch((err) => {
+          addLog(`图片 ROI 合成失败：${String(err)}`, "warn");
+        });
+    }, 200);
+    return () => {
+      if (composeOverlayTimerRef.current !== null) {
+        window.clearTimeout(composeOverlayTimerRef.current);
+        composeOverlayTimerRef.current = null;
+      }
+    };
+  }, [regions, currentRegionId, imageSource, showRoi, focusCurrentRoi]);
 
   useEffect(() => {
     if (!timerRunning) return;
@@ -980,7 +1041,9 @@ function App() {
     if (!annotationMode || !imageSrc || !naturalSize.width || !naturalSize.height) return;
     const point = normalizedPointFromEvent(event);
     if (!point) return;
-    const rect = createFixedPixelRoi(point, naturalSize);
+    // 归一化基准统一用 ROI_REFERENCE_SIZE=1280×960，与相机模式一致；
+    // naturalSize 仅在前面 guard（非零）和 imageBox 视觉布局中起作用。
+    const rect = createFixedPixelRoi(point, ROI_REFERENCE_SIZE);
     setRegions((items) =>
       items.map((region) => (region.id === currentRegionId ? { ...region, rect } : region)),
     );
@@ -1023,10 +1086,14 @@ function App() {
     }
 
     setStatus("识别解算中");
+    // 文件模式：用"原图 data URL"喂给后端，而不是 imageSrc——后者是
+    // compose_image_overlay 合成出的带框图，颜色已被绿/蓝描边污染，
+    // 直接拿去识别会把矩形线像素混入 ROI 采样。
+    const solveSrc = imageSource === "file" ? fileOriginalSrcRef.current : imageSrc;
     const request = createSolveFrameRequest({
       cameraOpen,
       imageSource,
-      imageSrc,
+      imageSrc: solveSrc,
       rois: getFrameRois(),
     });
     const result = await invoke<SolveResponse>(request.command, request.args);
@@ -1188,8 +1255,12 @@ function App() {
   const loadImageFile = async (file: File) => {
     const reader = new FileReader();
     reader.onload = () => {
+      const originalDataUrl = String(reader.result);
+      fileOriginalSrcRef.current = originalDataUrl;
       setImageSource("file");
-      setImageSrc(String(reader.result));
+      // 先把原图挂上 <img>；下方 effect 会按 ROI 触发后端合成覆盖 imageSrc。
+      // 这样首屏不依赖后端 IPC 即可显示，避免空白闪烁。
+      setImageSrc(originalDataUrl);
       setImageName(file.name);
       setFrameStats("file loaded");
       setStatus(cameraOpen ? "已读取图片（相机后台运行中）" : "已读取图片");
@@ -1236,7 +1307,7 @@ function App() {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const data = normalizeLoadedRoiRegions(JSON.parse(String(reader.result)), naturalSize);
+        const data = normalizeLoadedRoiRegions(JSON.parse(String(reader.result)), ROI_REFERENCE_SIZE);
         setRegions(data);
         setCurrentRegionId(data.find((region) => !region.rect)?.id ?? data[0].id);
         addLog(`已读取 ROI：${file.name}`);
@@ -1261,14 +1332,13 @@ function App() {
   };
 
   const getSavedRoiText = () => {
-    const hasNaturalSize = naturalSize.width > 0 && naturalSize.height > 0;
-    const payload = hasNaturalSize
-      ? createRobotAppRoiExport(regions, naturalSize)
-      : [...regions].sort((left, right) => left.index - right.index);
+    // ROI 归一化基准统一为 ROI_REFERENCE_SIZE=1280×960，与相机帧尺寸对齐；
+    // 始终导出 RobotApp 像素格式，与 RobotApp/robot-roi.json 兼容。
+    const payload = createRobotAppRoiExport(regions, ROI_REFERENCE_SIZE);
 
     return {
       text: JSON.stringify(payload, null, 2),
-      format: hasNaturalSize ? "RobotApp 像素格式" : "内部归一化格式",
+      format: "RobotApp 像素格式",
     };
   };
 
@@ -1341,6 +1411,60 @@ function App() {
         }}
       />
       <input ref={roiInputRef} type="file" accept="application/json,.json" hidden onChange={handleRoiInput} />
+
+      {startupWarnings.length > 0 && (
+        <div className="startup-warnings" role="status" aria-live="polite">
+          {startupWarnings.map((warning) => {
+            const accent = warning.level === "error" ? "var(--danger)" : "var(--warn)";
+            return (
+              <div
+                key={warning.id}
+                className={`startup-warning-banner ${warning.level}`}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 12,
+                  padding: "8px 12px",
+                  margin: "8px 12px 0",
+                  border: `1px solid ${accent}`,
+                  borderLeft: `4px solid ${accent}`,
+                  borderRadius: 6,
+                  background: warning.level === "error" ? "#fef2f2" : "#fffbeb",
+                  color: accent,
+                  fontWeight: 600,
+                  fontSize: 13,
+                }}
+              >
+                <span style={{ flex: 1, lineHeight: 1.45, color: "var(--text)" }}>
+                  <strong style={{ color: accent, marginRight: 8 }}>
+                    [{warning.source}]
+                  </strong>
+                  {warning.message}
+                </span>
+                <button
+                  type="button"
+                  aria-label="关闭"
+                  title="关闭提示（本会话不再显示）"
+                  onClick={() =>
+                    setStartupWarnings((prev) => prev.filter((item) => item.id !== warning.id))
+                  }
+                  style={{
+                    minHeight: 24,
+                    padding: "0 8px",
+                    border: `1px solid ${accent}`,
+                    color: accent,
+                    background: "transparent",
+                    fontWeight: 700,
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       <header className="top-bar">
         <div>
@@ -1487,20 +1611,12 @@ function App() {
                   />
                 )}
                 {/*
-                  相机模式下 ROI 由后端 grid_timer 直接画在 grid JPEG 上
-                  （见后端 draw_overlay_rois），不再走前端 SVG，避免 30Hz 画面
-                  刷新与 SVG 重排争抢 webview 主线程。
-                  文件模式的快照画面是静态的，前端 SVG 没有性能问题，仍走原路径。
+                  ROI 框统一由后端绘制：
+                  - 相机模式：grid_timer 在每帧 grid JPEG 上画矩形（draw_overlay_rois）
+                  - 图片模式：上方 effect 调 compose_image_overlay 合成带框图
+                  前端 SVG <RoiOverlay> 已移除，避免两条渲染路径的几何对齐分歧
+                  以及 webview 主线程重排开销。
                 */}
-                {showRoi && imageSource !== "camera" && (
-                  <RoiOverlay
-                    regions={regions}
-                    currentRegionId={currentRegionId}
-                    focusCurrentRoi={focusCurrentRoi}
-                    imageBox={imageBox}
-                    onSelectRegion={setCurrentRegionId}
-                  />
-                )}
               </>
             ) : (
               <div className="empty-image">

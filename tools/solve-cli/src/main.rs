@@ -110,7 +110,9 @@ fn recognize_from_file(image_path: &str, roi_path: &str) -> Result<CubeFace> {
         })
         .collect();
 
-    let recognizer = ColorClusterRecognizer;
+    // CLI 用默认 RGB KMeans 跑单次识别；GUI 端走的是 race_recognize_and_solve
+    // 三种算法竞速，CLI 主要用于离线 benchmark，简单起见保持单算法。
+    let recognizer = ColorClusterRecognizer::default();
     recognizer.recognize(&frame, &rois).context("识别失败")
 }
 

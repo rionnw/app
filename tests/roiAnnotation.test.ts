@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { createFixedPixelRoi } from "../src/roiAnnotation";
+import { createFixedPixelRoi, ROI_REFERENCE_SIZE } from "../src/roiAnnotation";
 
 const appSource = await Bun.file(new URL("../src/App.tsx", import.meta.url)).text();
 
@@ -30,5 +30,17 @@ describe("ROI annotation behavior", () => {
       w: 0.1,
       h: 0.2,
     });
+  });
+
+  test("ROI_REFERENCE_SIZE locks normalization basis to 1280x960 grid", () => {
+    expect(ROI_REFERENCE_SIZE).toEqual({ width: 1280, height: 960 });
+  });
+
+  test("createFixedPixelRoi defaults to ROI_REFERENCE_SIZE when no size is given", () => {
+    const expected = createFixedPixelRoi({ x: 0.5, y: 0.5 }, ROI_REFERENCE_SIZE);
+    expect(createFixedPixelRoi({ x: 0.5, y: 0.5 })).toEqual(expected);
+    // 1280×960 → 10/1280, 10/960 共 0.0078125, 0.0104166...
+    expect(expected.w).toBeCloseTo(10 / 1280);
+    expect(expected.h).toBeCloseTo(10 / 960);
   });
 });
